@@ -1,0 +1,190 @@
+menu "MPX Dog App Configuration"
+
+config APP_LITTLEFS_PARTITION
+    string "LittleFS partition label"
+    default "storage"
+    help
+        Partition label for the LittleFS filesystem used to store
+        .wasm binaries and other persistent data.
+
+config APP_AP_SSID
+    string "Wi-Fi AP SSID"
+    default "MPX-Dog"
+    help
+        SSID broadcast by the robot's soft-AP.
+
+config APP_AP_PASSWORD
+    string "Wi-Fi AP password (empty = open)"
+    default ""
+    help
+        Leave empty for an open (no-password) access point.
+
+config APP_AP_CHANNEL
+    int "Wi-Fi AP channel"
+    range 1 13
+    default 6
+    help
+        2.4 GHz channel for the soft-AP.
+
+config APP_AP_MAX_CONN
+    int "Max Wi-Fi AP connections"
+    range 1 10
+    default 4
+    help
+        Maximum number of simultaneous station connections.
+
+choice APP_SERVO_MOTOR
+    prompt "Servo motor type"
+    default APP_SERVO_MOTOR_OLD
+    help
+        Select the servo motor model used on the robot.
+        This affects the UART baud rate used to communicate
+        with the servos.
+
+config APP_SERVO_MOTOR_OLD
+    bool "Old motor (0.5 Mbaud)"
+    help
+        Original servo motor communicating at 500 000 baud.
+
+config APP_SERVO_MOTOR_NEW
+    bool "New motor (1 Mbaud)"
+    help
+        New servo motor communicating at 1 000 000 baud.
+
+endchoice
+
+config APP_SERVO_BAUD_RATE
+    int
+    default 500000 if APP_SERVO_MOTOR_OLD
+    default 1000000 if APP_SERVO_MOTOR_NEW
+
+config APP_STA_AUTO_CONNECT
+    bool "Auto-connect to saved STA network on boot"
+    default y
+    help
+        If enabled and saved Wi-Fi credentials exist in NVS,
+        the robot will automatically connect to the saved network
+        in STA mode in addition to running its own AP.
+
+config APP_CHAT_SERVER_IP
+    string "Cloud chat backend server IP or hostname"
+    default "echo"
+    help
+        IP address or hostname of the upstream cloud chat backend.
+        The robot's Core 0 will connect to this server via WebSocket
+        to relay chat messages.
+
+        Special value "echo" enables local echo mode — the robot
+        simply echoes back user input without any cloud connection.
+        This is useful for testing the chat UI pipeline.
+
+config APP_CHAT_SERVER_PORT
+    int "Cloud chat backend server port"
+    range 1 65535
+    default 8080
+    help
+        TCP port of the upstream cloud chat backend.
+
+config APP_CHAT_WS_PATH
+    string "Cloud chat WebSocket path"
+    default "/v1/chat/ingress"
+    help
+        WebSocket path on the upstream cloud backend.
+        The robot connects to ws://SERVER_IP:PORT/WS_PATH.
+
+# ── IMU logging ────────────────────────────────────────────────
+
+    config APP_IMU_LOG_ENABLE
+        bool "Enable periodic IMU data logging"
+        default y
+        help
+            When enabled, the IMU background task prints accelerometer
+            and gyroscope data to the log at a configurable interval.
+            Disable to eliminate IMU log spam in production.
+
+    config APP_IMU_LOG_INTERVAL
+        int "IMU log interval (reads between prints)"
+        range 1 10000
+        default 50
+        help
+            Number of IMU reads between each log line.  At a 20 Hz
+            poll rate, 50 iterations ≈ 2.5 s between prints.
+            Increase this value (e.g. 500 ≈ 25 s) to reduce log spam
+            without fully disabling the log.
+
+    choice APP_IMU_LOG_LEVEL
+        prompt "IMU log verbosity"
+        default APP_IMU_LOG_LEVEL_INFO
+        help
+            Controls which ESP log macro is used for periodic IMU data.
+            Use INFO for normal visibility, DEBUG/VERBOSE to reduce
+            noise (only shown when the corresponding global log level
+            is enabled).
+
+config APP_IMU_LOG_LEVEL_INFO
+    bool "INFO"
+    help
+        Use ESP_LOGI — always visible at default log level.
+
+config APP_IMU_LOG_LEVEL_DEBUG
+    bool "DEBUG"
+    help
+        Use ESP_LOGD — hidden unless CONFIG_LOG_DEFAULT_LEVEL >= DEBUG.
+
+config APP_IMU_LOG_LEVEL_VERBOSE
+    bool "VERBOSE"
+    help
+        Use ESP_LOGV — hidden unless CONFIG_LOG_DEFAULT_LEVEL >= VERBOSE.
+
+endchoice
+
+config APP_ROBOT_UUID
+    string "Unique robot identifier (UUID)"
+    default "MPX-DOG-01"
+    help
+        Unique identifier for this robot, used as the routing header
+        in upstream binary frames. This is sent as plain-text AAD
+        in the encrypted frame header.
+
+        In production, this should be a factory-provisioned UUID
+        and should match the key in NVS.
+
+config APP_CHAT_AES_KEY_HEX
+    string "AES-256-GCM key (hex, 64 hex chars)"
+    default "0000000000000000000000000000000000000000000000000000000000000001"
+    help
+        256-bit AES key in hexadecimal format (64 hex characters).
+        Used for encrypting the upstream binary frame payload.
+
+        WARNING: The default key is INSECURE and for development only.
+        In production, provision a unique key per device via NVS.
+
+# ── Lua scripting ────────────────────────────────────────────────────
+
+config APP_LUA_ENABLE
+    bool "Enable Lua scripting VM"
+    default y
+    help
+        Embeds Lua 5.5 with robot bindings and modules.
+        The robot.gait(), robot.set_servo_angle(), etc. functions
+        become available in Lua scripts.
+
+if APP_LUA_ENABLE
+
+config APP_LUA_HEAP_SIZE
+    int "Lua VM heap size (KB)"
+    range 16 256
+    default 64
+    help
+        Heap allocation for the Lua interpreter. Larger values allow
+        more complex scripts and larger data structures.
+
+config APP_LUA_TASK_STACK_SIZE
+    int "Lua async task stack size (bytes)"
+    default 4096
+    help
+        Stack size for async Lua script tasks (future use).
+
+endif  # APP_LUA_ENABLE
+
+endmenu

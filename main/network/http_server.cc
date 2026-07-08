@@ -1,0 +1,1404 @@
+#include "network/http_server.h"
+#include "network/chat_ws.h"
+#include "network/wifi_ap.h"
+#include "network/wifi_sta.h"
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <sys/stat.h>
+#include <dirent.h>
+
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "fs/littlefs_manager.h"
+#include "lua/lua_vm.h"
+#include "robot/robot.h"
+#include "wasm/wasm_sandbox.h"
+
+static const char *TAG = "http_server";
+
+namespace network {
+namespace {
+
+httpd_handle_t s_server = nullptr;
+
+/* ── MIME type helpers ──────────────────────────────────────── */
+
+const char *get_mime_type(const char *path)
+{
+    const char *ext = std::strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+
+    if (std::strcmp(ext, ".html") == 0) return "text/html; charset=utf-8";
+    if (std::strcmp(ext, ".js")   == 0) return "application/javascript; charset=utf-8";
+    if (std::strcmp(ext, ".css")  == 0) return "text/css; charset=utf-8";
+    if (std::strcmp(ext, ".svg")  == 0) return "image/svg+xml";
+    if (std::strcmp(ext, ".json") == 0) return "application/json";
+    if (std::strcmp(ext, ".png")  == 0) return "image/png";
+    if (std::strcmp(ext, ".ico")  == 0) return "image/x-icon";
+    if (std::strcmp(ext, ".wasm") == 0) return "application/wasm";
+    return "application/octet-stream";
+}
+
+/* ── URL-decode a percent-encoded string ───────────────────── */
+static std::string url_decode(const std::string &src)
+{
+    std::string out;
+    out.reserve(src.size());
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        if (src[i] == '%' && i + 2 < src.size()) {
+            char hex[3] = {src[i + 1], src[i + 2], 0};
+            char *end = nullptr;
+            long val = std::strtol(hex, &end, 16);
+            if (end == hex + 2) {
+                out += static_cast<char>(val);
+                i += 2;
+            } else {
+                out += src[i];
+            }
+        } else if (src[i] == '+') {
+            out += ' ';
+        } else {
+            out += src[i];
+        }
+    }
+    return out;
+}
+
+/* ── Build a full filesystem path from a URI ────────────────── */
+std::string uri_to_path(const char *uri)
+{
+    // Default to index.html for root
+    if (std::strcmp(uri, "/") == 0) {
+        return std::string(WWW_ROOT) + "/index.html";
+    }
+
+    // Map favicon.ico to our SVG icon
+    if (std::strcmp(uri, "/favicon.ico") == 0) {
+        return std::string(WWW_ROOT) + "/icon.svg";
+    }
+
+    std::string path = std::string(WWW_ROOT) + uri;
+
+    // Strip trailing slash
+    if (path.size() > 0 && path.back() == '/') {
+        path += "index.html";
+    }
+
+    return path;
+}
+
+/* ── Check if client accepts gzip ───────────────────────────── */
+bool accepts_gzip(httpd_req_t *req)
+{
+    char buf[64] = {};
+    if (httpd_req_get_hdr_value_str(req, "Accept-Encoding", buf, sizeof(buf)) != ESP_OK) {
+        return false;
+    }
+    return std::strstr(buf, "gzip") != nullptr;
+}
+
+/* ── Send a file from the filesystem ────────────────────────── */
+esp_err_t send_file(httpd_req_t *req, const char *fs_path,
+                           const char *mime, bool is_gzipped)
+{
+    if (!req || !fs_path || !mime) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    FILE *f = std::fopen(fs_path, "rb");
+    if (!f) {
+        return ESP_FAIL;
+    }
+
+    // Get file size
+    struct stat st;
+    if (stat(fs_path, &st) != 0) {
+        std::fclose(f);
+        return ESP_FAIL;
+    }
+
+    // Set Content-Type
+    if (httpd_resp_set_type(req, mime) != ESP_OK) {
+        std::fclose(f);
+        return ESP_FAIL;
+    }
+
+    // Set Content-Encoding if serving a gzipped file
+    if (is_gzipped) {
+        if (httpd_resp_set_hdr(req, "Content-Encoding", "gzip") != ESP_OK) {
+            std::fclose(f);
+            return ESP_FAIL;
+        }
+    }
+
+    // Set Cache-Control for static assets
+    if (httpd_resp_set_hdr(req, "Cache-Control",
+                           "public, max-age=31536000, immutable") != ESP_OK) {
+        std::fclose(f);
+        return ESP_FAIL;
+    }
+
+    // Stream the file in chunks (small buffer to save stack)
+    constexpr size_t CHUNK_SIZE = 512;
+    char buf[CHUNK_SIZE];
+    size_t remaining = static_cast<size_t>(st.st_size);
+
+    while (remaining > 0) {
+        const size_t to_read = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
+        const size_t read_bytes = std::fread(buf, 1, to_read, f);
+
+        if (read_bytes == 0) break;
+
+        if (httpd_resp_send_chunk(req, buf, read_bytes) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send chunk (connection closed?)");
+            std::fclose(f);
+            return ESP_FAIL;
+        }
+        remaining -= read_bytes;
+    }
+
+    std::fclose(f);
+
+    // Terminate chunked response
+    httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+}
+
+/* ── Try to open and serve a file, return ESP_OK on success ─── */
+static bool try_serve(httpd_req_t *req, const std::string &path,
+                      const char *mime, bool is_gzipped)
+{
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fclose(f);
+
+    return send_file(req, path.c_str(), mime, is_gzipped) == ESP_OK;
+}
+
+/* ── Static asset handler (with gzip support) ───────────────── */
+esp_err_t static_handler(httpd_req_t *req)
+{
+    // Reject API/WebSocket paths
+    if (std::strncmp(req->uri, "/v1/", 4) == 0) {
+        return ESP_OK;
+    }
+
+    const std::string fs_path = uri_to_path(req->uri);
+    const std::string mime = get_mime_type(fs_path.c_str());
+    const bool gzip = accepts_gzip(req);
+
+    // Try gzipped first, then uncompressed
+    if ((gzip && try_serve(req, fs_path + ".gz", mime.c_str(), true)) ||
+        try_serve(req, fs_path, mime.c_str(), false)) {
+        return ESP_OK;
+    }
+
+    // Fallback: serve index.html for SPA routing
+    const std::string fallback = std::string(WWW_ROOT) + "/index.html";
+    if ((gzip && try_serve(req, fallback + ".gz", "text/html; charset=utf-8", true)) ||
+        try_serve(req, fallback, "text/html; charset=utf-8", false)) {
+        return ESP_OK;
+    }
+
+    // Nothing found — send a minimal manual response and return OK
+    // (returning ESP_FAIL triggers a cleanup crash in ESP-IDF's httpd)
+    ESP_LOGW(TAG, "File not found, sending 404: %s", req->uri);
+    const char *body = "404 Not Found";
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* ── WebSocket telemetry handler ────────────────────────────── */
+esp_err_t websocket_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        ESP_LOGI(TAG, "WebSocket connection established");
+        return ESP_OK;
+    }
+
+    // Handle WebSocket frame
+    httpd_ws_frame_t ws_pkt{};
+    uint8_t buf[256] = {};
+
+    ws_pkt.payload = buf;
+    ws_pkt.len = sizeof(buf);
+
+    const esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(buf));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WebSocket recv error: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Echo or handle the message
+    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT) {
+        ESP_LOGD(TAG, "WS text: %.*s", (int)ws_pkt.len, (const char *)ws_pkt.payload);
+        // Echo back for now
+        httpd_ws_send_frame(req, &ws_pkt);
+    } else if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        ESP_LOGI(TAG, "WebSocket closed by client");
+    }
+
+    return ESP_OK;
+}
+
+}  // anonymous namespace
+
+/* ── REST API handlers ─────────────────────────────────────── */
+
+/* ── Helper: check if a path is under /www/ (read-only PWA assets) ── */
+static bool is_www_path(const std::string &path)
+{
+    return path.compare(0, 5, "/www/") == 0 || path == "/www";
+}
+
+/* GET /v1/skills/list — list .wasm files (excluding www) */
+static esp_err_t api_skills_list(httpd_req_t *req)
+{
+    auto files = fs::list_files("/");
+    std::string json = "[\n";
+
+    bool first = true;
+    for (const auto &f : files) {
+        if (f.size() < 6 || f.substr(f.size() - 5) != ".wasm") continue;
+        if (is_www_path(f)) continue;
+
+        if (!first) json += ",\n";
+        first = false;
+
+        std::size_t sz = fs::file_size(f.c_str());
+        std::string name = f;
+        if (name.size() > 0 && name[0] == '/') name = name.substr(1);
+
+        json += "  {\"name\":\"" + name + "\",\"size\":" + std::to_string(sz) + "}";
+    }
+    json += "\n]";
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json.c_str(), json.size());
+    return ESP_OK;
+}
+
+/* POST /v1/skills/run — execute a .wasm skill via WAMR */
+static esp_err_t api_skills_run(httpd_req_t *req)
+{
+    char buf[256] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    const char *key = "\"skill\":\"";
+    const char *val = std::strstr(buf, key);
+    if (!val) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing skill name", -1);
+        return ESP_OK;
+    }
+    val += std::strlen(key);
+    std::string skill_name;
+    while (*val && *val != '"') skill_name += *val++;
+
+    std::string path = "/" + skill_name;
+    ESP_LOGI(TAG, "Running skill: %s", path.c_str());
+
+    std::string output;
+    auto result = wasm::load_and_run(path.c_str(), "on_start", 60000);
+    ESP_LOGI(TAG, "Skill '%s' completed with result=%d", skill_name.c_str(),
+             static_cast<int>(result));
+
+    switch (result) {
+        case wasm::SandboxResult::Success:
+            output = "{\"output\":\"Skill '" + skill_name + "' executed successfully\"}";
+            break;
+        case wasm::SandboxResult::LoadFailed:
+            output = "{\"output\":\"Failed to load " + skill_name + "\"}";
+            break;
+        case wasm::SandboxResult::InstantiateFailed:
+            output = "{\"output\":\"Failed to instantiate " + skill_name + "\"}";
+            break;
+        case wasm::SandboxResult::FunctionNotFound:
+            output = "{\"output\":\"Entry point 'on_start' not found in " + skill_name + "\"}";
+            break;
+        case wasm::SandboxResult::ExecutionFailed:
+            output = "{\"output\":\"Execution failed for " + skill_name + "\"}";
+            break;
+        case wasm::SandboxResult::Timeout:
+            output = "{\"output\":\"Skill '" + skill_name + "' timed out\"}";
+            break;
+        default:
+            output = "{\"output\":\"Unknown error running " + skill_name + "\"}";
+            break;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, output.c_str(), output.size());
+    return ESP_OK;
+}
+
+/* Escape a string for JSON embedding. */
+static std::string json_escape(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            case '\r': out += "\\r";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned char>(c));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+/* GET /v1/fs/list — list files + dirs on LittleFS. Query: ?path=/lua (default /) */
+static esp_err_t api_fs_list(httpd_req_t *req)
+{
+    std::string dir_path = "/";
+    const char *query = strchr(req->uri, '?');
+    if (query) {
+        const char *p = strstr(query, "path=");
+        if (p) {
+            dir_path = p + 5;
+            auto amp = dir_path.find('&');
+            if (amp != std::string::npos) dir_path = dir_path.substr(0, amp);
+            dir_path = url_decode(dir_path);
+        }
+    }
+
+    // Build VFS path, open directory, enumerate files + subdirs
+    std::string vfs = (dir_path == "/") ? "/fs" : "/fs" + dir_path;
+    DIR *dir = opendir(vfs.c_str());
+
+    std::string files_json, dirs_json;
+    bool first_file = true, first_dir = true;
+
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string name(entry->d_name);
+            if (name == ".") continue;
+
+            if (entry->d_type == DT_DIR) {
+                if (!first_dir) dirs_json += ",";
+                first_dir = false;
+                dirs_json += "\"" + json_escape(name) + "\"";
+            } else if (entry->d_type == DT_REG) {
+                std::string full = dir_path + "/" + name;
+                std::size_t sz = fs::file_size(full.c_str());
+                bool ro = is_www_path(full);
+                if (!first_file) files_json += ",";
+                first_file = false;
+                files_json += "{\"n\":\"" + json_escape(name) + "\""
+                            + ",\"s\":" + std::to_string(sz)
+                            + ",\"r\":" + (ro ? "true" : "false") + "}";
+            }
+        }
+        closedir(dir);
+    }
+
+    std::string json = "{\"f\":[" + files_json + "],\"d\":[" + dirs_json + "]}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json.c_str(), json.size());
+    return ESP_OK;
+}
+
+/* GET /v1/fs/read?path=/lua/walk.lua — read file content as JSON */
+static esp_err_t api_fs_read(httpd_req_t *req)
+{
+    std::string file_path;
+    const char *query = strchr(req->uri, '?');
+    if (query) {
+        const char *p = strstr(query, "path=");
+        if (p) {
+            file_path = p + 5;
+            auto amp = file_path.find('&');
+            if (amp != std::string::npos) file_path = file_path.substr(0, amp);
+            file_path = url_decode(file_path);
+        }
+    }
+
+    if (file_path.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing path", -1);
+        return ESP_OK;
+    }
+
+    auto data = fs::read_file(file_path.c_str());
+    if (data.empty()) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_send(req, "file not found", -1);
+        return ESP_OK;
+    }
+
+    std::string content(data.begin(), data.end());
+    std::string resp = "{\"ok\":true,\"p\":\"" + json_escape(file_path)
+                     + "\",\"c\":\"" + json_escape(content) + "\"}";
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp.c_str(), resp.size());
+    return ESP_OK;
+}
+
+/* GET /v1/fs/info — filesystem stats */
+static esp_err_t api_fs_info(httpd_req_t *req)
+{
+    std::size_t total = 0, used = 0;
+    fs::stats(total, used);
+
+    char json[128];
+    std::snprintf(json, sizeof(json),
+                  "{\"total\":%zu,\"used\":%zu}", total, used);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, -1);
+    return ESP_OK;
+}
+
+/* POST /v1/fs/delete — delete a file (reject www paths) */
+static esp_err_t api_fs_delete(httpd_req_t *req)
+{
+    char buf[256] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    const char *key = "\"path\":\"";
+    const char *val = std::strstr(buf, key);
+    if (!val) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing path", -1);
+        return ESP_OK;
+    }
+    val += std::strlen(key);
+    std::string file_path = "/";
+    while (*val && *val != '"') file_path += *val++;
+
+    // Check sudo mode
+    bool sudo = (std::strstr(buf, "\"sudo\":true") != nullptr);
+
+    // Reject deletion of www assets (even with sudo)
+    if (is_www_path(file_path)) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_send(req, "cannot delete www assets", -1);
+        return ESP_OK;
+    }
+
+    // Without sudo, only allow .wasm and .lua deletion
+    if (!sudo) {
+        std::string lower = file_path;
+        for (auto &c : lower) c = std::tolower(c);
+        bool allowed = (lower.size() >= 5 && lower.substr(lower.size() - 5) == ".wasm")
+                    || (lower.size() >= 4 && lower.substr(lower.size() - 4) == ".lua");
+        if (!allowed) {
+            httpd_resp_set_status(req, "403 Forbidden");
+            httpd_resp_send(req, "sudo required to delete this file", -1);
+            return ESP_OK;
+        }
+    }
+
+    if (fs::delete_file(file_path.c_str())) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":true}", -1);
+    } else {
+        httpd_resp_set_status(req, "500 Server Error");
+        httpd_resp_send(req, "delete failed", -1);
+    }
+    return ESP_OK;
+}
+
+/* POST /v1/skills/upload — upload a .wasm file (raw body, name in query) */
+static esp_err_t api_skills_upload(httpd_req_t *req)
+{
+    // Extract filename from query string: /v1/skills/upload?name=foo.wasm
+    std::string filename = "skill.wasm";
+    const char *query = strchr(req->uri, '?');
+    if (query) {
+        const char *nkey = "name=";
+        const char *nval = std::strstr(query + 1, nkey);
+        if (nval) {
+            nval += std::strlen(nkey);
+            filename = "";
+            while (*nval && *nval != '&') filename += *nval++;
+        }
+    }
+
+    // Read the raw binary body
+    size_t content_len = req->content_len;
+    if (content_len == 0 || content_len > 256 * 1024) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "invalid size", -1);
+        return ESP_OK;
+    }
+
+    auto *data = new uint8_t[content_len];
+    size_t total_read = 0;
+
+    while (total_read < content_len) {
+        int ret = httpd_req_recv(req, (char *)data + total_read,
+                                 content_len - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+
+    if (total_read != content_len) {
+        delete[] data;
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "read error", -1);
+        return ESP_OK;
+    }
+
+    // Write to LittleFS
+    std::string fs_path = "/" + filename;
+    if (fs::write_file(fs_path.c_str(), data, total_read)) {
+        ESP_LOGI(TAG, "Uploaded %s (%zu bytes)", filename.c_str(), total_read);
+        std::string resp = "{\"ok\":true,\"path\":\"" + filename + "\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp.c_str(), resp.size());
+    } else {
+        httpd_resp_set_status(req, "500 Server Error");
+        httpd_resp_send(req, "write failed", -1);
+    }
+
+    delete[] data;
+    return ESP_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  Robot control API
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* ── Helper: parse a JSON string value (handles escape sequences) ── */
+static std::string json_get_str(const char *body, const char *key)
+{
+    std::string needle = "\"" + std::string(key) + "\":\"";
+    const char *p = std::strstr(body, needle.c_str());
+    if (!p) return {};
+    p += needle.size();
+    std::string val;
+    while (*p && *p != '"') {
+        if (*p == '\\') {
+            p++; // skip backslash
+            if (*p == '"')       val += '"';
+            else if (*p == '\\') val += '\\';
+            else if (*p == 'n')  val += '\n';
+            else if (*p == 't')  val += '\t';
+            else if (*p == 'r')  val += '\r';
+            else if (*p == '/')  val += '/';
+            else if (*p == 'u') {
+                // Simple \\u00xx for basic ASCII range
+                if (p[1] && p[2] && p[3] && p[4]) {
+                    char hex[5] = {p[1], p[2], p[3], p[4], 0};
+                    unsigned int code;
+                    sscanf(hex, "%x", &code);
+                    val += (char)code;
+                    p += 4;
+                }
+            } else {
+                val += *p; // pass through unknown escape
+            }
+        } else {
+            val += *p;
+        }
+        p++;
+    }
+    return val;
+}
+
+/* ── Helper: parse a JSON number value ─────────────────────── */
+static int json_get_int(const char *body, const char *key, int def)
+{
+    std::string needle = "\"" + std::string(key) + "\":";
+    const char *p = std::strstr(body, needle.c_str());
+    if (!p) return def;
+    p += needle.size();
+    // Skip whitespace
+    while (*p == ' ') ++p;
+    bool neg = (*p == '-');
+    if (neg) ++p;
+    int val = 0;
+    while (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); ++p; }
+    return neg ? -val : val;
+}
+
+/* ── Helper: parse a JSON float value ──────────────────────── */
+static float json_get_float(const char *body, const char *key, float def)
+{
+    std::string needle = "\"" + std::string(key) + "\":";
+    const char *p = std::strstr(body, needle.c_str());
+    if (!p) return def;
+    p += needle.size();
+    while (*p == ' ') ++p;
+    char *end = nullptr;
+    float val = std::strtof(p, &end);
+    return (end == p) ? def : val;
+}
+
+/* ── Gait name → GaitCmd mapping ──────────────────────────── */
+static robot::GaitCmd gait_name_to_cmd(const std::string &name)
+{
+    if (name == "init")     return robot::GaitCmd::Init;
+    if (name == "step")     return robot::GaitCmd::Step;
+    if (name == "roll")     return robot::GaitCmd::Roll;
+    if (name == "pitch")    return robot::GaitCmd::Pitch;
+    if (name == "stretch")  return robot::GaitCmd::Stretch;
+    if (name == "advance")  return robot::GaitCmd::Advance;
+    if (name == "back")     return robot::GaitCmd::Back;
+    if (name == "left")     return robot::GaitCmd::Left;
+    if (name == "right")    return robot::GaitCmd::Right;
+    if (name == "turnL")    return robot::GaitCmd::TurnL;
+    if (name == "turnR")    return robot::GaitCmd::TurnR;
+    if (name == "twerk")    return robot::GaitCmd::Twerk;
+    if (name == "jump")     return robot::GaitCmd::Jump;
+    if (name == "jumpfwd")  return robot::GaitCmd::JumpFwd;
+    if (name == "testspeed") return robot::GaitCmd::TestSpeed;
+    if (name == "lookup")    return robot::GaitCmd::LookUp;
+    if (name == "lookdown")  return robot::GaitCmd::LookDown;
+    if (name == "lookleft")  return robot::GaitCmd::LookLeft;
+    if (name == "lookright") return robot::GaitCmd::LookRight;
+    if (name == "lookul")    return robot::GaitCmd::LookUpperLeft;
+    if (name == "lookur")    return robot::GaitCmd::LookUpperRight;
+    if (name == "lookll")    return robot::GaitCmd::LookLowerLeft;
+    if (name == "looklr")    return robot::GaitCmd::LookLowerRight;
+    if (name == "flegL")     return robot::GaitCmd::ForelegLiftL;
+    if (name == "flegR")     return robot::GaitCmd::ForelegLiftR;
+    if (name == "blegL")     return robot::GaitCmd::BacklegLiftL;
+    if (name == "blegR")     return robot::GaitCmd::BacklegLiftR;
+    if (name == "heightup")  return robot::GaitCmd::HeightUp;
+    if (name == "heightdown")return robot::GaitCmd::HeightDown;
+    if (name == "balance")   return robot::GaitCmd::Balance;
+    if (name == "bowback")   return robot::GaitCmd::BowBack;
+    if (name == "bodycycle") return robot::GaitCmd::BodyCycle;
+    if (name == "headellipse")return robot::GaitCmd::HeadEllipse;
+    if (name == "moveLF")    return robot::GaitCmd::MoveLeftFront;
+    if (name == "moveRF")    return robot::GaitCmd::MoveRightFront;
+    if (name == "moveLB")    return robot::GaitCmd::MoveLeftBack;
+    if (name == "moveRB")    return robot::GaitCmd::MoveRightBack;
+    if (name == "none")     return robot::GaitCmd::None;
+    return robot::GaitCmd::None;
+}
+
+/* ── GaitCmd → name string ─────────────────────────────────── */
+static const char *gait_cmd_to_name(robot::GaitCmd cmd)
+{
+    switch (cmd) {
+        case robot::GaitCmd::None:      return "none";
+        case robot::GaitCmd::Init:      return "init";
+        case robot::GaitCmd::Step:      return "step";
+        case robot::GaitCmd::Roll:      return "roll";
+        case robot::GaitCmd::Pitch:     return "pitch";
+        case robot::GaitCmd::Stretch:   return "stretch";
+        case robot::GaitCmd::Advance:   return "advance";
+        case robot::GaitCmd::Back:      return "back";
+        case robot::GaitCmd::Left:      return "left";
+        case robot::GaitCmd::Right:     return "right";
+        case robot::GaitCmd::TurnL:     return "turnL";
+        case robot::GaitCmd::TurnR:     return "turnR";
+        case robot::GaitCmd::Twerk:     return "twerk";
+        case robot::GaitCmd::Jump:      return "jump";
+        case robot::GaitCmd::JumpFwd:   return "jumpfwd";
+        case robot::GaitCmd::TestSpeed: return "testspeed";
+        case robot::GaitCmd::LookUp:         return "lookup";
+        case robot::GaitCmd::LookDown:       return "lookdown";
+        case robot::GaitCmd::LookLeft:       return "lookleft";
+        case robot::GaitCmd::LookRight:      return "lookright";
+        case robot::GaitCmd::LookUpperLeft:  return "lookul";
+        case robot::GaitCmd::LookUpperRight: return "lookur";
+        case robot::GaitCmd::LookLowerLeft:  return "lookll";
+        case robot::GaitCmd::LookLowerRight: return "looklr";
+        case robot::GaitCmd::ForelegLiftL:   return "flegL";
+        case robot::GaitCmd::ForelegLiftR:   return "flegR";
+        case robot::GaitCmd::BacklegLiftL:   return "blegL";
+        case robot::GaitCmd::BacklegLiftR:   return "blegR";
+        case robot::GaitCmd::HeightUp:       return "heightup";
+        case robot::GaitCmd::HeightDown:     return "heightdown";
+        case robot::GaitCmd::Balance:        return "balance";
+        case robot::GaitCmd::BowBack:        return "bowback";
+        case robot::GaitCmd::BodyCycle:      return "bodycycle";
+        case robot::GaitCmd::HeadEllipse:    return "headellipse";
+        case robot::GaitCmd::MoveLeftFront:  return "moveLF";
+        case robot::GaitCmd::MoveRightFront: return "moveRF";
+        case robot::GaitCmd::MoveLeftBack:   return "moveLB";
+        case robot::GaitCmd::MoveRightBack:  return "moveRB";
+    }
+    return "unknown";
+}
+
+/* POST /v1/robot/gait — set gait mode */
+static esp_err_t api_robot_gait(httpd_req_t *req)
+{
+    char buf[256] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    std::string mode = json_get_str(buf, "mode");
+    if (mode.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing 'mode' field", -1);
+        return ESP_OK;
+    }
+
+    robot::GaitCmd cmd = gait_name_to_cmd(mode);
+
+    ESP_LOGI(TAG, "POST /v1/robot/gait  mode=%s", mode.c_str());
+
+    robot::send_gait_cmd(cmd);
+
+    char resp[128];
+    std::snprintf(resp, sizeof(resp), R"({"ok":true,"mode":"%s"})", gait_cmd_to_name(cmd));
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, -1);
+    return ESP_OK;
+}
+
+/* GET /v1/robot/status — current gait mode */
+static esp_err_t api_robot_status(httpd_req_t *req)
+{
+    robot::GaitCmd cmd = robot::current_gait_cmd();
+    robot::Config cfg = robot::get_config();
+
+    ESP_LOGI(TAG, "GET  /v1/robot/status  mode=%s", gait_cmd_to_name(cmd));
+
+    char resp[512];
+    int n = std::snprintf(resp, sizeof(resp),
+        R"({"mode":"%s")"
+        R"(,"config":{"period":%d,"height":%d,"up_height":%d,"stride":%d,"tilt":%d})"
+        R"(,"offsets":[)",
+        gait_cmd_to_name(cmd),
+        cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt);
+
+    for (int i = 1; i <= 12; ++i) {
+        n += std::snprintf(resp + n, sizeof(resp) - n, "%.1f%s",
+                           robot::get_offset(i), (i < 12) ? "," : "");
+    }
+    n += std::snprintf(resp + n, sizeof(resp) - n, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, -1);
+    return ESP_OK;
+}
+
+/* POST /v1/robot/config — update robot configuration */
+static esp_err_t api_robot_config(httpd_req_t *req)
+{
+    char buf[256] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    robot::Config cfg = robot::get_config();
+
+    int val;
+    if ((val = json_get_int(buf, "period", -1))   >= 0)   cfg.period    = val;
+    if ((val = json_get_int(buf, "height", -1))   >= 0)   cfg.height    = val;
+    if ((val = json_get_int(buf, "up_height", -1)) >= 0)   cfg.up_height = val;
+    if ((val = json_get_int(buf, "stride", -1))   >= 0)   cfg.stride    = val;
+    if ((val = json_get_int(buf, "tilt", -1))     >= 0)   cfg.tilt      = val;
+
+    ESP_LOGI(TAG, "POST /v1/robot/config  period=%d height=%d up_height=%d stride=%d tilt=%d",
+             cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt);
+
+    robot::set_config(cfg);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
+/* GET /v1/robot/config — get robot configuration */
+static esp_err_t api_robot_get_config(httpd_req_t *req)
+{
+    robot::Config cfg = robot::get_config();
+
+    ESP_LOGI(TAG, "GET  /v1/robot/config  period=%d height=%d up_height=%d stride=%d tilt=%d",
+             cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt);
+
+    char resp[256];
+    std::snprintf(resp, sizeof(resp),
+        R"({"period":%d,"height":%d,"up_height":%d,"stride":%d,"tilt":%d})",
+        cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, -1);
+    return ESP_OK;
+}
+
+/* POST /v1/robot/calibrate — set a servo offset */
+static esp_err_t api_robot_calibrate(httpd_req_t *req)
+{
+    char buf[256] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    int servo = json_get_int(buf, "servo", -1);
+    float offset = json_get_float(buf, "offset", 0.0f);
+
+    if (servo < 1 || servo > 12) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "servo must be 1-12", -1);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "POST /v1/robot/calibrate  servo=%d offset=%.1f", servo, offset);
+
+    robot::set_offset(servo, offset);
+
+    char resp[128];
+    std::snprintf(resp, sizeof(resp),
+                  R"({"ok":true,"servo":%d,"offset":%.1f})", servo, offset);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, -1);
+    return ESP_OK;
+}
+
+/* POST /v1/robot/calibrate/reset — reset all offsets to 0 */
+static esp_err_t api_robot_cal_reset(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "POST /v1/robot/calibrate/reset");
+    robot::reset_offsets();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
+/* POST /v1/robot/diagnostic/ping — ping a servo by ID */
+static esp_err_t api_robot_diag_ping(httpd_req_t *req)
+{
+    char buf[64] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    int servo = json_get_int(buf, "servo", 1);
+    if (servo < 1 || servo > 12) servo = 1;
+
+    ESP_LOGI(TAG, "POST /v1/robot/diagnostic/ping  servo=%d", servo);
+
+    int result = robot::ping_servo(servo);
+    char resp[128];
+    if (result > 0) {
+        std::snprintf(resp, sizeof(resp),
+                      R"({"ok":true,"servo":%d,"model":%d})", servo, result);
+    } else {
+        std::snprintf(resp, sizeof(resp),
+                      R"({"ok":false,"servo":%d,"error":%d})", servo, result);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, -1);
+    return ESP_OK;
+}
+
+/* POST /v1/robot/diagnostic/sweep — sweep a single servo ±45° */
+static esp_err_t api_robot_diag_sweep(httpd_req_t *req)
+{
+    char buf[64] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    int servo = json_get_int(buf, "servo", 1);
+    if (servo < 1 || servo > 12) servo = 1;
+
+    ESP_LOGI(TAG, "POST /v1/robot/diagnostic/sweep  servo=%d", servo);
+
+    // Sweep servo back and forth
+    for (int i = 0; i < 3; ++i) {
+        robot::set_servo_angle(servo, -45.0f);
+        robot::set_all_servo_speed(200);
+        robot::flush();
+        vTaskDelay(pdMS_TO_TICKS(400));
+
+        robot::set_servo_angle(servo, 45.0f);
+        robot::flush();
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    // Return to centre
+    robot::set_servo_angle(servo, 0.0f);
+    robot::flush();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  WiFi config API
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* GET /v1/wifi/status — current AP + STA status */
+static esp_err_t api_wifi_status(httpd_req_t *req)
+{
+    StaState sta = wifi_sta_get_state();
+    std::string sta_ip = wifi_sta_get_ip();
+    std::string sta_ssid = wifi_sta_get_ssid();
+
+    const char *sta_state_str = "disconnected";
+    switch (sta) {
+        case StaState::Disconnected: sta_state_str = "disconnected"; break;
+        case StaState::Connecting:   sta_state_str = "connecting";   break;
+        case StaState::Connected:    sta_state_str = "connected";    break;
+        case StaState::Failed:       sta_state_str = "failed";       break;
+    }
+
+    char resp[512];
+    std::snprintf(resp, sizeof(resp),
+        R"({"ap":{"ssid":"%s","ip":"%s"})"
+        R"(,"sta":{"state":"%s","ssid":"%s","ip":"%s"}})",
+        WIFI_AP_SSID, AP_IP_ADDR,
+        sta_state_str, sta_ssid.c_str(), sta_ip.c_str());
+
+    ESP_LOGI(TAG, "GET  /v1/wifi/status  sta=%s ssid=%s ip=%s",
+             sta_state_str, sta_ssid.c_str(), sta_ip.c_str());
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, -1);
+    return ESP_OK;
+}
+
+/* POST /v1/wifi/connect — connect to a Wi-Fi network (STA mode) */
+static esp_err_t api_wifi_connect(httpd_req_t *req)
+{
+    char buf[256] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    std::string ssid = json_get_str(buf, "ssid");
+    std::string password = json_get_str(buf, "password");
+
+    if (ssid.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing 'ssid' field", -1);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "POST /v1/wifi/connect  ssid=%s", ssid.c_str());
+
+    if (!wifi_sta_connect(ssid.c_str(), password.c_str())) {
+        httpd_resp_set_status(req, "500 Server Error");
+        httpd_resp_send(req, "connect failed", -1);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
+/* POST /v1/wifi/disconnect — disconnect from STA */
+static esp_err_t api_wifi_disconnect(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "POST /v1/wifi/disconnect");
+    wifi_sta_disconnect();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
+/* POST /v1/wifi/forget — forget saved credentials and disconnect */
+static esp_err_t api_wifi_forget(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "POST /v1/wifi/forget");
+    wifi_sta_forget();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
+/* ── Body reader helper (heap-allocated, no large stack buffers) ──────── */
+
+/**
+ * Read the full request body into a heap-allocated buffer.
+ * Caller must free() the returned pointer. Returns NULL on failure.
+ */
+static char *read_body(httpd_req_t *req)
+{
+    int content_len = req->content_len;
+    if (content_len <= 0) return nullptr;
+
+    char *buf = (char *)malloc(content_len + 1);
+    if (!buf) return nullptr;
+
+    int total = 0;
+    while (total < content_len) {
+        int ret = httpd_req_recv(req, buf + total, content_len - total);
+        if (ret <= 0) {
+            free(buf);
+            return nullptr;
+        }
+        total += ret;
+    }
+    buf[total] = '\0';
+    return buf;
+}
+
+/* ── Lua API endpoints ─────────────────────────────────────── */
+
+/* POST /v1/lua/run — run a Lua script
+ *   Body: {"script":"..."}  or  {"path":"/lua/foo.lua"}
+ *   Response: {"ok":true,"output":"..."}  or  {"ok":false,"error":"..."}
+ */
+static esp_err_t api_lua_run(httpd_req_t *req)
+{
+    char *buf = read_body(req);
+    if (!buf) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+
+    std::string script = json_get_str(buf, "script");
+    std::string path   = json_get_str(buf, "path");
+    free(buf);
+
+    if (script.empty() && path.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "need 'script' or 'path' field", -1);
+        return ESP_OK;
+    }
+
+    // Use a heap-allocated output buffer (2048 bytes is enough for most results)
+    char *output = (char *)malloc(2048);
+    if (!output) {
+        httpd_resp_set_status(req, "500 Internal Error");
+        httpd_resp_send(req, "oom", -1);
+        return ESP_OK;
+    }
+    output[0] = '\0';
+
+    esp_err_t err;
+    if (!path.empty()) {
+        err = lua_run_file(path.c_str(), output, 2048, 5000);
+    } else {
+        err = lua_run_string(script.c_str(), output, 2048, 5000);
+    }
+
+    std::string escaped = json_escape(output);
+    free(output);
+
+    std::string resp = (err == ESP_OK)
+        ? R"({"ok":true,"output":")" + escaped + "\"}"
+        : R"({"ok":false,"error":")" + escaped + "\"}";
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp.c_str(), resp.size());
+    return ESP_OK;
+}
+
+/* GET /v1/lua/list — list .lua files on LittleFS
+ *   Response: {"ok":true,"files":["walk.lua","test.lua"]}
+ */
+static esp_err_t api_lua_list(httpd_req_t *req)
+{
+    auto files = fs::list_files("/lua");
+    std::string json = R"({"ok":true,"files":[)";
+    for (size_t i = 0; i < files.size(); i++) {
+        if (i > 0) json += ",";
+        json += "\"" + json_escape(files[i]) + "\"";
+    }
+    json += "]}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json.c_str(), json.size());
+    return ESP_OK;
+}
+
+/* POST /v1/lua/save — save a Lua script to LittleFS
+ *   Body: {"name":"walk.lua","code":"print('hi')"}
+ */
+static esp_err_t api_lua_save(httpd_req_t *req)
+{
+    char *buf = read_body(req);
+    if (!buf) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+
+    std::string name = json_get_str(buf, "name");
+    std::string code = json_get_str(buf, "code");
+    free(buf);
+
+    if (name.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing 'name' field", -1);
+        return ESP_OK;
+    }
+
+    std::string path = "/lua/" + name;
+    bool ok = fs::write_file(path.c_str(), code.data(), code.size());
+
+    char resp[256];
+    std::snprintf(resp, sizeof(resp),
+                  R"({"ok":%s,"path":"%s"})", ok ? "true" : "false",
+                  json_escape(path).c_str());
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, -1);
+    return ESP_OK;
+}
+
+/* GET /v1/lua/read?name=walk.lua — read a Lua script */
+static esp_err_t api_lua_read(httpd_req_t *req)
+{
+    std::string name;
+    std::string query(req->uri);
+    auto pos = query.find("name=");
+    if (pos != std::string::npos) {
+        name = query.substr(pos + 5);
+        auto amp = name.find('&');
+        if (amp != std::string::npos) name = name.substr(0, amp);
+        name = url_decode(name);
+    }
+
+    if (name.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing 'name' query param", -1);
+        return ESP_OK;
+    }
+
+    std::string path = "/lua/" + name;
+    auto data = fs::read_file(path.c_str());
+
+    if (data.empty()) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_send(req, "file not found", -1);
+        return ESP_OK;
+    }
+
+    std::string code(data.begin(), data.end());
+    std::string resp = R"({"ok":true,"name":")" + json_escape(name)
+                     + "\",\"code\":\"" + json_escape(code) + "\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp.c_str(), resp.size());
+    return ESP_OK;
+}
+
+/* POST /v1/lua/delete — delete a Lua script
+ *   Body: {"name":"walk.lua"}
+ */
+static esp_err_t api_lua_delete(httpd_req_t *req)
+{
+    char *buf = read_body(req);
+    if (!buf) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+
+    std::string name = json_get_str(buf, "name");
+    free(buf);
+
+    if (name.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing 'name' field", -1);
+        return ESP_OK;
+    }
+
+    std::string path = "/lua/" + name;
+    bool ok = fs::delete_file(path.c_str());
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, ok ? R"({"ok":true})" : R"({"ok":false})", -1);
+    return ESP_OK;
+}
+
+/* ── Helper to register an API handler ─────────────────────── */
+static void register_api(httpd_handle_t server, const char *method_str,
+                         const char *uri, httpd_method_t method,
+                         esp_err_t (*handler)(httpd_req_t *))
+{
+    httpd_uri_t h = {
+        .uri       = uri,
+        .method    = method,
+        .handler   = handler,
+        .user_ctx  = nullptr,
+        .is_websocket = false,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = nullptr,
+    };
+    httpd_register_uri_handler(server, &h);
+    ESP_LOGI(TAG, "  API: %s %s", method_str, uri);
+}
+
+/* ── Public API ─────────────────────────────────────────────── */
+
+bool start_http_server()
+{
+    if (s_server) {
+        ESP_LOGW(TAG, "HTTP server already running");
+        return true;
+    }
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 40;
+    config.max_open_sockets = 12;   // Must leave room for 3 internal HTTPD sockets
+    config.stack_size = 8192;
+    config.task_priority = 6;            // Priority 6 (per REQ-ROB-02)
+    config.core_id = 0;                  // Pin to Core 0 (PRO_CPU)
+    config.server_port = 80;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 60;       // Allow idle WS up to 60 s between frames
+    config.send_wait_timeout = 30;       // Allow slow sends (e.g. large replies)
+    config.close_fn = pwa_release_fd;    // Clean up PWA client slots on session close
+
+    if (httpd_start(&s_server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start HTTP server");
+        return false;
+    }
+
+    // ── Helper to register a static file handler ──
+    auto register_static = [&](const char *uri) {
+        httpd_uri_t h = {
+            .uri       = uri,
+            .method    = HTTP_GET,
+            .handler   = static_handler,
+            .user_ctx  = nullptr,
+            .is_websocket = false,
+            .handle_ws_control_frames = false,
+            .supported_subprotocol = nullptr,
+        };
+        httpd_register_uri_handler(s_server, &h);
+    };
+
+    // ── Register handlers for each known static file ──
+    register_static("/");
+    register_static("/index.html");
+    register_static("/m.js");
+    register_static("/index.css");
+    register_static("/icon.svg");
+    register_static("/manifest.json");
+    register_static("/sw.js");
+    register_static("/favicon.ico");
+
+    // ── Register WebSocket endpoint (telemetry) ──
+    httpd_uri_t ws_uri = {
+        .uri       = "/v1/telemetry/stream",
+        .method    = HTTP_GET,
+        .handler   = websocket_handler,
+        .user_ctx  = nullptr,
+        .is_websocket = true,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = nullptr,
+    };
+    httpd_register_uri_handler(s_server, &ws_uri);
+
+    // ── Register Chat WebSocket endpoint ──
+    httpd_uri_t chat_ws_uri = {
+        .uri       = "/v1/chat/ui",
+        .method    = HTTP_GET,
+        .handler   = chat_ws_handler,
+        .user_ctx  = nullptr,
+        .is_websocket = true,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = nullptr,
+    };
+    httpd_register_uri_handler(s_server, &chat_ws_uri);
+
+    // ── Register REST API endpoints ──
+    register_api(s_server, "GET",  "/v1/skills/list",   HTTP_GET,  api_skills_list);
+    register_api(s_server, "POST", "/v1/skills/run",    HTTP_POST, api_skills_run);
+    register_api(s_server, "GET",  "/v1/fs/list",       HTTP_GET,  api_fs_list);
+    register_api(s_server, "GET",  "/v1/fs/info",       HTTP_GET,  api_fs_info);
+    register_api(s_server, "GET",  "/v1/fs/read",       HTTP_GET,  api_fs_read);
+    register_api(s_server, "POST", "/v1/fs/delete",     HTTP_POST, api_fs_delete);
+    register_api(s_server, "POST", "/v1/skills/upload", HTTP_POST, api_skills_upload);
+
+    // ── Register robot control API endpoints ──
+    register_api(s_server, "POST", "/v1/robot/gait",           HTTP_POST, api_robot_gait);
+    register_api(s_server, "GET",  "/v1/robot/status",         HTTP_GET,  api_robot_status);
+    register_api(s_server, "POST", "/v1/robot/config",         HTTP_POST, api_robot_config);
+    register_api(s_server, "GET",  "/v1/robot/config",         HTTP_GET,  api_robot_get_config);
+    register_api(s_server, "POST", "/v1/robot/calibrate",      HTTP_POST, api_robot_calibrate);
+    register_api(s_server, "POST", "/v1/robot/calibrate/reset",HTTP_POST, api_robot_cal_reset);
+    register_api(s_server, "POST", "/v1/robot/diagnostic/ping", HTTP_POST, api_robot_diag_ping);
+    register_api(s_server, "POST", "/v1/robot/diagnostic/sweep",HTTP_POST, api_robot_diag_sweep);
+
+    // ── Register WiFi config API endpoints ──
+    register_api(s_server, "GET",  "/v1/wifi/status",          HTTP_GET,  api_wifi_status);
+    register_api(s_server, "POST", "/v1/wifi/connect",         HTTP_POST, api_wifi_connect);
+    register_api(s_server, "POST", "/v1/wifi/disconnect",      HTTP_POST, api_wifi_disconnect);
+    register_api(s_server, "POST", "/v1/wifi/forget",          HTTP_POST, api_wifi_forget);
+
+    // ── Register Lua API endpoints ──
+    register_api(s_server, "POST", "/v1/lua/run",              HTTP_POST, api_lua_run);
+    register_api(s_server, "GET",  "/v1/lua/list",             HTTP_GET,  api_lua_list);
+    register_api(s_server, "POST", "/v1/lua/save",             HTTP_POST, api_lua_save);
+    register_api(s_server, "GET",  "/v1/lua/read",             HTTP_GET,  api_lua_read);
+    register_api(s_server, "POST", "/v1/lua/delete",           HTTP_POST, api_lua_delete);
+
+    // ── Register Chat REST endpoint ──
+    register_api(s_server, "POST", "/v1/chat/send",            HTTP_POST, chat_send_handler);
+
+    ESP_LOGI(TAG, "HTTP server running on port 80 (Core 0, Priority 6)");
+    ESP_LOGI(TAG, "  → PWA:  http://%s/", AP_IP_ADDR);
+    ESP_LOGI(TAG, "  → WS:   ws://%s/v1/telemetry/stream", AP_IP_ADDR);
+    ESP_LOGI(TAG, "  → WS:   ws://%s/v1/chat/ui", AP_IP_ADDR);
+
+    return true;
+}
+
+void stop_http_server()
+{
+    if (s_server) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        ESP_LOGI(TAG, "HTTP server stopped");
+    }
+}
+
+}  // namespace network
