@@ -13,10 +13,6 @@
 #include "robot/robot.h"
 #include "wasm/wasm_sandbox.h"
 
-// Embedded .wasm binary — linked via EMBED_FILES in CMakeLists.txt
-extern const uint8_t test_skill_wasm_start[] asm("_binary_test_skill_wasm_start");
-extern const uint8_t test_skill_wasm_end[]   asm("_binary_test_skill_wasm_end");
-
 static const char *TAG = "main";
 
 static void init_nvs()
@@ -83,39 +79,5 @@ extern "C" void app_main(void)
 		ESP_LOGE(TAG, "Lua VM init failed — continuing without Lua scripting");
 	} else {
 		ESP_LOGI(TAG, "Lua VM ready — robot bindings registered");
-
-		// ── Quick Lua smoke test ──────────────────────────────
-		char lua_out[256];
-		esp_err_t lua_ret = lua_run_string(
-			R"(
-				print("Hello from Lua on ESP32-S3!")
-				local cfg = robot.get_config()
-				print("Current config: period=" .. cfg.period ..
-				      " height=" .. cfg.height ..
-				      " stride=" .. cfg.stride)
-			)",
-			lua_out, sizeof(lua_out), 5000);
-
-		if (lua_ret == ESP_OK) {
-			ESP_LOGI(TAG, "✅ Lua smoke test passed:\n%s", lua_out);
-		} else {
-			ESP_LOGW(TAG, "Lua smoke test failed (err=%d): %s",
-					 lua_ret, lua_out);
-		}
 	}
-
-	// Run the embedded test WASM binary
-	const size_t wasm_size = test_skill_wasm_end - test_skill_wasm_start;
-	ESP_LOGI(TAG, "Running embedded WASM (%zu bytes)", wasm_size);
-
-	wasm::SandboxResult result = wasm::load_and_run_bytes(
-		test_skill_wasm_start, wasm_size, "on_start", 3000);
-
-	if (result == wasm::SandboxResult::Success) {
-		ESP_LOGI(TAG, "✅ Embedded WASM executed successfully");
-	} else {
-		ESP_LOGE(TAG, "❌ Embedded WASM execution failed (code=%d)",
-				 static_cast<int>(result));
-	}
-
 }

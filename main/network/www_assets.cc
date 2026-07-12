@@ -37,7 +37,6 @@ DECLARE_EMBED(manifest_json);
 DECLARE_EMBED(manifest_json_gz);
 DECLARE_EMBED(sw_js);
 DECLARE_EMBED(sw_js_gz);
-DECLARE_EMBED(test_skill_wasm);
 
 /* ── File descriptor table ──────────────────────────────────── */
 
@@ -62,11 +61,6 @@ static const AssetFile ASSETS[] = {
     { "/manifest.json.gz",_binary_manifest_json_gz_start,_binary_manifest_json_gz_end},
     { "/sw.js",           _binary_sw_js_start,         _binary_sw_js_end          },
     { "/sw.js.gz",        _binary_sw_js_gz_start,      _binary_sw_js_gz_end       },
-};
-
-/* ── Skill binary deployed to LittleFS root ────────────────── */
-static const AssetFile SKILL = {
-    "/test_skill.wasm", _binary_test_skill_wasm_start, _binary_test_skill_wasm_end
 };
 
 static constexpr int NUM_ASSETS = sizeof(ASSETS) / sizeof(ASSETS[0]);
@@ -114,16 +108,6 @@ bool network::deploy_www_assets()
 
     ESP_LOGI(TAG, "Deployed %d PWA assets (%zu bytes) to LittleFS",
              deployed, total_bytes);
-
-    // Deploy embedded test_skill.wasm to LittleFS root for Skills menu
-    if (SKILL.size() > 0) {
-        if (fs::write_file(SKILL.name, SKILL.start, SKILL.size())) {
-            ESP_LOGI(TAG, "Deployed test_skill.wasm (%zu bytes)", SKILL.size());
-        } else {
-            ESP_LOGE(TAG, "Failed to deploy test_skill.wasm");
-            return false;
-        }
-    }
 
     return true;
 }

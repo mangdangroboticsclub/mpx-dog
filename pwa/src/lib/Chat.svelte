@@ -20,16 +20,41 @@
     );
   }
 
+  // ── Session ID persistence ───────────────────────────────────
+  const SESSION_STORAGE_KEY = "mpx_active_session_id";
+
+  /**
+   * Restore the last active session ID from localStorage, or generate
+   * a fresh one on first visit.  This ensures the session ID survives
+   * component re-mounts (SPA navigation, page refresh) so the server
+   * always receives the same identifier — preserving AI context.
+   */
+  function restoreSessionId() {
+    try {
+      const saved = localStorage.getItem(SESSION_STORAGE_KEY);
+      if (saved) return saved;
+    } catch { /* localStorage unavailable — ignore */ }
+    return generateUUID();
+  }
+
   // ── State ────────────────────────────────────────────────────
   /** Plain variable (not $state) — avoids reactive cascade from $effect tracking */
   let ws = null;
   let connected = $state(false);
   let sending = $state(false);
-  let sessionId = $state(generateUUID());
+  let sessionId = $state(restoreSessionId());
   let messages = $state([]);
   let inputText = $state("");
   let sidebarRefreshKey = $state(0);
   let sessionAckBadge = $state(false);     // show "Session reset" badge in header
+
+  // ── Live timer for response counter ─────────────────────────
+  let now = $state(Date.now());
+  let lastSentTs = $state(null);
+  $effect(() => {
+    const id = setInterval(() => { now = Date.now(); }, 200);
+    return () => clearInterval(id);
+  });
 
   // ── Permission state ─────────────────────────────────────────
   let pendingActions = $state([]); // { id, type, description, status }
@@ -65,6 +90,99 @@
     return raw
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/\son\w+\s*=\s*["']?[^"'\s>]+["']?/gi, "");
+  }
+
+  // ── Timestamp & date helpers ────────────────────────────────
+
+  /** Normalize a timestamp to milliseconds — accepts ms or seconds epoch */
+  function normalizeTs(ts) {
+    return ts < 100000000000 ? ts * 1000 : ts;
+  }
+
+  /** Format a timestamp for display (HH:MM) */
+  function formatTimestamp(ts) {
+    if (!ts) return "";
+    const d = new Date(normalizeTs(ts));
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  /** Extract the best timestamp from a message object */
+  function getMsgTs(msg) {
+    if (msg.ts) return msg.ts;
+    if (msg.history && msg.history.length > 0) return msg.history[0].ts;
+    return null;
+  }
+
+  /** Check if two messages are on different calendar days */
+  function isNewDay(a, b) {
+    const tsA = getMsgTs(a);
+    const tsB = getMsgTs(b);
+    if (!tsA || !tsB) return false;
+    const dA = new Date(normalizeTs(tsA));
+    const dB = new Date(normalizeTs(tsB));
+    return dA.getDate() !== dB.getDate() || dA.getMonth() !== dB.getMonth() || dA.getFullYear() !== dB.getFullYear();
+  }
+
+  /**
+   * Walk backwards from `fromIdx` to find the nearest message with a valid
+   * timestamp. Falls back to `messages[fromIdx]` if none found.
+   */
+  function findPrevTimestampMsg(messages, fromIdx) {
+    for (let i = fromIdx; i >= 0; i--) {
+      if (getMsgTs(messages[i])) return messages[i];
+    }
+    return messages[fromIdx];
+  }
+
+  /** Check if a message is from a previous day (not today) */
+  function isFromPastDay(msg) {
+    const ts = getMsgTs(msg);
+    if (!ts) return false;
+    const d = new Date(normalizeTs(ts));
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const msgDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    return msgDay.getTime() !== today.getTime();
+  }
+
+  /** Format a date label for the date delineator */
+  function formatDateLabel(msg) {
+    const ts = getMsgTs(msg);
+    if (!ts) return "";
+    const d = new Date(normalizeTs(ts));
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const dateDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const diffDays = Math.round((today - dateDay) / 86400000);
+    if (diffDays === 0) return "Today";
+    if (diffDays === 1) return "Yesterday";
+    if (diffDays < 7) {
+      const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+      return days[d.getDay()];
+    }
+    return d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+  }
+
+  /** Compute response seconds between a user msg and following bot reply */
+  function getResponseSeconds(messages, botIdx) {
+    if (botIdx <= 0) return null;
+    const botMsg = messages[botIdx];
+    if (!botMsg || botMsg.role !== "bot") return null;
+    // Search backwards for the preceding user message (skipping step/system in-between)
+    let userMsg = null;
+    for (let i = botIdx - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        userMsg = messages[i];
+        break;
+      }
+    }
+    if (!userMsg) return null;
+    const start = userMsg.ts || userMsg.history?.[0]?.ts;
+    const end = botMsg.ts;
+    if (!start || !end) return null;
+    const diff = normalizeTs(end) - normalizeTs(start);
+    if (diff <= 0) return null;
+    return (diff / 1000).toFixed(1);
   }
 
   const WS_URL = `ws://${location.host}/v1/chat/ui`;
@@ -360,6 +478,7 @@
     }];
     inputText = "";
     sending = true;
+    lastSentTs = Date.now();
 
     ws.send(JSON.stringify({
       type: "user_chat_input",
@@ -457,9 +576,26 @@
     }
   });
 
+  // ── Persist sessionId on every change ───────────────────────
+  $effect(() => {
+    const id = sessionId;
+    // Sync the current session ID to localStorage so it survives
+    // component re-mounts and page refreshes.
+    try {
+      localStorage.setItem(SESSION_STORAGE_KEY, id);
+    } catch { /* localStorage unavailable — silent */ }
+  });
+
   // ── Lifecycle ────────────────────────────────────────────────
 
   onMount(() => {
+    // Restore messages for the last active conversation so the user
+    // sees continuity instead of a blank chat after re-mount.
+    const convo = getConversation(sessionId);
+    if (convo && convo.messages.length > 0) {
+      messages = convo.messages;
+    }
+
     connect();
     return () => disconnect();
   });
@@ -538,7 +674,15 @@
       </p>
     {/if}
 
-    {#each messages as msg}
+    {#each messages as msg, i}
+      <!-- Date delineator: always show on first message, or between messages on different days -->
+      {#if i === 0 || (i > 0 && isNewDay(findPrevTimestampMsg(messages, i - 1), msg))}
+        <div class="flex justify-center my-3">
+          <span class="text-[11px] text-mpx-muted bg-mpx-surface/60 px-3 py-1 rounded-full border border-mpx-muted/10">
+            {formatDateLabel(msg)}
+          </span>
+        </div>
+      {/if}
       {#if msg.role === "step"}
         <!-- Step message — progress indicator -->
         <div class="flex justify-start">
@@ -558,33 +702,92 @@
           <div class="max-w-[80%]">
             <div class="rounded-xl px-4 py-2 text-sm bg-mpx-orange text-white rounded-br-sm">
               {msg.text}
+              {#if msg.ts}
+                <div class="text-[9px] text-white/40 text-right mt-0.5">{formatTimestamp(msg.ts)}</div>
+              {/if}
             </div>
-            <!-- Timeline indicator -->
+            <!-- Timeline indicator (one-line status + expand) -->
             {#if msg.history && msg.history.length > 0}
-              <div class="mt-1 space-y-0.5">
-                {#each msg.history as entry}
+              {@const lastEntry = msg.history[msg.history.length - 1]}
+              <div class="mt-1">
+                {#if msg.history.length === 1}
+                  <!-- Single entry — plain status line -->
                   <div class="flex items-center gap-1.5 text-xs text-mpx-muted">
-                    {#if entry.stage === "sending"}
-                      <span class="w-1.5 h-1.5 rounded-full bg-yellow-400"></span>
+                    {#if lastEntry.stage === "sending"}
+                      <span class="w-1.5 h-1.5 rounded-full bg-yellow-400 shrink-0"></span>
                       <span>Sending…</span>
-                    {:else if entry.stage === "sent"}
-                      <span class="w-1.5 h-1.5 rounded-full bg-blue-400"></span>
+                    {:else if lastEntry.stage === "sent"}
+                      <span class="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0"></span>
                       <span>Sent</span>
-                    {:else if entry.stage === "relayed"}
-                      <span class="w-1.5 h-1.5 rounded-full bg-blue-400"></span>
+                    {:else if lastEntry.stage === "relayed"}
+                      <span class="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0"></span>
                       <span>Relayed to cloud</span>
-                    {:else if entry.stage === "processing"}
-                      <span class="w-1.5 h-1.5 rounded-full bg-purple-400"></span>
+                    {:else if lastEntry.stage === "processing"}
+                      <span class="w-1.5 h-1.5 rounded-full bg-purple-400 shrink-0"></span>
                       <span>AI processing…</span>
-                    {:else if entry.stage === "step"}
-                      <span class="w-1.5 h-1.5 rounded-full bg-mpx-orange"></span>
-                      <span>Step {entry.seq}/{entry.total}: {entry.text}</span>
-                    {:else if entry.stage === "completed"}
-                      <span class="w-1.5 h-1.5 rounded-full bg-green-400"></span>
+                    {:else if lastEntry.stage === "step"}
+                      <span class="w-1.5 h-1.5 rounded-full bg-mpx-orange shrink-0"></span>
+                      <span>Step {lastEntry.seq}/{lastEntry.total}: {lastEntry.text}</span>
+                    {:else if lastEntry.stage === "completed"}
+                      <span class="w-1.5 h-1.5 rounded-full bg-green-400 shrink-0"></span>
                       <span class="text-green-400">✓ Complete</span>
                     {/if}
                   </div>
-                {/each}
+                {:else}
+                  <!-- Multiple entries — summary has status + arrow+count on one line -->
+                  <details class="group">
+                    <summary class="flex items-center gap-1.5 text-xs text-mpx-muted list-none cursor-pointer">
+                      {#if lastEntry.stage === "sending"}
+                        <span class="w-1.5 h-1.5 rounded-full bg-yellow-400 shrink-0"></span>
+                        <span>Sending…</span>
+                      {:else if lastEntry.stage === "sent"}
+                        <span class="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0"></span>
+                        <span>Sent</span>
+                      {:else if lastEntry.stage === "relayed"}
+                        <span class="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0"></span>
+                        <span>Relayed to cloud</span>
+                      {:else if lastEntry.stage === "processing"}
+                        <span class="w-1.5 h-1.5 rounded-full bg-purple-400 shrink-0"></span>
+                        <span>AI processing…</span>
+                      {:else if lastEntry.stage === "step"}
+                        <span class="w-1.5 h-1.5 rounded-full bg-mpx-orange shrink-0"></span>
+                        <span>Step {lastEntry.seq}/{lastEntry.total}: {lastEntry.text}</span>
+                      {:else if lastEntry.stage === "completed"}
+                        <span class="w-1.5 h-1.5 rounded-full bg-green-400 shrink-0"></span>
+                        <span class="text-green-400">✓ Complete</span>
+                      {/if}
+                      <span class="text-mpx-muted/40 hover:text-mpx-orange transition-colors flex items-center gap-0.5">
+                        <span class="inline-block transition-transform group-open:rotate-90 text-[10px]">▶</span>
+                        <span class="text-[11px]">{msg.history.length - 1}</span>
+                      </span>
+                    </summary>
+                    <div class="mt-0.5 space-y-0.5">
+                      {#each [...msg.history].reverse().slice(1) as entry}
+                        <div class="flex items-center gap-1.5 text-xs text-mpx-muted/70">
+                          {#if entry.stage === "sending"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-yellow-400/60"></span>
+                            <span>Sending…</span>
+                          {:else if entry.stage === "sent"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-blue-400/60"></span>
+                            <span>Sent</span>
+                          {:else if entry.stage === "relayed"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-blue-400/60"></span>
+                            <span>Relayed to cloud</span>
+                          {:else if entry.stage === "processing"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-purple-400/60"></span>
+                            <span>AI processing…</span>
+                          {:else if entry.stage === "step"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-mpx-orange/60"></span>
+                            <span>Step {entry.seq}/{entry.total}: {entry.text}</span>
+                          {:else if entry.stage === "completed"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-green-400/60"></span>
+                            <span class="text-green-400/70">✓ Complete</span>
+                          {/if}
+                        </div>
+                      {/each}
+                    </div>
+                  </details>
+                {/if}
               </div>
             {/if}
           </div>
@@ -595,6 +798,9 @@
           <div class="max-w-[80%]">
             <div class="prose prose-sm prose-invert max-w-none rounded-xl px-4 py-2 bg-mpx-surface text-mpx-text rounded-bl-sm markdown-body">
               {@html renderMarkdown(msg.text)}
+              {#if msg.ts}
+                <div class="text-[9px] text-mpx-muted/40 text-right mt-0.5">{formatTimestamp(msg.ts)}</div>
+              {/if}
             </div>
             {#if msg.commands && msg.commands.length > 0}
               <details class="mt-1">
@@ -660,6 +866,16 @@
         </div>
       {/if}
     {/each}
+
+    <!-- Live response throbber + counter (left side while waiting) -->
+    {#if sending && lastSentTs}
+      <div class="flex justify-start">
+        <div class="flex items-center gap-3 px-4 py-3 rounded-xl bg-mpx-surface/30 border border-mpx-muted/10">
+          <span class="w-5 h-5 border-2 border-mpx-orange/60 border-t-mpx-orange rounded-full animate-spin"></span>
+          <span class="text-base font-mono text-mpx-muted tabular-nums">{Math.floor((now - lastSentTs) / 1000)}s</span>
+        </div>
+      </div>
+    {/if}
 
     <!-- Scroll anchor for auto-scroll -->
     <div bind:this={scrollAnchor}></div>

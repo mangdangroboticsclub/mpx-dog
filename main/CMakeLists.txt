@@ -16,7 +16,6 @@ idf_component_register(
         "lua/lua_bindings.cc"
     INCLUDE_DIRS "." "fs" "wasm" "sdk" "network" "robot" "lua"
     EMBED_FILES
-        "test_skill.wasm"
         # PWA static assets (www output from pwa/ build)
         "../pwa/www/icon.svg"
         "../pwa/www/icon.svg.gz"
