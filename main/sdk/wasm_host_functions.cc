@@ -123,6 +123,14 @@ int32_t host_robot_gait(wasm_exec_env_t exec_env,
 	else if (std::strcmp(name, "moveRF")   == 0) cmd = robot::GaitCmd::MoveRightFront;
 	else if (std::strcmp(name, "moveLB")   == 0) cmd = robot::GaitCmd::MoveLeftBack;
 	else if (std::strcmp(name, "moveRB")   == 0) cmd = robot::GaitCmd::MoveRightBack;
+	else if (std::strcmp(name, "stanford") == 0) cmd = robot::GaitCmd::StanfordWalk;
+	else if (std::strcmp(name, "frontkick")== 0) cmd = robot::GaitCmd::FrontKick;
+	else if (std::strcmp(name, "wiggle")   == 0) cmd = robot::GaitCmd::Wiggle;
+	else if (std::strcmp(name, "buttshrug")== 0) cmd = robot::GaitCmd::ButtShrug;
+	else if (std::strcmp(name, "wiggleL")  == 0) cmd = robot::GaitCmd::WiggleLeft;
+	else if (std::strcmp(name, "wiggleR")  == 0) cmd = robot::GaitCmd::WiggleRight;
+	else if (std::strcmp(name, "buttshrugL")==0) cmd = robot::GaitCmd::ButtShrugLeft;
+	else if (std::strcmp(name, "buttshrugR")==0) cmd = robot::GaitCmd::ButtShrugRight;
 	else {
 		ESP_LOGW(TAG, "robot_gait: unknown gait \"%s\"", name);
 		return -1;
@@ -144,7 +152,9 @@ int32_t host_robot_set_config(wasm_exec_env_t exec_env,
 							  int32_t up_height, int32_t stride,
 							  int32_t tilt)
 {
-	robot::Config cfg;
+	// Start from the CURRENT config so fields not exposed to WASM
+	// (e.g. sg_speed, the Stanford walk speed) keep their values.
+	robot::Config cfg = robot::get_config();
 	cfg.period    = static_cast<int>(period);
 	cfg.height    = static_cast<int>(height);
 	cfg.up_height = static_cast<int>(up_height);

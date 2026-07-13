@@ -28,6 +28,9 @@ export const ROBOT_COMPLETIONS: RobotCompletion[] = [
       "'heightup', 'heightdown', 'balance', 'bowback',\n" +
       "'bodycycle', 'headellipse',\n" +
       "'moveLF', 'moveRF', 'moveLB', 'moveRB',\n" +
+      "'stanford' (Stanford Pupper trot walk),\n" +
+      "'frontkick', 'wiggle', 'buttshrug',\n" +
+      "'wiggleL', 'wiggleR', 'buttshrugL', 'buttshrugR' (FPC),\n" +
       "'testspeed', 'none'",
   },
   {
@@ -39,12 +42,12 @@ export const ROBOT_COMPLETIONS: RobotCompletion[] = [
   // ── Configuration ────────────────────────────────────────────
   {
     label: "robot.get_config",
-    detail: "robot.get_config() → {period, height, up_height, stride, tilt}",
+    detail: "robot.get_config() → {period, height, up_height, stride, tilt, sg_speed}",
     info: "Returns the current gait parameters as a Lua table.",
   },
   {
     label: "robot.set_config",
-    detail: "robot.set_config(period, height, up_height, stride, tilt)",
+    detail: "robot.set_config(period, height, up_height, stride, tilt, sg_speed)",
     info:
       "Set gait parameters.\n" +
       "All arguments are optional — pass nil to keep the current value.\n" +

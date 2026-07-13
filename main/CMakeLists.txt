@@ -11,6 +11,8 @@ idf_component_register(
         "network/crypto.cc"
         "network/chat_ws.cc"
         "robot/robot.cc"
+        "robot/stanford_gait.cc"
+        "robot/stanford_kinematics.cc"
         "robot/imu.cc"
         "lua/lua_vm.cc"
         "lua/lua_bindings.cc"

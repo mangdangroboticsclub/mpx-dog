@@ -63,7 +63,10 @@ static bool check_servo_id(lua_State *L, int arg, int *out_id)
  * "bowback", "bodycycle", "headellipse",
  * "moveLF", "moveRF", "moveLB", "moveRB",
  * "testspeed", "roll", "pitch", "stretch",
- * "lookul", "lookur", "lookll", "looklr"
+ * "lookul", "lookur", "lookll", "looklr",
+ * "stanford" (Stanford Pupper trot walk),
+ * "frontkick", "wiggle", "buttshrug",
+ * "wiggleL", "wiggleR", "buttshrugL", "buttshrugR" (FPC choreography)
  */
 static int l_robot_gait(lua_State *L)
 {
@@ -109,6 +112,14 @@ static int l_robot_gait(lua_State *L)
     else if (strcmp(name, "moveRF")    == 0) cmd = robot::GaitCmd::MoveRightFront;
     else if (strcmp(name, "moveLB")    == 0) cmd = robot::GaitCmd::MoveLeftBack;
     else if (strcmp(name, "moveRB")    == 0) cmd = robot::GaitCmd::MoveRightBack;
+    else if (strcmp(name, "stanford")  == 0) cmd = robot::GaitCmd::StanfordWalk;
+    else if (strcmp(name, "frontkick") == 0) cmd = robot::GaitCmd::FrontKick;
+    else if (strcmp(name, "wiggle")    == 0) cmd = robot::GaitCmd::Wiggle;
+    else if (strcmp(name, "buttshrug") == 0) cmd = robot::GaitCmd::ButtShrug;
+    else if (strcmp(name, "wiggleL")   == 0) cmd = robot::GaitCmd::WiggleLeft;
+    else if (strcmp(name, "wiggleR")   == 0) cmd = robot::GaitCmd::WiggleRight;
+    else if (strcmp(name, "buttshrugL")== 0) cmd = robot::GaitCmd::ButtShrugLeft;
+    else if (strcmp(name, "buttshrugR")== 0) cmd = robot::GaitCmd::ButtShrugRight;
     else {
         lua_pushfstring(L, "unknown gait name '%s'", name);
         return lua_error(L);
@@ -166,6 +177,14 @@ static int l_robot_get_mode(lua_State *L)
         case robot::GaitCmd::MoveRightFront: name = "moveRF";      break;
         case robot::GaitCmd::MoveLeftBack:   name = "moveLB";      break;
         case robot::GaitCmd::MoveRightBack:  name = "moveRB";      break;
+        case robot::GaitCmd::StanfordWalk:   name = "stanford";    break;
+        case robot::GaitCmd::FrontKick:      name = "frontkick";   break;
+        case robot::GaitCmd::Wiggle:         name = "wiggle";      break;
+        case robot::GaitCmd::ButtShrug:      name = "buttshrug";   break;
+        case robot::GaitCmd::WiggleLeft:     name = "wiggleL";     break;
+        case robot::GaitCmd::WiggleRight:    name = "wiggleR";     break;
+        case robot::GaitCmd::ButtShrugLeft:  name = "buttshrugL";  break;
+        case robot::GaitCmd::ButtShrugRight: name = "buttshrugR";  break;
     }
 
     lua_pushstring(L, name);
@@ -175,8 +194,9 @@ static int l_robot_get_mode(lua_State *L)
 /* ── Configuration ────────────────────────────────────────────────────── */
 
 /**
- * robot.set_config(period, height, up_height, stride, tilt)
- *   — Set gait parameters (integers).
+ * robot.set_config(period, height, up_height, stride, tilt, sg_speed)
+ *   — Set gait parameters (integers).  sg_speed is the Stanford walk /
+ *     diagonal speed in mm/s (10..200).
  *
  * All parameters are optional — pass nil to keep current value.
  */
@@ -190,10 +210,12 @@ static int l_robot_set_config(lua_State *L)
     if (n >= 3 && !lua_isnil(L, 3)) cfg.up_height = (int)luaL_checkinteger(L, 3);
     if (n >= 4 && !lua_isnil(L, 4)) cfg.stride    = (int)luaL_checkinteger(L, 4);
     if (n >= 5 && !lua_isnil(L, 5)) cfg.tilt      = (int)luaL_checkinteger(L, 5);
+    if (n >= 6 && !lua_isnil(L, 6)) cfg.sg_speed  = (int)luaL_checkinteger(L, 6);
 
     robot::set_config(cfg);
-    ESP_LOGI(TAG, "set_config: p=%d h=%d uh=%d s=%d t=%d",
-             cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt);
+    ESP_LOGI(TAG, "set_config: p=%d h=%d uh=%d s=%d t=%d sg=%d",
+             cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt,
+             cfg.sg_speed);
     return 0;
 }
 
@@ -205,12 +227,13 @@ static int l_robot_get_config(lua_State *L)
 {
     robot::Config cfg = robot::get_config();
 
-    lua_createtable(L, 0, 5);
+    lua_createtable(L, 0, 6);
     lua_pushinteger(L, cfg.period);    lua_setfield(L, -2, "period");
     lua_pushinteger(L, cfg.height);    lua_setfield(L, -2, "height");
     lua_pushinteger(L, cfg.up_height); lua_setfield(L, -2, "up_height");
     lua_pushinteger(L, cfg.stride);    lua_setfield(L, -2, "stride");
     lua_pushinteger(L, cfg.tilt);      lua_setfield(L, -2, "tilt");
+    lua_pushinteger(L, cfg.sg_speed);  lua_setfield(L, -2, "sg_speed");
     return 1;
 }
 

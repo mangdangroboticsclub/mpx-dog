@@ -11,6 +11,7 @@
   let upHeight = $state(10);
   let stride = $state(10);
   let tilt = $state(10);
+  let sgSpeed = $state(50);   // Stanford walk / diagonal speed (mm/s)
 
   // Offsets (loaded from robot)
   let offsets = $state(Array(12).fill(0));
@@ -32,6 +33,7 @@
         upHeight = data.config?.up_height ?? upHeight;
         stride = data.config?.stride ?? stride;
         tilt = data.config?.tilt ?? tilt;
+        sgSpeed = data.config?.sg_speed ?? sgSpeed;
         if (data.offsets) offsets = data.offsets;
         statusError = "";
       } else {
@@ -61,7 +63,7 @@
       await fetch("/v1/robot/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ period, height, up_height: upHeight, stride, tilt }),
+        body: JSON.stringify({ period, height, up_height: upHeight, stride, tilt, sg_speed: sgSpeed }),
       });
     } catch (e) {
       console.error("Config update failed:", e);
@@ -87,7 +89,85 @@
     if (param === "upHeight") { upHeight = Math.max(0, Math.min(50, upHeight + delta)); }
     if (param === "stride")   { stride   = Math.max(0, Math.min(60, stride + delta)); }
     if (param === "tilt")     { tilt     = Math.max(0, Math.min(60, tilt + delta)); }
+    if (param === "sgSpeed")  { sgSpeed  = Math.max(10, Math.min(200, sgSpeed + delta)); }
     updateConfig();
+  }
+
+  // ── Joystick (mini_pupper_web_controller style) ─────────────
+  // Left pad: forward/strafe.  Right pad: turn.  Values -1..1 are
+  // sent to /v1/robot/joy ~10x/s while a pad is touched; touching a
+  // pad auto-starts the Stanford walk, releasing steps in place.
+  let joyF = 0, joyS = 0, joyT = 0;          // current stick values
+  let joyKnobL = $state({ x: 0, y: 0 });     // knob positions (-1..1) for display
+  let joyKnobR = $state({ x: 0 });
+  let joyTimer = null;
+
+  async function sendJoy() {
+    try {
+      await fetch("/v1/robot/joy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ f: joyF, s: joyS, t: joyT }),
+      });
+    } catch (e) { /* transient — keep trying while pad is held */ }
+  }
+
+  function joyStartTimer() {
+    if (!joyTimer) {
+      sendJoy();
+      joyTimer = setInterval(sendJoy, 100);
+    }
+  }
+
+  function joyStopIfIdle() {
+    if (joyF === 0 && joyS === 0 && joyT === 0 && joyTimer) {
+      clearInterval(joyTimer);
+      joyTimer = null;
+      sendJoy();               // final zeros -> step in place
+    }
+  }
+
+  // Normalised -1..1 position of the pointer inside the pad element.
+  function padPos(e, el) {
+    const r = el.getBoundingClientRect();
+    let x = ((e.clientX - r.left) / r.width) * 2 - 1;
+    let y = ((e.clientY - r.top) / r.height) * 2 - 1;
+    x = Math.max(-1, Math.min(1, x));
+    y = Math.max(-1, Math.min(1, y));
+    return { x, y };
+  }
+
+  function padLeftMove(e) {
+    if (e.buttons === 0 && e.type === "pointermove") return;
+    const p = padPos(e, e.currentTarget);
+    joyF = -p.y;               // pad up    = forward (+)
+    joyS = -p.x;               // pad left  = strafe left (+)
+    joyKnobL = { x: p.x, y: p.y };
+    joyStartTimer();
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  }
+
+  function padLeftEnd() {
+    joyF = 0; joyS = 0;
+    joyKnobL = { x: 0, y: 0 };
+    joyStopIfIdle();
+    if (joyTimer) sendJoy();   // right pad may still be active
+  }
+
+  function padRightMove(e) {
+    if (e.buttons === 0 && e.type === "pointermove") return;
+    const p = padPos(e, e.currentTarget);
+    joyT = -p.x;               // pad left = turn left (+)
+    joyKnobR = { x: p.x };
+    joyStartTimer();
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  }
+
+  function padRightEnd() {
+    joyT = 0;
+    joyKnobR = { x: 0 };
+    joyStopIfIdle();
+    if (joyTimer) sendJoy();
   }
 
   // ── Offset helpers ─────────────────────────────────────────
@@ -151,7 +231,12 @@
   }
 
   // ── Init ───────────────────────────────────────────────────
-  $effect(() => { fetchStatus(); });
+  $effect(() => {
+    fetchStatus();
+    return () => {              // stop the joystick sender on unmount
+      if (joyTimer) { clearInterval(joyTimer); joyTimer = null; }
+    };
+  });
 
   // ── Button config ──────────────────────────────────────────
   const gaitActions = {
@@ -251,6 +336,17 @@
           </div>
         </div>
 
+        <!-- Stanford Walk (exact StanfordQuadruped trot gait) -->
+        <div class="flex justify-center mb-3">
+          <button onclick={() => sendGait("stanford")}
+                  class="flex-1 max-w-60 rounded-xl py-2.5 text-sm font-bold text-white
+                         bg-teal-600 hover:bg-teal-700 active:bg-teal-800
+                         {activeMode === 'stanford' ? 'ring-2 ring-white/60' : ''}
+                         transition-all cursor-pointer active:scale-95">
+            🐕 Stanford Walk
+          </button>
+        </div>
+
         <!-- Rotation row -->
         <div class="flex justify-center gap-3">
           <button onclick={() => sendGait("turnL")}
@@ -267,6 +363,49 @@
                          transition-all cursor-pointer active:scale-95">
             Turn R ↻
           </button>
+        </div>
+      </div>
+
+      <!-- ═══════════════════════════════════════════════════════
+           Joystick (Stanford walk) — like the minipupperesp
+           web controller: left pad drive/strafe, right pad turn.
+           ═══════════════════════════════════════════════════════ -->
+      <div class="rounded-xl bg-mpx-surface border border-mpx-muted/10 px-4 py-4">
+        <p class="text-xs text-mpx-muted mb-1 uppercase tracking-wide font-semibold">Joystick</p>
+        <p class="text-[11px] text-mpx-muted mb-3">
+          Touch to trot (Stanford gait, {sgSpeed} mm/s max) — release to step in place
+        </p>
+        <div class="flex justify-center gap-4 select-none touch-none">
+          <!-- Left pad: forward / strafe -->
+          <div class="relative w-36 h-36 rounded-2xl bg-mpx-bg border border-mpx-muted/20
+                      touch-none cursor-pointer"
+               onpointerdown={padLeftMove}
+               onpointermove={padLeftMove}
+               onpointerup={padLeftEnd}
+               onpointercancel={padLeftEnd}
+               onlostpointercapture={padLeftEnd}>
+            <span class="absolute top-1 left-1/2 -translate-x-1/2 text-[10px] text-mpx-muted">▲ fwd</span>
+            <span class="absolute bottom-1 left-1/2 -translate-x-1/2 text-[10px] text-mpx-muted">▼ back</span>
+            <span class="absolute left-1.5 top-1/2 -translate-y-1/2 text-[10px] text-mpx-muted">◀</span>
+            <span class="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-mpx-muted">▶</span>
+            <div class="absolute w-9 h-9 rounded-full bg-teal-500/90 shadow pointer-events-none"
+                 style="left: calc(50% + {joyKnobL.x * 36}px - 18px);
+                        top:  calc(50% + {joyKnobL.y * 36}px - 18px);"></div>
+          </div>
+          <!-- Right pad: turn -->
+          <div class="relative w-36 h-36 rounded-2xl bg-mpx-bg border border-mpx-muted/20
+                      touch-none cursor-pointer"
+               onpointerdown={padRightMove}
+               onpointermove={padRightMove}
+               onpointerup={padRightEnd}
+               onpointercancel={padRightEnd}
+               onlostpointercapture={padRightEnd}>
+            <span class="absolute left-1.5 top-1/2 -translate-y-1/2 text-[10px] text-mpx-muted">↺ L</span>
+            <span class="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-mpx-muted">R ↻</span>
+            <div class="absolute w-9 h-9 rounded-full bg-cyan-500/90 shadow pointer-events-none"
+                 style="left: calc(50% + {joyKnobR.x * 36}px - 18px);
+                        top:  calc(50% - 18px);"></div>
+          </div>
         </div>
       </div>
 
@@ -379,6 +518,13 @@
             { m: "heightup",   l: "Height ▲",  c: "bg-pink-700 hover:bg-pink-800 active:bg-pink-900" },
             { m: "heightdown", l: "Height ▼",  c: "bg-pink-700 hover:bg-pink-800 active:bg-pink-900" },
             { m: "balance",    l: "Balance",   c: "bg-teal-700 hover:bg-teal-800 active:bg-teal-900" },
+            { m: "frontkick",  l: "🐴 Front Kick", c: "bg-rose-700 hover:bg-rose-800 active:bg-rose-900" },
+            { m: "wiggle",     l: "🐕 Wiggle",     c: "bg-rose-700 hover:bg-rose-800 active:bg-rose-900" },
+            { m: "buttshrug",  l: "Butt Shrug",   c: "bg-rose-700 hover:bg-rose-800 active:bg-rose-900" },
+            { m: "wiggleL",    l: "Wiggle ◀",     c: "bg-rose-600 hover:bg-rose-700 active:bg-rose-800" },
+            { m: "wiggleR",    l: "▶ Wiggle",     c: "bg-rose-600 hover:bg-rose-700 active:bg-rose-800" },
+            { m: "buttshrugL", l: "Shrug ◀",      c: "bg-rose-600 hover:bg-rose-700 active:bg-rose-800" },
+            { m: "buttshrugR", l: "▶ Shrug",      c: "bg-rose-600 hover:bg-rose-700 active:bg-rose-800" },
             { m: "bowback",    l: "Bow",       c: "bg-fuchsia-700 hover:bg-fuchsia-800 active:bg-fuchsia-900" },
             { m: "bodycycle",  l: "Body Circle", c: "bg-fuchsia-700 hover:bg-fuchsia-800 active:bg-fuchsia-900" },
             { m: "headellipse",l: "Head Ellipse",c: "bg-fuchsia-700 hover:bg-fuchsia-800 active:bg-fuchsia-900" },
@@ -410,6 +556,7 @@
             { label: "Lift (mm)",    key: "upHeight", val: upHeight,  min: 0,   max: 50,   step: 2 },
             { label: "Stride (mm)",  key: "stride",   val: stride,   min: 0,   max: 60,   step: 2 },
             { label: "Tilt (°)",     key: "tilt",     val: tilt,     min: 0,   max: 60,   step: 2 },
+            { label: "Walk speed (mm/s)", key: "sgSpeed", val: sgSpeed, min: 10, max: 200, step: 5 },
           ] as param}
             <div>
               <div class="flex justify-between text-xs mb-1">
@@ -434,6 +581,7 @@
                     else if (param.key === "upHeight") upHeight = v;
                     else if (param.key === "stride") stride = v;
                     else if (param.key === "tilt") tilt = v;
+                    else if (param.key === "sgSpeed") sgSpeed = v;
                   }}
                   onchange={updateConfig}
                   class="flex-1 accent-mpx-orange h-1.5 rounded-full

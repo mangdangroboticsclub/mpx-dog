@@ -19,10 +19,46 @@ constexpr float L1 = 50.0f;   // Upper leg length (mm)
 constexpr float L2 = 56.0f;   // Lower leg length (mm)
 constexpr float PI = 3.14159265358979f;
 
+// ── Servo signal range ───────────────────────────────────────
+// The Feetech SCSCL bus servos on this robot sweep 0–180° over the
+// raw range 0..1023 (centre 511 = 90°).  IK angles are commanded
+// RELATIVE to the centre, so the usable command range is ±90°.
+constexpr float SERVO_RANGE_DEG   = 180.0f;
+constexpr float SERVO_DEG_TO_RAW  = 1023.0f / SERVO_RANGE_DEG;   // ≈ 5.683
+
+// ── Neutral stand calibration (like the reference minipupperesp) ─
+// The robot is physically calibrated so ALL SERVOS CENTRED == the
+// standing pose at this height.  The leg IK subtracts the neutral
+// joint angles of this stance so that front_right_ik(0,0,NEUTRAL_Z)
+// == centred servos == the power-on pose.  This makes the stand
+// phase after start-up identical to the reference repo: the robot
+// simply holds/settles into the stand with no repositioning jump.
+constexpr float NEUTRAL_Z = 70.0f;
+
+// ── Stanford walk parameters ─────────────────────────────────
+// The walk speed itself is RUNTIME-ADJUSTABLE: Config::sg_speed
+// (mm/s), set from the web UI "Walk speed" slider and persisted in
+// NVS.  Full-stick maximum is 200 mm/s per the Mini Pupper BSP
+// Config.py; the reference web default was 100 which is too fast
+// for this robot, so the default here is 50.
+constexpr float SG_SPEED_MAX_MM_S = 200.0f;   // full joystick stick
+// The reference robot's leg roles are mirrored left<->right vs the
+// physical legs, so lateral/yaw commands are flipped there.  Keep
+// the same default; set to false if strafe/turn comes out mirrored.
+constexpr bool  SG_MIRROR_LR = true;
+
+// ── Web joystick (mini_pupper_web_controller style) ──────────
+// Left pad: forward/strafe, right pad: turn.  Values -1..1, scaled
+// by Config::sg_speed.  Fresh input drives the Stanford walk; when
+// the pads are released (zeros / timeout) the robot steps in place.
+constexpr float JOY_VY_MAX     = 200.0f;   // mm/s strafe at full stick
+constexpr float JOY_WZ_MAX     = 2.0f;     // rad/s yaw at full stick
+constexpr uint32_t JOY_TIMEOUT_MS = 600;
+
 // ── Body geometry for attitude (look) poses ──────────────────
-// Half the distance between hip axes, in mm.  Used to convert a
-// body roll/pitch/yaw (Stanford-style "head aiming") into per-leg
-// foot offsets.  Tune to your chassis if the look angles feel off.
+// NOTE: superseded — the look/imported-move poses now use the exact
+// Stanford geometry (SG_ORIGIN_X/SG_ORIGIN_Y in stanford_gait.h).
+// Kept only for reference.
 constexpr float BODY_LX = 50.0f;   // half fore-aft hip spacing (mm)
 constexpr float BODY_LY = 35.0f;   // half left-right hip spacing (mm)
 
@@ -92,6 +128,18 @@ enum class GaitCmd : uint8_t {
     MoveRightFront, // Forward + strafe right
     MoveLeftBack,   // Backward + strafe left
     MoveRightBack,  // Backward + strafe right
+
+    // ── Stanford Pupper trot gait (exact StanfordQuadruped port) ─
+    StanfordWalk,   // Continuous forward trot, Raibert swing/stance
+
+    // ── FPC choreography (MangDang MovementGroups.py, Stanford IK) ─
+    FrontKick,      // Rear up like a horse: front paws reach fwd+up, auto-return
+    Wiggle,         // Butt up (pitch -22°), tail-wag yaw sweep while held
+    ButtShrug,      // Nose up (pitch +20°), butt-shrug yaw sweep while held
+    WiggleLeft,     // Butt up, yaw held to one side (FPC wiggle_left)
+    WiggleRight,    // Butt up, yaw held to the other side (FPC wiggle_right)
+    ButtShrugLeft,  // Nose up, yaw held to one side (FPC butt_shrug_left)
+    ButtShrugRight, // Nose up, yaw held to the other side (FPC butt_shrug_right)
 };
 
 // ── Robot configuration ──────────────────────────────────────
@@ -101,6 +149,7 @@ struct Config {
     int up_height = 10;  // Foot lift height (mm)
     int stride   = 10;   // Stride length (mm)
     int tilt     = 10;   // Body tilt angle (degrees)
+    int sg_speed = 50;   // Stanford walk / diagonal speed (mm/s, max 200)
 };
 
 // ── Servo pin / UART configuration ───────────────────────────
@@ -136,6 +185,16 @@ void send_gait_cmd(GaitCmd cmd);
  * @brief Return the currently active gait command.
  */
 GaitCmd current_gait_cmd();
+
+/**
+ * @brief Web-joystick input (mini_pupper_web_controller style).
+ *
+ * f = forward/back, s = strafe (+left), t = turn (+left); each -1..1.
+ * Any input beyond the dead-zone auto-starts the Stanford walk; the
+ * velocities scale with Config::sg_speed.  Releasing the pads (zeros)
+ * makes the robot step in place; leaving the walk parks it standing.
+ */
+void joy_input(float f, float s, float t);
 
 /**
  * @brief Get the current robot configuration.
@@ -246,7 +305,10 @@ int ping_servo(int servo_id);
 // ── Low-level IK (exposed for WASM host functions) ───────────
 
 /**
- * @brief Set one servo angle (degrees), clamping to [‑270, 270].
+ * @brief Set one servo angle in degrees RELATIVE to centre (0 = 90°
+ *        physical). Clamped to the raw range 0..1023, i.e. ±90° for
+ *        this 0–180° servo. (Raw scale was 270°/1023 before; now
+ *        180°/1023 to match the physical servo range. Old doc said (‑270, 270).
  */
 void set_servo_angle(int servo_id, float deg);
 

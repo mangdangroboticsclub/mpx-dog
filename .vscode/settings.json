@@ -7,7 +7,7 @@
     "--query-driver=**",
     "--compile-commands-dir=/workspaces/MPX-Dog/build"
   ],
-  "idf.currentSetup": "/home/hharis/.espressif/v5.5.4/esp-idf",
+  "idf.currentSetup": "/opt/esp/idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },

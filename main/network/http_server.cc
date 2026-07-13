@@ -700,6 +700,14 @@ static robot::GaitCmd gait_name_to_cmd(const std::string &name)
     if (name == "moveRF")    return robot::GaitCmd::MoveRightFront;
     if (name == "moveLB")    return robot::GaitCmd::MoveLeftBack;
     if (name == "moveRB")    return robot::GaitCmd::MoveRightBack;
+    if (name == "stanford")  return robot::GaitCmd::StanfordWalk;
+    if (name == "frontkick") return robot::GaitCmd::FrontKick;
+    if (name == "wiggle")    return robot::GaitCmd::Wiggle;
+    if (name == "buttshrug") return robot::GaitCmd::ButtShrug;
+    if (name == "wiggleL")   return robot::GaitCmd::WiggleLeft;
+    if (name == "wiggleR")   return robot::GaitCmd::WiggleRight;
+    if (name == "buttshrugL")return robot::GaitCmd::ButtShrugLeft;
+    if (name == "buttshrugR")return robot::GaitCmd::ButtShrugRight;
     if (name == "none")     return robot::GaitCmd::None;
     return robot::GaitCmd::None;
 }
@@ -746,6 +754,14 @@ static const char *gait_cmd_to_name(robot::GaitCmd cmd)
         case robot::GaitCmd::MoveRightFront: return "moveRF";
         case robot::GaitCmd::MoveLeftBack:   return "moveLB";
         case robot::GaitCmd::MoveRightBack:  return "moveRB";
+        case robot::GaitCmd::StanfordWalk:   return "stanford";
+        case robot::GaitCmd::FrontKick:      return "frontkick";
+        case robot::GaitCmd::Wiggle:         return "wiggle";
+        case robot::GaitCmd::ButtShrug:      return "buttshrug";
+        case robot::GaitCmd::WiggleLeft:     return "wiggleL";
+        case robot::GaitCmd::WiggleRight:    return "wiggleR";
+        case robot::GaitCmd::ButtShrugLeft:  return "buttshrugL";
+        case robot::GaitCmd::ButtShrugRight: return "buttshrugR";
     }
     return "unknown";
 }
@@ -783,6 +799,33 @@ static esp_err_t api_robot_gait(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* POST /v1/robot/joy — web joystick input (mini_pupper_web_controller
+ * style).  Body: {"f":-1..1,"s":-1..1,"t":-1..1}
+ *   f = forward/back, s = strafe (+left), t = turn (+left).
+ * Touching a pad auto-starts the Stanford walk; releasing (zeros)
+ * steps in place.  Velocities scale with Config::sg_speed.        */
+static esp_err_t api_robot_joy(httpd_req_t *req)
+{
+    char buf[160] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    const float f = json_get_float(buf, "f", 0.0f);
+    const float s = json_get_float(buf, "s", 0.0f);
+    const float t = json_get_float(buf, "t", 0.0f);
+
+    robot::joy_input(f, s, t);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
 /* GET /v1/robot/status — current gait mode */
 static esp_err_t api_robot_status(httpd_req_t *req)
 {
@@ -794,10 +837,10 @@ static esp_err_t api_robot_status(httpd_req_t *req)
     char resp[512];
     int n = std::snprintf(resp, sizeof(resp),
         R"({"mode":"%s")"
-        R"(,"config":{"period":%d,"height":%d,"up_height":%d,"stride":%d,"tilt":%d})"
+        R"(,"config":{"period":%d,"height":%d,"up_height":%d,"stride":%d,"tilt":%d,"sg_speed":%d})"
         R"(,"offsets":[)",
         gait_cmd_to_name(cmd),
-        cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt);
+        cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt, cfg.sg_speed);
 
     for (int i = 1; i <= 12; ++i) {
         n += std::snprintf(resp + n, sizeof(resp) - n, "%.1f%s",
@@ -830,9 +873,10 @@ static esp_err_t api_robot_config(httpd_req_t *req)
     if ((val = json_get_int(buf, "up_height", -1)) >= 0)   cfg.up_height = val;
     if ((val = json_get_int(buf, "stride", -1))   >= 0)   cfg.stride    = val;
     if ((val = json_get_int(buf, "tilt", -1))     >= 0)   cfg.tilt      = val;
+    if ((val = json_get_int(buf, "sg_speed", -1)) >= 0)   cfg.sg_speed  = val;
 
-    ESP_LOGI(TAG, "POST /v1/robot/config  period=%d height=%d up_height=%d stride=%d tilt=%d",
-             cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt);
+    ESP_LOGI(TAG, "POST /v1/robot/config  period=%d height=%d up_height=%d stride=%d tilt=%d sg_speed=%d",
+             cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt, cfg.sg_speed);
 
     robot::set_config(cfg);
 
@@ -851,8 +895,8 @@ static esp_err_t api_robot_get_config(httpd_req_t *req)
 
     char resp[256];
     std::snprintf(resp, sizeof(resp),
-        R"({"period":%d,"height":%d,"up_height":%d,"stride":%d,"tilt":%d})",
-        cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt);
+        R"({"period":%d,"height":%d,"up_height":%d,"stride":%d,"tilt":%d,"sg_speed":%d})",
+        cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt, cfg.sg_speed);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, -1);
@@ -1360,6 +1404,7 @@ bool start_http_server()
 
     // ── Register robot control API endpoints ──
     register_api(s_server, "POST", "/v1/robot/gait",           HTTP_POST, api_robot_gait);
+    register_api(s_server, "POST", "/v1/robot/joy",            HTTP_POST, api_robot_joy);
     register_api(s_server, "GET",  "/v1/robot/status",         HTTP_GET,  api_robot_status);
     register_api(s_server, "POST", "/v1/robot/config",         HTTP_POST, api_robot_config);
     register_api(s_server, "GET",  "/v1/robot/config",         HTTP_GET,  api_robot_get_config);
