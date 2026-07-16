@@ -762,6 +762,7 @@ static const char *gait_cmd_to_name(robot::GaitCmd cmd)
         case robot::GaitCmd::WiggleRight:    return "wiggleR";
         case robot::GaitCmd::ButtShrugLeft:  return "buttshrugL";
         case robot::GaitCmd::ButtShrugRight: return "buttshrugR";
+        case robot::GaitCmd::BodyAttitude:   return "attitude";
     }
     return "unknown";
 }

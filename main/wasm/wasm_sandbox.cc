@@ -45,11 +45,15 @@ static bool s_initialized = false;
 static void *wamr_malloc(unsigned int size)
 {
 #ifdef CONFIG_SPIRAM
-    uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    // Prefer external PSRAM (keeps scarce internal DRAM free for WiFi/TCP).
+    void *p = heap_caps_aligned_alloc(8, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p) return p;
+    // Fall back to internal DRAM if PSRAM is exhausted or unavailable, so a
+    // large linear-memory request can't silently fail wasm instantiation.
+    return heap_caps_aligned_alloc(8, size, MALLOC_CAP_8BIT);
 #else
-    uint32_t caps = MALLOC_CAP_8BIT;
+    return heap_caps_aligned_alloc(8, size, MALLOC_CAP_8BIT);
 #endif
-    return heap_caps_aligned_alloc(8, size, caps);
 }
 
 static void *wamr_realloc(void *ptr, unsigned int size)

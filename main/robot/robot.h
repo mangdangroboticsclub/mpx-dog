@@ -140,6 +140,10 @@ enum class GaitCmd : uint8_t {
     WiggleRight,    // Butt up, yaw held to the other side (FPC wiggle_right)
     ButtShrugLeft,  // Nose up, yaw held to one side (FPC butt_shrug_left)
     ButtShrugRight, // Nose up, yaw held to the other side (FPC butt_shrug_right)
+
+    // Direct SDK-controlled body attitude. Kept last so existing numeric
+    // GaitCmd values remain backward compatible.
+    BodyAttitude,   // Hold caller-provided roll, pitch and yaw angles
 };
 
 // ── Robot configuration ──────────────────────────────────────
@@ -195,6 +199,34 @@ GaitCmd current_gait_cmd();
  * makes the robot step in place; leaving the walk parks it standing.
  */
 void joy_input(float f, float s, float t);
+
+/**
+ * @brief Hold a Stanford-IK body attitude (degrees).
+ *
+ * Values are clamped to the same safe limits as the reference movement API:
+ * roll +/-25, pitch +/-20 and yaw +/-30 degrees. Calling this again updates
+ * the held pose; sending any gait command exits the pose normally.
+ */
+void set_body_attitude(float roll_deg, float pitch_deg, float yaw_deg);
+
+/**
+ * @brief Set the body-attitude slew speed in degrees/second.
+ *
+ * 0 (default) = instant: roll/pitch/yaw/attitude snap to the target.
+ * >0 makes the held attitude glide toward the target at this speed, so
+ * repeated pose updates ease smoothly instead of jumping. Negative values
+ * are clamped to 0.
+ */
+void set_attitude_speed(float dps);
+
+/**
+ * @brief Set the body-attitude slew speed per axis, in degrees/second.
+ *
+ * Like set_attitude_speed() but with an independent speed for roll, pitch
+ * and yaw. 0 on an axis = that axis snaps instantly; >0 = it glides at that
+ * speed. Negative values are clamped to 0.
+ */
+void set_attitude_speed_xyz(float roll_dps, float pitch_dps, float yaw_dps);
 
 /**
  * @brief Get the current robot configuration.

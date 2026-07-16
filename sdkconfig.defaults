@@ -1,0 +1,21 @@
+# Project sdkconfig defaults.
+# Seeded so a fresh `idf.py reconfigure` / `fullclean` keeps these values.
+
+# The HTTP server (network/http_server.cc) sets max_open_sockets = 12, which
+# needs LWIP_MAX_SOCKETS >= 12 + 3 (internal) = 15. Default 10 caused
+# "max_open_sockets is too large (max allowed 7)" and the server failed to
+# start. 16 leaves a little headroom for the websocket chat + PWA serving.
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# External PSRAM. Board is ESP32-S3-WROOM-1-N16R8 = 8 MB OCTAL PSRAM (see
+# partitions.csv). It was disabled, so the WASM sandbox's 128 KB linear
+# memory fell back to internal DRAM and every skill failed with
+# "Failed to instantiate". Enabling octal PSRAM gives it 8 MB to work in.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768

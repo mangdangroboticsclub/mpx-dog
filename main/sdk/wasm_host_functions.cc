@@ -147,6 +147,42 @@ int32_t host_robot_get_mode(wasm_exec_env_t exec_env)
 	return mode;
 }
 
+int32_t host_robot_set_body_pose(wasm_exec_env_t exec_env,
+                                 float roll_deg, float pitch_deg,
+                                 float yaw_deg)
+{
+	if (wasm::was_cancelled()) return -1;
+
+	robot::set_body_attitude(roll_deg, pitch_deg, yaw_deg);
+	ESP_LOGI(TAG, "robot_set_body_pose: roll=%.1f pitch=%.1f yaw=%.1f",
+			 roll_deg, pitch_deg, yaw_deg);
+	return 0;
+}
+
+int32_t host_robot_set_attitude_speed(wasm_exec_env_t exec_env,
+                                      int32_t dps)
+{
+	if (wasm::was_cancelled()) return -1;
+
+	robot::set_attitude_speed(static_cast<float>(dps));
+	ESP_LOGI(TAG, "robot_set_attitude_speed: %" PRId32 " dps", dps);
+	return 0;
+}
+
+int32_t host_robot_set_attitude_speed_xyz(wasm_exec_env_t exec_env,
+                                          int32_t roll_dps, int32_t pitch_dps,
+                                          int32_t yaw_dps)
+{
+	if (wasm::was_cancelled()) return -1;
+
+	robot::set_attitude_speed_xyz(static_cast<float>(roll_dps),
+	                              static_cast<float>(pitch_dps),
+	                              static_cast<float>(yaw_dps));
+	ESP_LOGI(TAG, "robot_set_attitude_speed_xyz: r=%" PRId32 " p=%" PRId32
+	              " y=%" PRId32 " dps", roll_dps, pitch_dps, yaw_dps);
+	return 0;
+}
+
 int32_t host_robot_set_config(wasm_exec_env_t exec_env,
 							  int32_t period, int32_t height,
 							  int32_t up_height, int32_t stride,
