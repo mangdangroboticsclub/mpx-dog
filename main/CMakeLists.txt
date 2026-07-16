@@ -18,19 +18,25 @@ idf_component_register(
         "lua/lua_bindings.cc"
     INCLUDE_DIRS "." "fs" "wasm" "sdk" "network" "robot" "lua"
     EMBED_FILES
-        # PWA static assets (www output from pwa/ build)
-        "../pwa/www/icon.svg"
-        "../pwa/www/icon.svg.gz"
-        "../pwa/www/index.html"
-        "../pwa/www/index.html.gz"
-        "../pwa/www/index.css"
-        "../pwa/www/index.css.gz"
-        "../pwa/www/m.js"
-        "../pwa/www/m.js.gz"
-        "../pwa/www/manifest.json"
-        "../pwa/www/manifest.json.gz"
-        "../pwa/www/sw.js"
-        "../pwa/www/sw.js.gz"
+        # PWA static assets (www output from pwa-redesign/ build)
+        "../pwa-redesign/www/icon.svg"
+        "../pwa-redesign/www/icon.svg.gz"
+        "../pwa-redesign/www/index.html"
+        "../pwa-redesign/www/index.html.gz"
+        "../pwa-redesign/www/index.css"
+        "../pwa-redesign/www/index.css.gz"
+        "../pwa-redesign/www/m.js"
+        "../pwa-redesign/www/m.js.gz"
+        "../pwa-redesign/www/manifest.json"
+        "../pwa-redesign/www/manifest.json.gz"
+        "../pwa-redesign/www/sw.js"
+        "../pwa-redesign/www/sw.js.gz"
+        "../pwa-redesign/www/md.svg"
+        "../pwa-redesign/www/md.svg.gz"
+        "../pwa-redesign/www/eye-open.svg"
+        "../pwa-redesign/www/eye-open.svg.gz"
+        "../pwa-redesign/www/eye-close.svg"
+        "../pwa-redesign/www/eye-close.svg.gz"
     REQUIRES
         nvs_flash
         wasm-micro-runtime
