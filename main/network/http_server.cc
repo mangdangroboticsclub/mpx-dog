@@ -18,6 +18,7 @@
 
 #include "fs/littlefs_manager.h"
 #include "lua/lua_vm.h"
+#include "sdkconfig.h"
 #include "robot/robot.h"
 #include "wasm/wasm_sandbox.h"
 
@@ -79,9 +80,13 @@ std::string uri_to_path(const char *uri)
         return std::string(WWW_ROOT) + "/index.html";
     }
 
-    // Map favicon.ico to our SVG icon
+    // Map favicon.ico to the design-appropriate SVG icon
     if (std::strcmp(uri, "/favicon.ico") == 0) {
+#ifdef CONFIG_PWA_DESIGN_REDESIGN
+        return std::string(WWW_ROOT) + "/md.svg";
+#else
         return std::string(WWW_ROOT) + "/icon.svg";
+#endif
     }
 
     std::string path = std::string(WWW_ROOT) + uri;
@@ -1364,10 +1369,16 @@ bool start_http_server()
     register_static("/index.html");
     register_static("/m.js");
     register_static("/index.css");
-    register_static("/icon.svg");
     register_static("/manifest.json");
     register_static("/sw.js");
     register_static("/favicon.ico");
+#ifdef CONFIG_PWA_DESIGN_REDESIGN
+    register_static("/md.svg");
+    register_static("/eye-open.svg");
+    register_static("/eye-close.svg");
+#else
+    register_static("/icon.svg");
+#endif
 
     // ── Register WebSocket endpoint (telemetry) ──
     httpd_uri_t ws_uri = {

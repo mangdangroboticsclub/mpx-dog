@@ -1,42 +1,65 @@
-idf_component_register(
-    SRCS
-        "main.cc"
-        "fs/littlefs_manager.cc"
-        "wasm/wasm_sandbox.cc"
-        "sdk/wasm_host_functions.cc"
-        "network/wifi_ap.cc"
-        "network/wifi_sta.cc"
-        "network/http_server.cc"
-        "network/www_assets.cc"
-        "network/crypto.cc"
-        "network/chat_ws.cc"
-        "robot/robot.cc"
-        "robot/stanford_gait.cc"
-        "robot/stanford_kinematics.cc"
-        "robot/imu.cc"
-        "lua/lua_vm.cc"
-        "lua/lua_bindings.cc"
-    INCLUDE_DIRS "." "fs" "wasm" "sdk" "network" "robot" "lua"
-    EMBED_FILES
-        # PWA static assets (www output from pwa-redesign/ build)
-        "../pwa-redesign/www/icon.svg"
-        "../pwa-redesign/www/icon.svg.gz"
-        "../pwa-redesign/www/index.html"
-        "../pwa-redesign/www/index.html.gz"
-        "../pwa-redesign/www/index.css"
-        "../pwa-redesign/www/index.css.gz"
-        "../pwa-redesign/www/m.js"
-        "../pwa-redesign/www/m.js.gz"
-        "../pwa-redesign/www/manifest.json"
-        "../pwa-redesign/www/manifest.json.gz"
-        "../pwa-redesign/www/sw.js"
-        "../pwa-redesign/www/sw.js.gz"
+# ── Source files (common to all designs) ─────────────────────
+set(sources
+    "main.cc"
+    "fs/littlefs_manager.cc"
+    "wasm/wasm_sandbox.cc"
+    "sdk/wasm_host_functions.cc"
+    "network/wifi_ap.cc"
+    "network/wifi_sta.cc"
+    "network/http_server.cc"
+    "network/www_assets.cc"
+    "network/crypto.cc"
+    "network/chat_ws.cc"
+    "robot/robot.cc"
+    "robot/stanford_gait.cc"
+    "robot/stanford_kinematics.cc"
+    "robot/imu.cc"
+    "lua/lua_vm.cc"
+    "lua/lua_bindings.cc"
+)
+
+# ── Design-specific assets ───────────────────────────────────
+if(CONFIG_PWA_DESIGN_REDESIGN)
+    message(STATUS "PWA design: redesign (light theme)")
+    set(pwa_www_dir "../pwa-redesign/www")
+    set(design_assets
         "../pwa-redesign/www/md.svg"
         "../pwa-redesign/www/md.svg.gz"
         "../pwa-redesign/www/eye-open.svg"
         "../pwa-redesign/www/eye-open.svg.gz"
         "../pwa-redesign/www/eye-close.svg"
         "../pwa-redesign/www/eye-close.svg.gz"
+    )
+else()
+    message(STATUS "PWA design: original (dark theme)")
+    set(pwa_www_dir "../pwa/www")
+    set(design_assets
+        "../pwa/www/icon.svg"
+        "../pwa/www/icon.svg.gz"
+    )
+endif()
+
+# ── Assets shared by both designs (same names, different content) ──
+set(common_assets
+    "${pwa_www_dir}/index.html"
+    "${pwa_www_dir}/index.html.gz"
+    "${pwa_www_dir}/index.css"
+    "${pwa_www_dir}/index.css.gz"
+    "${pwa_www_dir}/m.js"
+    "${pwa_www_dir}/m.js.gz"
+    "${pwa_www_dir}/manifest.json"
+    "${pwa_www_dir}/manifest.json.gz"
+    "${pwa_www_dir}/sw.js"
+    "${pwa_www_dir}/sw.js.gz"
+)
+
+# ── Register component ───────────────────────────────────────
+idf_component_register(
+    SRCS        ${sources}
+    INCLUDE_DIRS "." "fs" "wasm" "sdk" "network" "robot" "lua"
+    EMBED_FILES
+        ${common_assets}
+        ${design_assets}
     REQUIRES
         nvs_flash
         wasm-micro-runtime

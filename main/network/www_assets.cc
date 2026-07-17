@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "fs/littlefs_manager.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "www_assets";
 
@@ -25,8 +26,7 @@ static constexpr const char *MOUNT_POINT = "/fs";
     extern const uint8_t _binary_##name##_start[];                           \
     extern const uint8_t _binary_##name##_end[]
 
-DECLARE_EMBED(icon_svg);
-DECLARE_EMBED(icon_svg_gz);
+// ── Common assets (present in both designs) ──────────────────
 DECLARE_EMBED(index_html);
 DECLARE_EMBED(index_html_gz);
 DECLARE_EMBED(index_css);
@@ -37,12 +37,19 @@ DECLARE_EMBED(manifest_json);
 DECLARE_EMBED(manifest_json_gz);
 DECLARE_EMBED(sw_js);
 DECLARE_EMBED(sw_js_gz);
+
+// ── Design-specific assets ───────────────────────────────────
+#ifdef CONFIG_PWA_DESIGN_REDESIGN
 DECLARE_EMBED(md_svg);
 DECLARE_EMBED(md_svg_gz);
 DECLARE_EMBED(eye_open_svg);
 DECLARE_EMBED(eye_open_svg_gz);
 DECLARE_EMBED(eye_close_svg);
 DECLARE_EMBED(eye_close_svg_gz);
+#else
+DECLARE_EMBED(icon_svg);
+DECLARE_EMBED(icon_svg_gz);
+#endif
 
 /* ── File descriptor table ──────────────────────────────────── */
 
@@ -54,25 +61,34 @@ struct AssetFile {
     std::size_t size() const { return static_cast<std::size_t>(end - start); }
 };
 
+// Helper macro to avoid repetition in the table
+#define ASSET_ENTRY(path, sym)  { path, _binary_##sym##_start, _binary_##sym##_end }
+
 static const AssetFile ASSETS[] = {
-    { "/icon.svg",         _binary_icon_svg_start,       _binary_icon_svg_end        },
-    { "/icon.svg.gz",      _binary_icon_svg_gz_start,    _binary_icon_svg_gz_end     },
-    { "/index.html",       _binary_index_html_start,     _binary_index_html_end      },
-    { "/index.html.gz",    _binary_index_html_gz_start,  _binary_index_html_gz_end   },
-    { "/index.css",        _binary_index_css_start,      _binary_index_css_end       },
-    { "/index.css.gz",     _binary_index_css_gz_start,   _binary_index_css_gz_end    },
-    { "/m.js",             _binary_m_js_start,           _binary_m_js_end            },
-    { "/m.js.gz",          _binary_m_js_gz_start,        _binary_m_js_gz_end         },
-    { "/manifest.json",    _binary_manifest_json_start,  _binary_manifest_json_end   },
-    { "/manifest.json.gz", _binary_manifest_json_gz_start,_binary_manifest_json_gz_end},
-    { "/sw.js",            _binary_sw_js_start,          _binary_sw_js_end           },
-    { "/sw.js.gz",         _binary_sw_js_gz_start,       _binary_sw_js_gz_end        },
-    { "/md.svg",           _binary_md_svg_start,         _binary_md_svg_end          },
-    { "/md.svg.gz",        _binary_md_svg_gz_start,      _binary_md_svg_gz_end       },
-    { "/eye-open.svg",     _binary_eye_open_svg_start,   _binary_eye_open_svg_end    },
-    { "/eye-open.svg.gz",  _binary_eye_open_svg_gz_start,_binary_eye_open_svg_gz_end },
-    { "/eye-close.svg",    _binary_eye_close_svg_start,  _binary_eye_close_svg_end   },
-    { "/eye-close.svg.gz", _binary_eye_close_svg_gz_start,_binary_eye_close_svg_gz_end},
+    // ── Common ───────────────────────────────────────────────
+    ASSET_ENTRY("/index.html",       index_html),
+    ASSET_ENTRY("/index.html.gz",    index_html_gz),
+    ASSET_ENTRY("/index.css",        index_css),
+    ASSET_ENTRY("/index.css.gz",     index_css_gz),
+    ASSET_ENTRY("/m.js",             m_js),
+    ASSET_ENTRY("/m.js.gz",          m_js_gz),
+    ASSET_ENTRY("/manifest.json",    manifest_json),
+    ASSET_ENTRY("/manifest.json.gz", manifest_json_gz),
+    ASSET_ENTRY("/sw.js",            sw_js),
+    ASSET_ENTRY("/sw.js.gz",         sw_js_gz),
+
+    // ── Design-specific ──────────────────────────────────────
+#ifdef CONFIG_PWA_DESIGN_REDESIGN
+    ASSET_ENTRY("/md.svg",           md_svg),
+    ASSET_ENTRY("/md.svg.gz",        md_svg_gz),
+    ASSET_ENTRY("/eye-open.svg",     eye_open_svg),
+    ASSET_ENTRY("/eye-open.svg.gz",  eye_open_svg_gz),
+    ASSET_ENTRY("/eye-close.svg",    eye_close_svg),
+    ASSET_ENTRY("/eye-close.svg.gz", eye_close_svg_gz),
+#else
+    ASSET_ENTRY("/icon.svg",         icon_svg),
+    ASSET_ENTRY("/icon.svg.gz",      icon_svg_gz),
+#endif
 };
 
 static constexpr int NUM_ASSETS = sizeof(ASSETS) / sizeof(ASSETS[0]);
