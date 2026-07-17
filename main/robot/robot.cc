@@ -55,6 +55,35 @@ volatile float    s_js_f = 0.0f, s_js_s = 0.0f, s_js_t = 0.0f;
 volatile uint32_t s_js_last_ms = 0;
 volatile bool     s_js_active  = false;
 
+// Direct SDK body-attitude target. Each value is a single 32-bit write, so
+// the gait task can safely sample it while the host task updates the pose.
+volatile float s_body_roll_deg  = 0.0f;
+volatile float s_body_pitch_deg = 0.0f;
+volatile float s_body_yaw_deg   = 0.0f;
+
+// Per-axis attitude slew rate in degrees/second. 0 = instant (snap straight
+// to the target, the original behaviour). >0 makes that axis glide toward its
+// target at this speed so it eases instead of jumping. Each axis is
+// independent, so e.g. yaw can be slow while roll/pitch stay instant.
+volatile float s_body_slew_roll_dps  = 0.0f;
+volatile float s_body_slew_pitch_dps = 0.0f;
+volatile float s_body_slew_yaw_dps   = 0.0f;
+
+// The pose the gait task is CURRENTLY commanding while slewing toward the
+// target above. Only touched by the gait task.
+float s_body_roll_cur  = 0.0f;
+float s_body_pitch_cur = 0.0f;
+float s_body_yaw_cur   = 0.0f;
+
+// Move `cur` toward `target` by at most `max_step` (one tick of slew).
+static inline float step_toward(float cur, float target, float max_step)
+{
+    const float d = target - cur;
+    if (d >  max_step) return cur + max_step;
+    if (d < -max_step) return cur - max_step;
+    return target;
+}
+
 // ── Helper: millis since boot ────────────────────────────────
 static inline uint32_t millis()
 {
@@ -388,6 +417,40 @@ GaitCmd current_gait_cmd()
     return s_gait_cmd;
 }
 
+void set_body_attitude(float roll_deg, float pitch_deg, float yaw_deg)
+{
+    // Match MovementGroups.py safety caps from the reference implementation.
+    if (roll_deg > 25.0f) roll_deg = 25.0f;
+    if (roll_deg < -25.0f) roll_deg = -25.0f;
+    if (pitch_deg > 20.0f) pitch_deg = 20.0f;
+    if (pitch_deg < -20.0f) pitch_deg = -20.0f;
+    if (yaw_deg > 30.0f) yaw_deg = 30.0f;
+    if (yaw_deg < -30.0f) yaw_deg = -30.0f;
+
+    s_body_roll_deg  = roll_deg;
+    s_body_pitch_deg = pitch_deg;
+    s_body_yaw_deg   = yaw_deg;
+    s_gait_cmd       = GaitCmd::BodyAttitude;
+}
+
+void set_attitude_speed(float dps)
+{
+    if (dps < 0.0f) dps = 0.0f;
+    s_body_slew_roll_dps  = dps;
+    s_body_slew_pitch_dps = dps;
+    s_body_slew_yaw_dps   = dps;
+}
+
+void set_attitude_speed_xyz(float roll_dps, float pitch_dps, float yaw_dps)
+{
+    if (roll_dps  < 0.0f) roll_dps  = 0.0f;
+    if (pitch_dps < 0.0f) pitch_dps = 0.0f;
+    if (yaw_dps   < 0.0f) yaw_dps   = 0.0f;
+    s_body_slew_roll_dps  = roll_dps;
+    s_body_slew_pitch_dps = pitch_dps;
+    s_body_slew_yaw_dps   = yaw_dps;
+}
+
 // ── Web joystick ─────────────────────────────────────────────
 // Same behaviour as the reference minipupperesp /js handler:
 // touching a pad auto-starts the Stanford trot; the gait task
@@ -674,6 +737,7 @@ void gait_task()
                 case GaitCmd::WiggleRight:    name = "wiggleR";       break;
                 case GaitCmd::ButtShrugLeft:  name = "buttshrugL";    break;
                 case GaitCmd::ButtShrugRight: name = "buttshrugR";    break;
+                case GaitCmd::BodyAttitude:   name = "attitude";      break;
             }
             ESP_LOGI(TAG, "Gait: %s", name);
         }
@@ -1316,6 +1380,68 @@ void gait_task()
         // ═══════════════════════════════════════════════════════════
 
         // ── Look / head poses (static body-attitude holds) ───────
+        // Direct roll/pitch/yaw pose requested by the SDK. Repeated calls can
+        // update the target while this command is active; any gait command
+        // interrupts it and the normal Stanford park transition runs.
+        if (cmd == GaitCmd::BodyAttitude) {
+            const float h = static_cast<float>(s_cfg.height);
+            set_all_servo_speed(0);
+
+            sg_foot_t pose[4];
+            // Snapshot the per-axis speeds (deg/s). 0 on an axis = instant.
+            const float rdps = s_body_slew_roll_dps;
+            const float pdps = s_body_slew_pitch_dps;
+            const float ydps = s_body_slew_yaw_dps;
+            const bool any_slew = (rdps > 0.0f || pdps > 0.0f || ydps > 0.0f);
+
+            if (!any_slew) {
+                // All axes instant: ease in once (period-based ramp), then
+                // hold, applying any live target updates immediately (snap).
+                sg_attitude(s_body_roll_deg, s_body_pitch_deg,
+                            s_body_yaw_deg, h, pose);
+                sg_ramp_to(pose, sg_ramp_ms());
+
+                while (s_gait_cmd == cmd) {
+                    sg_attitude(s_body_roll_deg, s_body_pitch_deg,
+                                s_body_yaw_deg, h, pose);
+                    sg_write(pose);
+                    flush();
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+                sg_park(h);
+                continue;
+            }
+
+            // Per-axis speed-limited slew: glide each axis toward its (possibly
+            // changing) target at its own deg/second so repeated pose updates
+            // ease smoothly. An axis with speed 0 uses a huge step, i.e. it
+            // snaps instantly while the others glide. Start from the rest
+            // attitude we parked at, so the first move eases in too.
+            s_body_roll_cur  = 0.0f;
+            s_body_pitch_cur = 0.0f;
+            s_body_yaw_cur   = 0.0f;
+            const float BIG   = 1.0e6f;
+            const float rstep = (rdps > 0.0f) ? rdps * 0.02f : BIG;  // deg/20ms
+            const float pstep = (pdps > 0.0f) ? pdps * 0.02f : BIG;
+            const float ystep = (ydps > 0.0f) ? ydps * 0.02f : BIG;
+
+            while (s_gait_cmd == cmd) {
+                s_body_roll_cur  = step_toward(s_body_roll_cur,
+                                               s_body_roll_deg,  rstep);
+                s_body_pitch_cur = step_toward(s_body_pitch_cur,
+                                               s_body_pitch_deg, pstep);
+                s_body_yaw_cur   = step_toward(s_body_yaw_cur,
+                                               s_body_yaw_deg,   ystep);
+                sg_attitude(s_body_roll_cur, s_body_pitch_cur,
+                            s_body_yaw_cur, h, pose);
+                sg_write(pose);
+                flush();
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            sg_park(h);
+            continue;
+        }
+
         if (cmd == GaitCmd::LookUp     || cmd == GaitCmd::LookDown  ||
             cmd == GaitCmd::LookLeft   || cmd == GaitCmd::LookRight ||
             cmd == GaitCmd::LookUpperLeft  || cmd == GaitCmd::LookUpperRight ||
@@ -1679,10 +1805,10 @@ void gait_task()
         // (pitch +25) with the same sweep.  Angles softened slightly
         // (-22/+20, yaw ±15) to stay well inside this servo's range.
         // Runs continuously while held, then returns to the stand.
-        if (cmd == GaitCmd::Wiggle || cmd == GaitCmd::ButtShrug) {
+        if (cmd == GaitCmd::Wiggle) {
             const float h     = static_cast<float>(s_cfg.height);
-            const float pitch = (cmd == GaitCmd::Wiggle) ? -22.0f : 20.0f;
-            const float yawA  = 15.0f;                          // wag amplitude
+            const float pitch = -22.0f;
+            const float yawA  = 15.0f;
             const float p     = static_cast<float>(s_cfg.period) * 8.0f;
             set_all_servo_speed(0);
 
@@ -1697,6 +1823,34 @@ void gait_task()
                 sg_attitude(0.0f, pitch, yaw, h, pose);
                 sg_write(pose);
                 flush();
+                vTaskDelay(pdMS_TO_TICKS(20));   // pace the wag like every other hold loop
+            }
+            sg_park(h);
+            continue;
+        }
+
+        // Butt shrug is a separate front-up trajectory. Keeping its own
+        // branch makes its timing and amplitudes independent from wiggle.
+        if (cmd == GaitCmd::ButtShrug) {
+            const float h     = static_cast<float>(s_cfg.height);
+            const float pitch = 20.0f;
+            const float yawA  = 15.0f;
+            const float p     = static_cast<float>(s_cfg.period) * 8.0f;
+            set_all_servo_speed(0);
+
+            sg_foot_t pose[4];
+            sg_attitude(0.0f, pitch, 0.0f, h, pose);
+            sg_ramp_to(pose, sg_ramp_ms());
+
+            time_mSt = millis();
+            while (s_gait_cmd == cmd) {
+                tim = millis() - time_mSt;
+                tt = tim * 2.0f * PI / p;
+                const float yaw = yawA * std::sin(tt);
+                sg_attitude(0.0f, pitch, yaw, h, pose);
+                sg_write(pose);
+                flush();
+                vTaskDelay(pdMS_TO_TICKS(20));   // pace the wag like every other hold loop
             }
             sg_park(h);
             continue;

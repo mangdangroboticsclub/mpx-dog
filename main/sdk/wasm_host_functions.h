@@ -39,6 +39,33 @@ int32_t host_robot_gait(wasm_exec_env_t exec_env,
 int32_t host_robot_get_mode(wasm_exec_env_t exec_env);
 
 /**
+ * @brief Wasm-side: extern void robot_set_body_pose(float roll_deg,
+ *                       float pitch_deg, float yaw_deg);
+ * Signature "(fff)". Holds a Stanford-IK body attitude in degrees.
+ */
+int32_t host_robot_set_body_pose(wasm_exec_env_t exec_env,
+                                 float roll_deg, float pitch_deg,
+                                 float yaw_deg);
+
+/**
+ * @brief Wasm-side: extern void robot_set_attitude_speed(int dps);
+ * Signature "(i)". Sets the roll/pitch/yaw slew speed in degrees/second
+ * (0 = instant snap; >0 eases toward the target at that speed).
+ */
+int32_t host_robot_set_attitude_speed(wasm_exec_env_t exec_env,
+                                      int32_t dps);
+
+/**
+ * @brief Wasm-side: extern void robot_set_attitude_speed_xyz(int roll_dps,
+ *                       int pitch_dps, int yaw_dps);
+ * Signature "(iii)". Per-axis roll/pitch/yaw slew speed in degrees/second
+ * (0 on an axis = instant snap; >0 = eases at that speed).
+ */
+int32_t host_robot_set_attitude_speed_xyz(wasm_exec_env_t exec_env,
+                                          int32_t roll_dps, int32_t pitch_dps,
+                                          int32_t yaw_dps);
+
+/**
  * @brief Wasm-side: extern void robot_set_config(int period, int height,
  *                       int up_height, int stride, int tilt);
  * Signature "(iiiii)".
@@ -226,13 +253,21 @@ int32_t host_robot_imu_print(wasm_exec_env_t exec_env);
 //  NativeSymbol table
 // ═══════════════════════════════════════════════════════════════
 
-static const NativeSymbol NATIVE_SYMBOLS[] = {
+// NOTE: intentionally NOT const. WAMR's wasm_runtime_register_natives()
+// sorts this table in place with qsort() so it can binary-search symbol
+// names later. If the array is const it is placed in flash (.rodata) and
+// the in-place sort triggers a "Dbus write to cache rejected" cache-error
+// panic on the ESP32-S3. Keeping it non-const puts it in writable RAM.
+static NativeSymbol NATIVE_SYMBOLS[] = {
 	// SDK
 	{ "print", (void *)host_print, "($i)", nullptr },
 
 	// Robot — high-level gait
 	{ "robot_gait",         (void *)host_robot_gait,         "($)",   nullptr },
 	{ "robot_get_mode",     (void *)host_robot_get_mode,     "()i",   nullptr },
+	{ "robot_set_body_pose",(void *)host_robot_set_body_pose,"(fff)", nullptr },
+	{ "robot_set_attitude_speed",(void *)host_robot_set_attitude_speed,"(i)", nullptr },
+	{ "robot_set_attitude_speed_xyz",(void *)host_robot_set_attitude_speed_xyz,"(iii)", nullptr },
 
 	// Robot — configuration
 	{ "robot_set_config",   (void *)host_robot_set_config,   "(iiiii)", nullptr },

@@ -185,6 +185,7 @@ static int l_robot_get_mode(lua_State *L)
         case robot::GaitCmd::WiggleRight:    name = "wiggleR";     break;
         case robot::GaitCmd::ButtShrugLeft:  name = "buttshrugL";  break;
         case robot::GaitCmd::ButtShrugRight: name = "buttshrugR";  break;
+        case robot::GaitCmd::BodyAttitude:   name = "attitude";    break;
     }
 
     lua_pushstring(L, name);
