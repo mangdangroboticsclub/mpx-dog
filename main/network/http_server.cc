@@ -12,6 +12,7 @@
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -1046,15 +1047,65 @@ static esp_err_t api_wifi_status(httpd_req_t *req)
     std::snprintf(resp, sizeof(resp),
         R"({"ap":{"ssid":"%s","ip":"%s"})"
         R"(,"sta":{"state":"%s","ssid":"%s","ip":"%s"}})",
-        WIFI_AP_SSID, AP_IP_ADDR,
+        wifi_ap_get_ssid(), AP_IP_ADDR,
         sta_state_str, sta_ssid.c_str(), sta_ip.c_str());
 
-    ESP_LOGI(TAG, "GET  /v1/wifi/status  sta=%s ssid=%s ip=%s",
-             sta_state_str, sta_ssid.c_str(), sta_ip.c_str());
+    ESP_LOGI(TAG, "GET  /v1/wifi/status  ap_ssid=%s sta=%s ssid=%s ip=%s",
+             wifi_ap_get_ssid(), sta_state_str, sta_ssid.c_str(), sta_ip.c_str());
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, -1);
     return ESP_OK;
+}
+
+/* POST /v1/wifi/ap-config — save AP SSID/password and restart.
+ *
+ * Body: {"ssid":"MyAP","password":"secret123"}
+ * Responds 200 before restarting so the client gets a clean response.
+ * The ESP will reboot ~500 ms after the response is sent, giving the
+ * PWA time to display the reconnect instructions.
+ */
+static esp_err_t api_wifi_ap_config(httpd_req_t *req)
+{
+    char buf[256] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    std::string ssid     = json_get_str(buf, "ssid");
+    std::string password = json_get_str(buf, "password");
+
+    if (ssid.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing 'ssid' field", -1);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "POST /v1/wifi/ap-config  ssid=%s  pass_len=%zu",
+             ssid.c_str(), password.size());
+
+    if (!wifi_ap_save_config(ssid.c_str(), password.c_str())) {
+        httpd_resp_set_status(req, "500 Server Error");
+        httpd_resp_send(req, "nvs write failed", -1);
+        return ESP_OK;
+    }
+
+    // Respond to the client before restarting
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true,"restarting":true})", -1);
+
+    ESP_LOGW(TAG, "AP config saved — restarting ESP in 500 ms ...");
+
+    // Flush logs, then restart
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+
+    return ESP_OK; // never reached
 }
 
 /* POST /v1/wifi/connect — connect to a Wi-Fi network (STA mode) */
@@ -1430,6 +1481,7 @@ bool start_http_server()
     register_api(s_server, "POST", "/v1/wifi/connect",         HTTP_POST, api_wifi_connect);
     register_api(s_server, "POST", "/v1/wifi/disconnect",      HTTP_POST, api_wifi_disconnect);
     register_api(s_server, "POST", "/v1/wifi/forget",          HTTP_POST, api_wifi_forget);
+    register_api(s_server, "POST", "/v1/wifi/ap-config",       HTTP_POST, api_wifi_ap_config);
 
     // ── Register Lua API endpoints ──
     register_api(s_server, "POST", "/v1/lua/run",              HTTP_POST, api_lua_run);

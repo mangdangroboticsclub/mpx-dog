@@ -68,10 +68,21 @@
   });
 
   let activeView = $state("main"); // "main" | "upload"
-  let showLangMenu = $state(false);
+
+  // ── Connection mode detection ──────────────────────────────
+  /** "ap" if the page is loaded via 192.168.2.1, otherwise "sta". */
+  let connectionMode = $derived(
+    typeof window !== "undefined" && window.location.hostname === "192.168.2.1"
+      ? "ap"
+      : "sta"
+  );
+
   let showAllActions = $state(false);
   let showAddAction = $state(false);
   let customActions = $state([]);
+  let pinnedActions = $state([]);
+  let showGaitSection = $state(false);
+  let longPressTarget = $state(null);
   let showAllAdjust = $state(false);
   let selectedAdjust = $state(0);
   let showCalibration = $state(false);
@@ -81,11 +92,12 @@
   let adjustDragBarEl = $state(null);
 
   let adjustProps = $state([
-    { label: 'Period', value: 80, min: 0, max: 200, unit: 'ms', isCenter: false },
-    { label: 'Height', value: 70, min: 0, max: 150, unit: 'mm', isCenter: false },
-    { label: 'Lift', value: 10, min: 0, max: 50, unit: 'mm', isCenter: false },
-    { label: 'Stride', value: 10, min: 0, max: 50, unit: 'mm', isCenter: false },
-    { label: 'Tilt', value: 0, min: -30, max: 30, unit: '°', isCenter: true },
+    // Each entry has a `key` mapping to the /v1/robot/config API parameter name
+    { label: 'Period', key: 'period',    value: 80,  min: 0,   max: 200, unit: 'ms',  isCenter: false },
+    { label: 'Height', key: 'height',    value: 70,  min: 0,   max: 150, unit: 'mm',  isCenter: false },
+    { label: 'Lift',   key: 'up_height', value: 10,  min: 0,   max: 50,  unit: 'mm',  isCenter: false },
+    { label: 'Stride', key: 'stride',    value: 10,  min: 0,   max: 50,  unit: 'mm',  isCenter: false },
+    { label: 'Tilt',   key: 'tilt',      value: 0,   min: -30, max: 30,  unit: '°',   isCenter: true },
   ]);
 
   const adjustPerPage = 3;
@@ -93,19 +105,122 @@
     return Math.ceil(adjustProps.length / adjustPerPage);
   }
 
+  // ── Robot config API ────────────────────────────────────────
+  let configLoading = $state(false);
+
+  async function fetchConfig() {
+    configLoading = true;
+    try {
+      const res = await fetch("/v1/robot/status");
+      if (res.ok) {
+        const data = await res.json();
+        const cfg = data.config || {};
+        for (const prop of adjustProps) {
+          if (cfg[prop.key] !== undefined) {
+            prop.value = cfg[prop.key];
+          }
+        }
+      }
+    } catch { /* robot may be unreachable — keep defaults */ }
+    configLoading = false;
+  }
+
+  async function saveConfig() {
+    const body = {};
+    for (const prop of adjustProps) {
+      body[prop.key] = prop.value;
+    }
+    try {
+      await fetch("/v1/robot/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch { /* ignore transient errors */ }
+  }
+
+  // ── localStorage persistence ──────────────────────────────
+  const STORAGE_KEY_ASSIGNMENTS = "mpx_action_assignments";
+  const STORAGE_KEY_CUSTOM = "mpx_custom_actions";
+  const STORAGE_KEY_PINNED = "mpx_pinned_actions";
+
+  // Load persisted state on mount
+  $effect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_ASSIGNMENTS);
+      if (saved) actionAssignments = JSON.parse(saved);
+    } catch {}
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_CUSTOM);
+      if (saved) customActions = JSON.parse(saved);
+    } catch {}
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_PINNED);
+      if (saved) pinnedActions = JSON.parse(saved);
+    } catch {}
+  });
+
+  // Persist on change
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    // track changes
+    const a = JSON.stringify(actionAssignments);
+    const c = JSON.stringify(customActions);
+    const p = JSON.stringify(pinnedActions);
+    try { localStorage.setItem(STORAGE_KEY_ASSIGNMENTS, a); } catch {}
+    try { localStorage.setItem(STORAGE_KEY_CUSTOM, c); } catch {}
+    try { localStorage.setItem(STORAGE_KEY_PINNED, p); } catch {}
+  });
+
+  $effect(() => {
+    fetchConfig();
+  });
+
   const actions = [
-    { id: "walk",  label: "Walk",  emoji: "🚶", color: colors.mpx.action_green, category: "gait" },
-    { id: "crawl", label: "Crawl", emoji: "🧎", color: "#7C7FDB",              category: "gait" },
-    { id: "jump",  label: "Jump",  emoji: "🤸", color: "#60C5B4",              category: "gait" },
-    { id: "sit",   label: "Sit",   emoji: "🪑", color: colors.mpx.action_blue,  category: "skill" },
-    { id: "follow", label: "Follow", emoji: "🐾", color: colors.mpx.action_purple, category: "skill" },
-    { id: "dance", label: "Dance", emoji: "💃", color: colors.mpx.action_red,    category: "skill" },
-    { id: "lie",   label: "Lie Down", emoji: "🛌", color: "#E8A060",            category: "skill" },
-    { id: "spin",  label: "Spin",  emoji: "🌀", color: "#E07B9E",              category: "skill" },
-    { id: "bow",   label: "Bow",   emoji: "🙇", color: "#D4A84B",              category: "skill" },
-    { id: "wave",  label: "Wave",  emoji: "👋", color: "#5DB0D6",              category: "skill" },
-    { id: "guard", label: "Guard", emoji: "🛡️", color: "#8DB850",              category: "skill" },
-    { id: "search", label: "Search", emoji: "🔍", color: "#D6877A",            category: "skill" },
+    // ── Movement gaits ──
+    { id: "advance",  label: "Forward",      emoji: "🚶", color: colors.mpx.action_green, category: "gait" },
+    { id: "back",     label: "Backward",     emoji: "🔙", color: colors.mpx.action_green, category: "gait" },
+    { id: "left",     label: "Strafe Left",  emoji: "◀️",  color: colors.mpx.action_green, category: "gait" },
+    { id: "right",    label: "Strafe Right", emoji: "▶️",  color: colors.mpx.action_green, category: "gait" },
+    { id: "turnL",    label: "Turn Left",    emoji: "↺",  color: "#0E8C8C",              category: "gait" },
+    { id: "turnR",    label: "Turn Right",   emoji: "↻",  color: "#0E8C8C",              category: "gait" },
+    { id: "stanford", label: "Trot",         emoji: "🐕", color: "#14A37F",              category: "gait" },
+    { id: "step",     label: "Step",         emoji: "🦶", color: "#14A37F",              category: "gait" },
+    { id: "testspeed",label: "Speed Test",   emoji: "⚡",  color: "#D14949",              category: "gait" },
+    { id: "jump",     label: "Jump",         emoji: "🤸", color: "#D97A29",              category: "gait" },
+    { id: "jumpfwd",  label: "Jump Fwd",     emoji: "🏃", color: "#C4901A",              category: "gait" },
+    // ── Leg lifts ──
+    { id: "flegR",    label: "Lift FR",      emoji: "🦵", color: "#5FAD41",              category: "gait" },
+    { id: "flegL",    label: "Lift FL",      emoji: "🦵", color: "#5FAD41",              category: "gait" },
+    { id: "blegR",    label: "Lift RR",      emoji: "🦵", color: "#5FAD41",              category: "gait" },
+    { id: "blegL",    label: "Lift RL",      emoji: "🦵", color: "#5FAD41",              category: "gait" },
+    // ── Height ──
+    { id: "heightup",   label: "Height Up",   emoji: "⬆️",  color: "#D96098",              category: "gait" },
+    { id: "heightdown", label: "Height Down", emoji: "⬇️",  color: "#D96098",              category: "gait" },
+    // ── Diagonal moves ──
+    { id: "moveLF", label: "Diag FL", emoji: "↗️",  color: "#4A8BC2",              category: "gait" },
+    { id: "moveRF", label: "Diag FR", emoji: "↖️",  color: "#4A8BC2",              category: "gait" },
+    { id: "moveLB", label: "Diag BL", emoji: "↘️",  color: "#4A8BC2",              category: "gait" },
+    { id: "moveRB", label: "Diag BR", emoji: "↙️",  color: "#4A8BC2",              category: "gait" },
+    // ── Skills (all built-in actions are gaits) ──
+    { id: "sit",      label: "Sit",          emoji: "🪑", color: colors.mpx.action_blue,   category: "gait" },
+    { id: "stretch",  label: "Stretch",      emoji: "🧘", color: "#D96098",               category: "gait" },
+    { id: "twerk",    label: "Twerk",        emoji: "💃", color: colors.mpx.action_purple, category: "gait" },
+    { id: "roll",     label: "Roll",         emoji: "🔄", color: "#14A37F",               category: "gait" },
+    { id: "pitch",    label: "Pitch",        emoji: "📐", color: "#14A37F",               category: "gait" },
+    { id: "balance",  label: "Balance",      emoji: "⚖️",  color: "#14A37F",               category: "gait" },
+    { id: "init",     label: "Init",         emoji: "🏁", color: "#7C7F7C",               category: "gait" },
+    { id: "none",     label: "Stop",         emoji: "⏹️",  color: "#D14949",               category: "gait" },
+    { id: "frontkick",label: "Front Kick",   emoji: "🦶", color: "#C44569",               category: "gait" },
+    { id: "wiggle",   label: "Wiggle",       emoji: "🐕", color: "#C44569",               category: "gait" },
+    { id: "wiggleL",  label: "Wiggle ◀",     emoji: "◀️",  color: "#C44569",               category: "gait" },
+    { id: "wiggleR",  label: "Wiggle ▶",     emoji: "▶️",  color: "#C44569",               category: "gait" },
+    { id: "buttshrug",  label: "Butt Shrug",   emoji: "🍑", color: "#C44569",             category: "gait" },
+    { id: "buttshrugL", label: "Shrug ◀",      emoji: "◀️",  color: "#C44569",             category: "gait" },
+    { id: "buttshrugR", label: "Shrug ▶",      emoji: "▶️",  color: "#C44569",             category: "gait" },
+    { id: "bowback",  label: "Bow",          emoji: "🙇", color: "#AD5FBF",               category: "gait" },
+    { id: "bodycycle",label: "Body Circle",  emoji: "🔄", color: "#AD5FBF",               category: "gait" },
+    { id: "headellipse",label: "Head Circle", emoji: "🔄", color: "#AD5FBF",              category: "gait" },
   ];
 
   const tabs = [
@@ -151,11 +266,13 @@
   function adjustEndDrag() {
     adjustDraggingId = null;
     adjustDragBarEl = null;
+    saveConfig();
   }
   function adjustStep(propIdx, delta) {
     const prop = adjustProps[propIdx];
     if (!prop) return;
     adjustProps[propIdx].value = Math.max(prop.min, Math.min(prop.max, prop.value + delta));
+    saveConfig();
   }
   function adjustCurrentPage() {
     return Math.floor(selectedAdjust / adjustPerPage);
@@ -175,6 +292,68 @@
     customActions = [...customActions, newAction];
   }
 
+  async function sendGait(mode) {
+    try {
+      await fetch("/v1/robot/gait", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+    } catch { /* ignore */ }
+  }
+
+  function togglePin(actionId) {
+    if (pinnedActions.includes(actionId)) {
+      pinnedActions = pinnedActions.filter(id => id !== actionId);
+    } else {
+      pinnedActions = [...pinnedActions, actionId];
+    }
+  }
+
+  function isPinned(actionId) {
+    return pinnedActions.includes(actionId);
+  }
+
+  // Get pinned action objects
+  let pinnedActionObjects = $derived(
+    pinnedActions.map(id => allActions.find(a => a.id === id)).filter(Boolean)
+  );
+
+  const pinnedPerPage = 8;
+  let pinnedTotalPages = $derived(Math.max(1, Math.ceil(pinnedActionObjects.length / pinnedPerPage)));
+
+  // ── Fullscreen API ──────────────────────────────────────
+  async function toggleFullscreen() {
+    if (isFullscreen) {
+      // Exit fullscreen
+      isFullscreen = false;
+      try {
+        if (document.fullscreenElement) {
+          await document.exitFullscreen();
+        }
+      } catch {}
+    } else {
+      // Enter fullscreen using the Fullscreen API
+      isFullscreen = true;
+      try {
+        await document.documentElement.requestFullscreen();
+      } catch {
+        // Fallback: just use CSS fullscreen if API fails
+      }
+    }
+  }
+
+  // Listen for fullscreen exit via Esc
+  $effect(() => {
+    function onFsChange() {
+      if (!document.fullscreenElement && isFullscreen) {
+        isFullscreen = false;
+      }
+    }
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  });
+
   function selectTab(id) {
     activeTab = id;
   }
@@ -184,9 +363,11 @@
   <!-- ═══ Top Header ═══ -->
   <header class="top-header" style="background: {YELLOW}">
     <div class="header-left">
-      <button class="pill-btn lang-btn" onclick={() => showLangMenu = !showLangMenu}>
-        ENG
-      </button>
+      <!-- Connection mode indicator -->
+      <div class="conn-mode-pill" class:mode-ap={connectionMode === "ap"} class:mode-sta={connectionMode === "sta"}>
+        <span class="conn-mode-dot"></span>
+        <span class="conn-mode-label">{connectionMode === "ap" ? "AP" : "STA"}</span>
+      </div>
     </div>
 
     <div class="header-center">
@@ -194,16 +375,6 @@
     </div>
 
     <div class="header-right">
-      <!-- Signal bars -->
-      <div class="signal-bars">
-        <span class="sig-bar"></span>
-        <span class="sig-bar"></span>
-        <span class="sig-bar"></span>
-        <span class="sig-bar"></span>
-      </div>
-
-      <button class="pill-btn">STA</button>
-      <button class="pill-btn">AP</button>
     </div>
   </header>
 
@@ -220,6 +391,10 @@
         assignments={actionAssignments}
         customActions={customActions}
         onAddAction={() => { showAddAction = true; }}
+        onDeleteAction={(actionId) => {
+          customActions = customActions.filter(c => c.id !== actionId);
+          pinnedActions = pinnedActions.filter(id => id !== actionId);
+        }}
         onSave={(updated) => {
           actionAssignments = updated;
         }}
@@ -242,20 +417,40 @@
           <div style="width:32px"></div>
         </header>
         <div class="all-actions-scroll">
-          <!-- ═══ Gait Section ═══ -->
+          <!-- ═══ Gait Section (collapsible) ═══ -->
           {#if gaitActions.length > 0}
             <div class="all-actions-category">
-              <h3 class="all-actions-cat-title">🚶 Gait</h3>
+              <button class="all-actions-cat-header" onclick={() => showGaitSection = !showGaitSection} aria-label="Toggle gait section">
+                <h3 class="all-actions-cat-title">🚶 Gait</h3>
+                <svg class="collapse-chevron" class:collapsed={!showGaitSection} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"/>
+                </svg>
+              </button>
+              {#if showGaitSection}
               <div class="actions-full-grid">
                 {#each gaitActions as action}
-                  <button class="action-grid-item" style="--action-color: {action.color}">
+                  <div class="action-grid-item all-action-item" style="--action-color: {action.color}" role="button" tabindex="0">
                     <div class="action-grid-icon">
                       <ActionIcon id={action.id} emoji={action.emoji} />
                     </div>
                     <span class="action-grid-label">{action.label}</span>
-                  </button>
+                    <!-- Pin button -->
+                    <button
+                      class="pin-trigger-btn"
+                      class:pinned={isPinned(action.id)}
+                      onclick={(e) => { e.stopPropagation(); togglePin(action.id); }}
+                      aria-label={isPinned(action.id) ? 'Unpin {action.label}' : 'Pin {action.label}'}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill={isPinned(action.id) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="17" x2="12" y2="22"/>
+                        <path d="M5 17h14v-2.5c0-.83-.67-1.5-1.5-1.5h-11c-.83 0-1.5.67-1.5 1.5V17z"/>
+                        <path d="M12 14V7l-2.33-4.67h4.66L12 7z"/>
+                      </svg>
+                    </button>
+                  </div>
                 {/each}
               </div>
+              {/if}
             </div>
           {/if}
 
@@ -265,12 +460,42 @@
               <h3 class="all-actions-cat-title">🎯 Skill</h3>
               <div class="actions-full-grid">
                 {#each skillActions as action}
-                  <button class="action-grid-item" style="--action-color: {action.color}">
+                  <div class="action-grid-item all-action-item" style="--action-color: {action.color}" role="button" tabindex="0">
                     <div class="action-grid-icon">
                       <ActionIcon id={action.id} emoji={action.emoji} />
                     </div>
                     <span class="action-grid-label">{action.label}</span>
-                  </button>
+                    <!-- Pin button -->
+                    <button
+                      class="pin-trigger-btn"
+                      class:pinned={isPinned(action.id)}
+                      onclick={(e) => { e.stopPropagation(); togglePin(action.id); }}
+                      aria-label={isPinned(action.id) ? 'Unpin {action.label}' : 'Pin {action.label}'}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill={isPinned(action.id) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="17" x2="12" y2="22"/>
+                        <path d="M5 17h14v-2.5c0-.83-.67-1.5-1.5-1.5h-11c-.83 0-1.5.67-1.5 1.5V17z"/>
+                        <path d="M12 14V7l-2.33-4.67h4.66L12 7z"/>
+                      </svg>
+                    </button>
+                    {#if action.category === "skill" || action.category === "custom"}
+                    <!-- Delete custom action -->
+                    <button
+                      class="delete-action-btn"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        customActions = customActions.filter(c => c.id !== action.id);
+                        pinnedActions = pinnedActions.filter(id => id !== action.id);
+                      }}
+                      aria-label="Delete {action.label}"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="3 6 5 6 21 6"/>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                      </svg>
+                    </button>
+                    {/if}
+                  </div>
                 {/each}
               </div>
             </div>
@@ -357,16 +582,16 @@
           bind:this={panelEl}
         >
           {#if useLandscape}
-            <ControllerLandscape />
+            <ControllerLandscape assignments={actionAssignments} />
           {:else}
-            <Controller />
+            <Controller assignments={actionAssignments} />
           {/if}
 
           <!-- ═══ Overlay Control Buttons ═══ -->
           <div class="ctrl-overlay-btns">
             <button
               class="ctrl-overlay-btn"
-              onclick={() => isFullscreen = !isFullscreen}
+              onclick={toggleFullscreen}
               aria-label={isFullscreen ? 'Minimize' : 'Fullscreen'}
               title={isFullscreen ? 'Minimize' : 'Fullscreen'}
             >
@@ -412,44 +637,78 @@
         <!-- ═══ Scrollable cards below ═══ -->
         <div class="home-content-scroll">
 
-        <!-- ═══ Actions Card ═══ -->
+        <!-- ═══ Actions Card (Pinned) ═══ -->
         <div class="section-card">
           <div class="section-card-header">
-            <h2 class="section-card-title">Actions</h2>
+            <h2 class="section-card-title">Quick Actions</h2>
             <button class="see-all-btn" onclick={() => showAllActions = true}>See all</button>
           </div>
           <div class="action-grid-scroll-wrap">
+            {#if pinnedActionObjects.length === 0}
+              <p class="no-pinned-hint">Long-press an action in "See all" to pin it here.</p>
+            {:else}
             <div class="action-grid-scroll">
-              {#each { length: totalPages() } as _, pageIdx}
+              {#each { length: pinnedTotalPages } as _, pageIdx}
                   <div class="action-grid-page">
-                    {#each allActions.slice(pageIdx * 8, pageIdx * 8 + 8) as action}
-                      <button class="action-grid-item" style="--action-color: {action.color}">
+                    {#each pinnedActionObjects.slice(pageIdx * pinnedPerPage, pageIdx * pinnedPerPage + pinnedPerPage) as action}
+                      <div
+                        class="action-grid-item pinned-item"
+                        class:show-trash={longPressTarget === action.id}
+                        style="--action-color: {action.color}; position: relative;"
+                        role="button"
+                        tabindex="0"
+                        onclick={() => sendGait(action.id)}
+                        onpointerdown={(e) => {
+                          const timer = setTimeout(() => {
+                            longPressTarget = action.id;
+                          }, 600);
+                          e.currentTarget._longPressTimer = timer;
+                        }}
+                        onpointerup={(e) => {
+                          clearTimeout(e.currentTarget._longPressTimer);
+                          longPressTarget = null;
+                        }}
+                        onpointerleave={(e) => {
+                          clearTimeout(e.currentTarget._longPressTimer);
+                          longPressTarget = null;
+                        }}
+                        onpointercancel={(e) => {
+                          clearTimeout(e.currentTarget._longPressTimer);
+                          longPressTarget = null;
+                        }}
+                      >
                         <div class="action-grid-icon">
                           <ActionIcon id={action.id} emoji={action.emoji} />
                         </div>
                         <span class="action-grid-label">{action.label}</span>
-                      </button>
-                    {/each}
-                    {#if pageIdx === totalPages() - 1}
-                    <button class="action-grid-item add-item" onclick={() => showAddAction = true}>
-                      <div class="action-grid-icon add-icon-box">
-                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                          <line x1="12" y1="5" x2="12" y2="19"/>
-                          <line x1="5" y1="12" x2="19" y2="12"/>
-                        </svg>
+                        <!-- Trash button (shown on long-press) -->
+                        <button
+                          class="unpin-trash-btn"
+                          onclick={(e) => {
+                            e.stopPropagation();
+                            togglePin(action.id);
+                          }}
+                          aria-label="Remove {action.label}"
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="3 6 5 6 21 6"/>
+                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                          </svg>
+                        </button>
                       </div>
-                      <span class="action-grid-label">Add</span>
-                    </button>
-                  {/if}
-                </div>
+                    {/each}
+                  </div>
               {/each}
             </div>
             <!-- Page dots -->
+            {#if pinnedTotalPages > 1}
             <div class="page-dots">
-              {#each { length: totalPages() } as _, i}
+              {#each { length: pinnedTotalPages } as _, i}
                 <span class="page-dot" class:active={i === 0}></span>
               {/each}
             </div>
+            {/if}
+            {/if}
           </div>
         </div>
 
@@ -731,45 +990,39 @@
     display: block;
   }
 
-  .pill-btn {
-    padding: 4px 12px;
-    border: none;
-    border-radius: 999px;
-    background: rgba(0, 0, 0, 0.15);
-    color: #000;
-    font-size: 0.75rem;
-    font-weight: 700;
-    cursor: pointer;
-    transition: background 0.15s;
-    line-height: 1.4;
-  }
-  .pill-btn:hover {
-    background: rgba(0, 0, 0, 0.25);
-  }
-
-  .lang-btn {
-    min-width: 40px;
-    text-align: center;
-  }
-
-  /* ── Signal Bars ──────────────────────── */
-  .signal-bars {
+  /* ── Connection Mode Pill ──────────────── */
+  .conn-mode-pill {
     display: flex;
-    align-items: flex-end;
-    gap: 2px;
-    height: 16px;
-    margin-right: 2px;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 10px 3px 8px;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    line-height: 1.4;
+    background: rgba(0, 0, 0, 0.12);
+    color: #000;
   }
 
-  .sig-bar {
-    width: 4px;
-    border-radius: 2px;
-    background: #2e7d32;
+  .conn-mode-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #999;
   }
-  .sig-bar:nth-child(1) { height: 5px; }
-  .sig-bar:nth-child(2) { height: 8px; }
-  .sig-bar:nth-child(3) { height: 11px; }
-  .sig-bar:nth-child(4) { height: 14px; }
+  .conn-mode-pill.mode-ap .conn-mode-dot {
+    background: #22c55e; /* green — AP mode is direct */
+  }
+  .conn-mode-pill.mode-sta .conn-mode-dot {
+    background: #3b82f6; /* blue — STA mode */
+  }
+
+  .conn-mode-label {
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+
 
   /* ════════════════════════════════════════
      CONTENT
@@ -983,6 +1236,124 @@
     line-height: 1.2;
   }
 
+  /* ── Pinned item trash button ─────────── */
+  .pinned-item {
+    position: relative;
+  }
+
+  .unpin-trash-btn {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #d14949;
+    border: 2px solid #fff;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 5;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    transition: transform 0.1s;
+  }
+  .pinned-item.show-trash .unpin-trash-btn {
+    display: flex;
+  }
+  .unpin-trash-btn:active {
+    transform: scale(0.85);
+  }
+
+  .no-pinned-hint {
+    font-size: 0.8rem;
+    color: #999;
+    text-align: center;
+    padding: 16px 8px;
+    font-style: italic;
+  }
+
+  /* ── All Actions: pin & delete buttons ── */
+  .all-action-item {
+    position: relative;
+  }
+
+  .pin-trigger-btn {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.4);
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: #fff;
+    opacity: 0.6;
+    transition: opacity 0.15s, background 0.15s;
+    padding: 0;
+  }
+  .pin-trigger-btn.pinned {
+    opacity: 1;
+    background: var(--yellow, #FFE605);
+    color: #000;
+  }
+  .all-action-item:hover .pin-trigger-btn {
+    opacity: 1;
+  }
+
+  .delete-action-btn {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #d14949;
+    border: 1.5px solid #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+    padding: 0;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+  }
+  .all-action-item:hover .delete-action-btn {
+    opacity: 1;
+  }
+
+  /* ── Collapsible Gait Header ───────────── */
+  .all-actions-cat-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    border: none;
+    background: none;
+    cursor: pointer;
+    padding: 8px 16px;
+    margin: 12px 0 8px;
+    transition: background 0.15s;
+    border-radius: 8px;
+  }
+  .all-actions-cat-header:hover {
+    background: rgba(0,0,0,0.04);
+  }
+
+  .collapse-chevron {
+    color: #888;
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+  .collapse-chevron.collapsed {
+    transform: rotate(-90deg);
+  }
+
   /* ── Add Item (dashed box) ─────────────── */
   .add-icon-box {
     background: transparent !important;
@@ -1063,7 +1434,7 @@
     color: #888;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    margin: 12px 16px 8px;
+    margin: 0;
     padding: 0;
   }
 

@@ -11,14 +11,26 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "lwip/ip4_addr.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 static const char *TAG = "wifi_ap";
+
+/* ── NVS namespace for AP config ────────────────────────────── */
+static constexpr const char *NVS_NS      = "wifi_ap";
+static constexpr const char *NVS_KEY_SSID = "ssid";
+static constexpr const char *NVS_KEY_PASS = "password";
+
+/* ── Helpers in the network namespace ──────────────────────── */
+namespace network {
 
 static esp_netif_t *s_ap_netif = nullptr;
 static bool s_initialized = false;
 
-/* ── Helpers in the network namespace ──────────────────────── */
-namespace network {
+/* ── Active AP config (NVS-customised or compile-time default) ── */
+static std::string s_active_ssid     = WIFI_AP_SSID;
+static std::string s_active_password = WIFI_AP_PASSWORD;
+
 namespace {
 
 void wifi_event_handler(void *arg, esp_event_base_t base,
@@ -68,6 +80,95 @@ bool set_static_ip()
 
 }  // anonymous namespace
 
+/* ── NVS persistence ────────────────────────────────────────── */
+
+bool wifi_ap_save_config(const char *ssid, const char *password)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS namespace '%s'", NVS_NS);
+        return false;
+    }
+
+    esp_err_t ret;
+    ret = nvs_set_str(nvs, NVS_KEY_SSID, ssid);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS write ssid failed: %s", esp_err_to_name(ret));
+        nvs_close(nvs);
+        return false;
+    }
+
+    ret = nvs_set_str(nvs, NVS_KEY_PASS, password);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS write password failed: %s", esp_err_to_name(ret));
+        nvs_close(nvs);
+        return false;
+    }
+
+    ret = nvs_commit(nvs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS commit failed: %s", esp_err_to_name(ret));
+        nvs_close(nvs);
+        return false;
+    }
+
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Saved AP config to NVS — SSID: \"%s\"", ssid);
+    return true;
+}
+
+bool wifi_ap_load_config(std::string &ssid, std::string &password)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NS, NVS_READONLY, &nvs) != ESP_OK) {
+        return false;
+    }
+
+    char buf[64];
+    size_t len;
+
+    len = sizeof(buf);
+    if (nvs_get_str(nvs, NVS_KEY_SSID, buf, &len) == ESP_OK) {
+        ssid = buf;
+    } else {
+        nvs_close(nvs);
+        return false;
+    }
+
+    len = sizeof(buf);
+    if (nvs_get_str(nvs, NVS_KEY_PASS, buf, &len) == ESP_OK) {
+        password = buf;
+    } else {
+        password.clear();
+    }
+
+    nvs_close(nvs);
+    return true;
+}
+
+void wifi_ap_erase_config()
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &nvs) != ESP_OK) return;
+
+    nvs_erase_key(nvs, NVS_KEY_SSID);
+    nvs_erase_key(nvs, NVS_KEY_PASS);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    ESP_LOGI(TAG, "Erased AP config from NVS");
+}
+
+const char *wifi_ap_get_ssid()
+{
+    return s_active_ssid.c_str();
+}
+
+const char *wifi_ap_get_password()
+{
+    return s_active_password.c_str();
+}
+
 /* ── Public API ─────────────────────────────────────────────── */
 
 bool init_wifi_ap()
@@ -98,14 +199,38 @@ bool init_wifi_ap()
     // Set Wi-Fi to AP+STA dual mode (STA netif created by init_wifi_sta)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 
+    // ── Load custom config from NVS, fall back to compile-time defaults ──
+    {
+        std::string nvs_ssid, nvs_password;
+        if (wifi_ap_load_config(nvs_ssid, nvs_password) && !nvs_ssid.empty()) {
+            s_active_ssid     = nvs_ssid;
+            s_active_password = nvs_password;
+            ESP_LOGI(TAG, "Using NVS-customised AP config — SSID: \"%s\"",
+                     s_active_ssid.c_str());
+        } else {
+            s_active_ssid     = WIFI_AP_SSID;
+            s_active_password = WIFI_AP_PASSWORD;
+            ESP_LOGI(TAG, "Using compile-time default AP config — SSID: \"%s\"",
+                     s_active_ssid.c_str());
+        }
+    }
+
     // Configure AP
     wifi_config_t ap_config = {};
     std::strncpy(reinterpret_cast<char *>(ap_config.ap.ssid),
-                 WIFI_AP_SSID, sizeof(ap_config.ap.ssid) - 1);
-    ap_config.ap.ssid_len = static_cast<uint8_t>(std::strlen(WIFI_AP_SSID));
+                 s_active_ssid.c_str(), sizeof(ap_config.ap.ssid) - 1);
+    ap_config.ap.ssid_len = static_cast<uint8_t>(s_active_ssid.size());
     ap_config.ap.max_connection = WIFI_AP_MAX_CONN;
     ap_config.ap.channel = WIFI_AP_CHANNEL;
-    ap_config.ap.authmode = WIFI_AUTH_OPEN;       // open network
+
+    if (s_active_password.empty()) {
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    } else {
+        ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        std::strncpy(reinterpret_cast<char *>(ap_config.ap.password),
+                     s_active_password.c_str(), sizeof(ap_config.ap.password) - 1);
+    }
+
     ap_config.ap.beacon_interval = 100;
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
@@ -119,8 +244,9 @@ bool init_wifi_ap()
     // Start Wi-Fi
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wi-Fi AP started — SSID: \"%s\", IP: %s",
-             WIFI_AP_SSID, AP_IP_ADDR);
+    ESP_LOGI(TAG, "Wi-Fi AP started — SSID: \"%s\", IP: %s, auth=%s",
+             s_active_ssid.c_str(), AP_IP_ADDR,
+             s_active_password.empty() ? "OPEN" : "WPA2");
 
     s_initialized = true;
     return true;

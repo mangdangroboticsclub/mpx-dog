@@ -5,23 +5,75 @@
 
   const YELLOW = colors.mpx.primary;
 
-  // ── Available .wasm / .lua files (mock) ──
-  let availableFiles = $state([
-    { path: "/skills/walk.lua",       name: "walk.lua",       type: "lua" },
-    { path: "/skills/sit.lua",        name: "sit.lua",        type: "lua" },
-    { path: "/skills/dance.lua",      name: "dance.lua",      type: "lua" },
-    { path: "/skills/follow.lua",     name: "follow.lua",     type: "lua" },
-    { path: "/skills/lie.lua",        name: "lie.lua",        type: "lua" },
-    { path: "/skills/walking/forward.wasm",  name: "forward.wasm",  type: "wasm" },
-    { path: "/skills/walking/backward.wasm", name: "backward.wasm", type: "wasm" },
-    { path: "/skills/walking/turn.wasm",     name: "turn.wasm",     type: "wasm" },
-    { path: "/skills/tricks/spin.wasm",      name: "spin.wasm",     type: "wasm" },
-    { path: "/skills/tricks/jump.wasm",      name: "jump.wasm",     type: "wasm" },
-  ]);
+  // ── File-system browser state (embedded FileViewer) ──
+  let files = $state([]);
+  let dirs = $state([]);
+  let currentDir = $state("/");
+  let fsInfo = $state({ total: 0, used: 0 });
+  let loading = $state(true);
+  let showHidden = $state(false);
+  let searchQuery = $state("");
 
+  function isWasm(n) { return n.endsWith(".wasm"); }
+  function isLua(n)  { return n.endsWith(".lua"); }
+  function isAllowed(n) { return isWasm(n) || isLua(n); }
+
+  function icon(n) {
+    if (isWasm(n)) return "⚡";
+    if (isLua(n))  return "🌙";
+    if (n.endsWith(".gz")) return "📦";
+    if (n.endsWith(".json")) return "📋";
+    if (n.endsWith(".md")) return "📝";
+    return "📄";
+  }
+
+  function fmtSize(b) {
+    return b < 1024 ? b + " B" : (b / 1024).toFixed(1) + " KB";
+  }
+
+  async function fetchDir(dir) {
+    loading = true;
+    try {
+      const [lr, ir] = await Promise.all([
+        fetch("/v1/fs/list?path=" + encodeURIComponent(dir)),
+        fetch("/v1/fs/info"),
+      ]);
+      if (lr.ok) { const d = await lr.json(); files = d.f || []; dirs = d.d || []; currentDir = dir; }
+      if (ir.ok) fsInfo = await ir.json();
+    } catch {
+      files = [];
+      dirs = [];
+    }
+    loading = false;
+  }
+
+  function goDir(d) { fetchDir(currentDir === "/" ? "/" + d : currentDir + "/" + d); }
+
+  function goUp() {
+    if (currentDir === "/") return;
+    const p = currentDir.split("/").filter(Boolean); p.pop();
+    fetchDir(p.length === 0 ? "/" : "/" + p.join("/"));
+  }
+
+  $effect(() => { fetchDir("/"); });
+
+  // ── Filtering ──
+  let filteredDirs = $derived(
+    searchQuery
+      ? dirs.filter(d => d.toLowerCase().includes(searchQuery.toLowerCase()))
+      : dirs
+  );
+  let filteredFiles = $derived(
+    searchQuery
+      ? files.filter(f => f.n.toLowerCase().includes(searchQuery.toLowerCase()))
+      : files
+  );
+
+  // ── Selection state ──
   let selectedFile = $state(null);
   let actionName = $state("");
   let actionEmoji = $state("");
+  let customEmojiInput = $state("");
 
   const emojiSuggestions = [
     "🤖", "⚡", "🔥", "💨", "🌟", "🎯", "🎪", "🎭",
@@ -30,23 +82,18 @@
     "🤿", "🏋️", "🤺", "🏃", "🧗", "🤹", "🎨", "🎵",
   ];
 
-  let fileSearchQuery = $state("");
+  let effectiveEmoji = $derived(customEmojiInput || actionEmoji || "⚙️");
 
-  let filteredFiles = $derived(
-    fileSearchQuery
-      ? availableFiles.filter(f =>
-          f.name.toLowerCase().includes(fileSearchQuery.toLowerCase()) ||
-          f.path.toLowerCase().includes(fileSearchQuery.toLowerCase())
-        )
-      : availableFiles
-  );
-
-  function selectFile(file) {
-    selectedFile = file;
+  function selectFile(f) {
+    const dirPath = currentDir === "/" ? "" : currentDir;
+    selectedFile = {
+      path: dirPath + "/" + f.n,
+      name: f.n,
+      type: isWasm(f.n) ? "wasm" : "lua",
+    };
     // Auto-suggest a name from the file name
     if (!actionName) {
-      actionName = file.name.replace(/\.(wasm|lua)$/, "");
-      // Capitalise first letter
+      actionName = f.n.replace(/\.(wasm|lua)$/, "");
       actionName = actionName.charAt(0).toUpperCase() + actionName.slice(1);
     }
   }
@@ -57,9 +104,9 @@
     const newAction = {
       id: "custom_" + Date.now(),
       label: actionName.trim(),
-      emoji: actionEmoji || "⚙️",
+      emoji: effectiveEmoji,
       color: "#888",
-      category: "custom",
+      category: "skill",
       filePath: selectedFile.path,
       fileType: selectedFile.type,
     };
@@ -87,42 +134,85 @@
   </header>
 
   <div class="form-scroll">
-    <!-- ═══ Step 1: Pick a file ═══ -->
+    <!-- ═══ Step 1: Browse & pick a file ═══ -->
     <section class="form-section">
-      <h2 class="section-title">1. Choose a file</h2>
-      <p class="section-desc">Select a .wasm or .lua file to use for this action.</p>
+      <h2 class="section-title">1. Browse &amp; select a file</h2>
+      <p class="section-desc">Navigate to a .wasm or .lua file on the robot.</p>
 
-      <!-- File search -->
-      <div class="file-search-bar">
+      <!-- Search bar -->
+      <div class="fv-search-wrap">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="11" cy="11" r="8"/>
           <line x1="21" y1="21" x2="16.65" y2="16.65"/>
         </svg>
         <input
+          class="fv-search-input"
           type="text"
-          class="file-search-input"
-          placeholder="Search files..."
-          bind:value={fileSearchQuery}
+          placeholder="Search files…"
+          bind:value={searchQuery}
         />
       </div>
 
-      <div class="file-list">
-        {#each filteredFiles as file}
-          <button
-            class="file-item"
-            class:selected={selectedFile === file}
-            onclick={() => selectFile(file)}
-          >
-            <span class="file-icon">{file.type === "wasm" ? "⚡" : "🌙"}</span>
-            <div class="file-info">
-              <span class="file-name">{file.name}</span>
-              <span class="file-path">{file.path}</span>
-            </div>
-            {#if selectedFile === file}
-              <span class="file-check">✓</span>
+      <!-- Storage bar -->
+      <div class="fv-storage-bar" style="--bar-bg: {YELLOW}">
+        <div class="fv-storage-row">
+          <span class="fv-storage-path">📁 {currentDir === "/" ? "/" : currentDir}</span>
+          <span class="fv-storage-actions">
+            <button class="fv-pill-btn fv-hidden-toggle"
+                    class:fv-hidden-active={showHidden}
+                    onclick={() => { showHidden = !showHidden; }}>
+              {showHidden ? '👁 Hidden' : '👁‍🗨'}
+            </button>
+            <button class="fv-pill-btn" onclick={() => fetchDir(currentDir)}>↻</button>
+          </span>
+        </div>
+        <div class="fv-storage-track">
+          <div class="fv-storage-fill" style="width:{fsInfo.total ? ((fsInfo.used / fsInfo.total) * 100) : 0}%"></div>
+        </div>
+        <span class="fv-storage-pct">{fsInfo.total ? ((fsInfo.used / fsInfo.total) * 100).toFixed(0) : 0}% used</span>
+      </div>
+
+      <!-- File / dir listing -->
+      <div class="fv-list">
+        {#if loading}
+          <p class="fv-status">Loading…</p>
+        {:else}
+          {#if currentDir !== "/"}
+            <button class="fv-dir-item" onclick={goUp}>
+              <span class="fv-dir-icon">📂</span>
+              <span class="fv-dir-name">..</span>
+            </button>
+          {/if}
+
+          {#each filteredDirs as d}
+            <button class="fv-dir-item" onclick={() => goDir(d)}>
+              <span class="fv-dir-icon">📁</span>
+              <span class="fv-dir-name">{d}</span>
+            </button>
+          {/each}
+
+          {#each filteredFiles as f}
+            {@const ok = isAllowed(f.n)}
+            {#if showHidden || ok}
+              <button
+                class="fv-file-item"
+                class:fv-dimmed={!ok}
+                class:fv-file-selected={selectedFile && selectedFile.name === f.n && (currentDir === "/" ? "" : currentDir) + "/" + f.n === selectedFile.path}
+                onclick={() => ok ? selectFile(f) : undefined}
+                disabled={!ok}
+              >
+                <span class="fv-file-icon">{icon(f.n)}</span>
+                <div class="fv-file-meta">
+                  <span class="fv-file-name">{f.n}{#if f.r}<span class="fv-lock-indicator">🔒</span>{/if}</span>
+                  <span class="fv-file-size">{fmtSize(f.s)}</span>
+                </div>
+                {#if selectedFile && selectedFile.name === f.n && (currentDir === "/" ? "" : currentDir) + "/" + f.n === selectedFile.path}
+                  <span class="fv-file-check">✓</span>
+                {/if}
+              </button>
             {/if}
-          </button>
-        {/each}
+          {/each}
+        {/if}
       </div>
     </section>
 
@@ -142,22 +232,30 @@
     <!-- ═══ Step 3: Pick an emoji ═══ -->
     <section class="form-section">
       <h2 class="section-title">3. Pick an emoji</h2>
+      <p class="section-desc">Type any emoji below, or pick one from the grid.</p>
+
+      <input
+        type="text"
+        class="emoji-text-input"
+        placeholder="e.g. 🎉 or any text…"
+        bind:value={customEmojiInput}
+        maxlength="8"
+      />
+
       <div class="emoji-grid">
         {#each emojiSuggestions as emoji}
           <button
             class="emoji-item"
-            class:selected={actionEmoji === emoji}
-            onclick={() => actionEmoji = emoji}
+            class:selected={actionEmoji === emoji && !customEmojiInput}
+            onclick={() => { actionEmoji = emoji; customEmojiInput = ""; }}
           >
             {emoji}
           </button>
         {/each}
       </div>
-      {#if actionEmoji}
-        <div class="emoji-preview">
-          Selected: <span class="emoji-preview-icon">{actionEmoji}</span>
-        </div>
-      {/if}
+      <div class="emoji-preview">
+        Selected: <span class="emoji-preview-icon">{effectiveEmoji}</span>
+      </div>
     </section>
 
     <!-- ═══ Preview ═══ -->
@@ -166,7 +264,7 @@
         <h2 class="section-title">Preview</h2>
         <div class="preview-card">
           <div class="preview-icon" style="background: {YELLOW}">
-            <span class="preview-emoji">{actionEmoji || "⚙️"}</span>
+            <span class="preview-emoji">{effectiveEmoji}</span>
           </div>
           <div class="preview-info">
             <span class="preview-name">{actionName || "Action Name"}</span>
@@ -261,57 +359,147 @@
     margin: 0 0 10px;
   }
 
-  /* ── File search ── */
-  .file-search-bar {
+  /* ═══ FileViewer-inspired styles ═══ */
+
+  /* ── Search ── */
+  .fv-search-wrap {
     display: flex;
     align-items: center;
     gap: 6px;
     padding: 8px 12px;
-    border-radius: 20px;
+    border-radius: 12px;
     background: #f5f5f5;
     border: 1.5px solid #e0e0e0;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
     color: #999;
   }
-  .file-search-bar:focus-within {
+  .fv-search-wrap:focus-within {
     border-color: #FFE605;
     background: #fff;
   }
 
-  .file-search-input {
+  .fv-search-input {
     flex: 1;
     border: none;
     background: transparent;
     outline: none;
     font-size: 0.8rem;
     color: #000;
+    font-family: inherit;
   }
-  .file-search-input::placeholder {
+  .fv-search-input::placeholder {
     color: #bbb;
   }
 
-  /* ── File list ── */
-  .file-list {
+  /* ── Storage bar ── */
+  .fv-storage-bar {
+    padding: 8px 12px;
+    background: #f5f5f5;
+    border-radius: 10px;
+    margin-bottom: 10px;
+  }
+
+  .fv-storage-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.7rem;
+    color: #666;
+    margin-bottom: 4px;
+  }
+
+  .fv-storage-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #444;
+  }
+
+  .fv-storage-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    margin-left: 8px;
+  }
+
+  .fv-pill-btn {
+    padding: 2px 8px;
+    border: none;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.12);
+    color: #000;
+    font-size: 0.65rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.15s;
+    line-height: 1.6;
+  }
+  .fv-pill-btn:hover {
+    background: rgba(0, 0, 0, 0.22);
+  }
+
+  .fv-hidden-toggle {
+    font-size: 0.6rem;
+    white-space: nowrap;
+  }
+  .fv-hidden-active {
+    background: rgba(0,0,0,0.22);
+  }
+
+  .fv-storage-track {
+    height: 5px;
+    border-radius: 3px;
+    background: #ddd;
+    overflow: hidden;
+    margin-bottom: 3px;
+  }
+
+  .fv-storage-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--bar-bg, #FFE605);
+    transition: width 0.3s;
+  }
+
+  .fv-storage-pct {
+    display: block;
+    font-size: 0.6rem;
+    color: #999;
+    text-align: right;
+  }
+
+  /* ── File / dir list ── */
+  .fv-list {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    max-height: 200px;
+    gap: 5px;
+    max-height: 240px;
     overflow-y: auto;
   }
-  .file-list::-webkit-scrollbar {
+  .fv-list::-webkit-scrollbar {
     width: 3px;
   }
-  .file-list::-webkit-scrollbar-thumb {
+  .fv-list::-webkit-scrollbar-thumb {
     background: #ddd;
     border-radius: 4px;
   }
 
-  .file-item {
+  .fv-status {
+    text-align: center;
+    color: #999;
+    font-size: 0.8rem;
+    padding: 20px;
+  }
+
+  .fv-dir-item {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 10px 12px;
-    border-radius: 12px;
+    padding: 9px 12px;
+    border-radius: 10px;
     border: 2px solid transparent;
     background: #fafafa;
     cursor: pointer;
@@ -319,40 +507,86 @@
     text-align: left;
     width: 100%;
   }
-  .file-item:hover {
+  .fv-dir-item:hover {
     background: #f0f0f0;
   }
-  .file-item.selected {
-    border-color: #FFE605;
-    background: #fff;
-  }
 
-  .file-icon {
-    font-size: 1.2rem;
+  .fv-dir-icon {
+    font-size: 1rem;
     flex-shrink: 0;
   }
 
-  .file-info {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-  }
-
-  .file-name {
+  .fv-dir-name {
     font-size: 0.8rem;
     font-weight: 600;
     color: #000;
   }
 
-  .file-path {
-    font-size: 0.65rem;
-    color: #999;
+  .fv-file-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 2px solid transparent;
+    background: #fafafa;
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: left;
+    width: 100%;
+  }
+  .fv-file-item:hover {
+    background: #f0f0f0;
+  }
+  .fv-file-item:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+  .fv-file-item:disabled:hover {
+    background: #fafafa;
+  }
+  .fv-file-item.fv-file-selected {
+    border-color: #FFE605;
+    background: #fffef0;
+  }
+
+  .fv-dimmed {
+    opacity: 0.45;
+  }
+
+  .fv-file-icon {
+    font-size: 1.1rem;
+    flex-shrink: 0;
+  }
+
+  .fv-file-meta {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .fv-file-name {
+    display: block;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #000;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .file-check {
+  .fv-lock-indicator {
+    font-size: 0.55rem;
+    margin-left: 2px;
+  }
+
+  .fv-file-size {
+    display: block;
+    font-size: 0.65rem;
+    color: #999;
+    margin-top: 1px;
+  }
+
+  .fv-file-check {
     margin-left: auto;
     color: #FFE605;
     font-weight: 700;
@@ -382,6 +616,23 @@
     font-size: 0.65rem;
     color: #bbb;
     margin-top: 4px;
+  }
+
+  /* ── Emoji text input ── */
+  .emoji-text-input {
+    width: 100%;
+    padding: 10px 14px;
+    border: 2px solid #e0e0e0;
+    border-radius: 12px;
+    font-size: 1.2rem;
+    outline: none;
+    margin-bottom: 10px;
+    box-sizing: border-box;
+    font-family: inherit;
+    text-align: center;
+  }
+  .emoji-text-input:focus {
+    border-color: #FFE605;
   }
 
   /* ── Emoji picker ── */

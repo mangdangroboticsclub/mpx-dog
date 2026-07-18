@@ -8,6 +8,7 @@
     onBack,
     customActions = [],
     onAddAction,
+    onDeleteAction,
   } = $props();
 
   const buttonPositions = [
@@ -19,18 +20,50 @@
 
   // ── Built-in actions with emoji + category ───────────────
   const builtinActions = [
-    { id: "walk",  label: "Walk",  emoji: "🚶", color: colors.mpx.action_green, category: "gait" },
-    { id: "crawl", label: "Crawl", emoji: "🧎", color: "#7C7FDB",              category: "gait" },
-    { id: "jump",  label: "Jump",  emoji: "🤸", color: "#60C5B4",              category: "gait" },
-    { id: "sit",   label: "Sit",   emoji: "🪑", color: colors.mpx.action_blue,  category: "skill" },
-    { id: "follow", label: "Follow", emoji: "🐾", color: colors.mpx.action_purple, category: "skill" },
-    { id: "dance", label: "Dance", emoji: "💃", color: colors.mpx.action_red,    category: "skill" },
-    { id: "lie",   label: "Lie Down", emoji: "🛌", color: "#E8A060",            category: "skill" },
-    { id: "spin",  label: "Spin",  emoji: "🌀", color: "#E07B9E",              category: "skill" },
-    { id: "bow",   label: "Bow",   emoji: "🙇", color: "#D4A84B",              category: "skill" },
-    { id: "wave",  label: "Wave",  emoji: "👋", color: "#5DB0D6",              category: "skill" },
-    { id: "guard", label: "Guard", emoji: "🛡️", color: "#8DB850",              category: "skill" },
-    { id: "search", label: "Search", emoji: "🔍", color: "#D6877A",            category: "skill" },
+    // ── Movement gaits ──
+    { id: "advance",  label: "Forward",      emoji: "🚶", color: colors.mpx.action_green, category: "gait" },
+    { id: "back",     label: "Backward",     emoji: "🔙", color: colors.mpx.action_green, category: "gait" },
+    { id: "left",     label: "Strafe Left",  emoji: "◀️",  color: colors.mpx.action_green, category: "gait" },
+    { id: "right",    label: "Strafe Right", emoji: "▶️",  color: colors.mpx.action_green, category: "gait" },
+    { id: "turnL",    label: "Turn Left",    emoji: "↺",  color: "#0E8C8C",              category: "gait" },
+    { id: "turnR",    label: "Turn Right",   emoji: "↻",  color: "#0E8C8C",              category: "gait" },
+    { id: "stanford", label: "Trot",         emoji: "🐕", color: "#14A37F",              category: "gait" },
+    { id: "step",     label: "Step",         emoji: "🦶", color: "#14A37F",              category: "gait" },
+    { id: "testspeed",label: "Speed Test",   emoji: "⚡",  color: "#D14949",              category: "gait" },
+    { id: "jump",     label: "Jump",         emoji: "🤸", color: "#D97A29",              category: "gait" },
+    { id: "jumpfwd",  label: "Jump Fwd",     emoji: "🏃", color: "#C4901A",              category: "gait" },
+    // ── Leg lifts ──
+    { id: "flegR",    label: "Lift FR",      emoji: "🦵", color: "#5FAD41",              category: "gait" },
+    { id: "flegL",    label: "Lift FL",      emoji: "🦵", color: "#5FAD41",              category: "gait" },
+    { id: "blegR",    label: "Lift RR",      emoji: "🦵", color: "#5FAD41",              category: "gait" },
+    { id: "blegL",    label: "Lift RL",      emoji: "🦵", color: "#5FAD41",              category: "gait" },
+    // ── Height ──
+    { id: "heightup",   label: "Height Up",   emoji: "⬆️",  color: "#D96098",              category: "gait" },
+    { id: "heightdown", label: "Height Down", emoji: "⬇️",  color: "#D96098",              category: "gait" },
+    // ── Diagonal moves ──
+    { id: "moveLF", label: "Diag FL", emoji: "↗️",  color: "#4A8BC2",              category: "gait" },
+    { id: "moveRF", label: "Diag FR", emoji: "↖️",  color: "#4A8BC2",              category: "gait" },
+    { id: "moveLB", label: "Diag BL", emoji: "↘️",  color: "#4A8BC2",              category: "gait" },
+    { id: "moveRB", label: "Diag BR", emoji: "↙️",  color: "#4A8BC2",              category: "gait" },
+    // ── Skills (all built-in actions are gaits) ──
+    { id: "sit",      label: "Sit",          emoji: "🪑", color: colors.mpx.action_blue,   category: "gait" },
+    { id: "stretch",  label: "Stretch",      emoji: "🧘", color: "#D96098",               category: "gait" },
+    { id: "twerk",    label: "Twerk",        emoji: "💃", color: colors.mpx.action_purple, category: "gait" },
+    { id: "roll",     label: "Roll",         emoji: "🔄", color: "#14A37F",               category: "gait" },
+    { id: "pitch",    label: "Pitch",        emoji: "📐", color: "#14A37F",               category: "gait" },
+    { id: "balance",  label: "Balance",      emoji: "⚖️",  color: "#14A37F",               category: "gait" },
+    { id: "init",     label: "Init",         emoji: "🏁", color: "#7C7F7C",               category: "gait" },
+    { id: "none",     label: "Stop",         emoji: "⏹️",  color: "#D14949",               category: "gait" },
+    { id: "frontkick",label: "Front Kick",   emoji: "🦶", color: "#C44569",               category: "gait" },
+    { id: "wiggle",   label: "Wiggle",       emoji: "🐕", color: "#C44569",               category: "gait" },
+    { id: "wiggleL",  label: "Wiggle ◀",     emoji: "◀️",  color: "#C44569",               category: "gait" },
+    { id: "wiggleR",  label: "Wiggle ▶",     emoji: "▶️",  color: "#C44569",               category: "gait" },
+    { id: "buttshrug",  label: "Butt Shrug",   emoji: "🍑", color: "#C44569",             category: "gait" },
+    { id: "buttshrugL", label: "Shrug ◀",      emoji: "◀️",  color: "#C44569",             category: "gait" },
+    { id: "buttshrugR", label: "Shrug ▶",      emoji: "▶️",  color: "#C44569",             category: "gait" },
+    { id: "bowback",  label: "Bow",          emoji: "🙇", color: "#AD5FBF",               category: "gait" },
+    { id: "bodycycle",label: "Body Circle",  emoji: "🔄", color: "#AD5FBF",               category: "gait" },
+    { id: "headellipse",label: "Head Circle", emoji: "🔄", color: "#AD5FBF",              category: "gait" },
   ];
 
   // ── Merge built-in + custom actions ──────────────────────
@@ -39,6 +72,7 @@
   // ── State ────────────────────────────────────────────────
   let selectedPosition = $state(buttonPositions[0].id);
   let searchQuery = $state("");
+  let showGaitSection = $state(true);
 
   // Clone assignments for local editing — auto-saves on each change
   let localAssignments = $state({ ...assignments });
@@ -161,11 +195,15 @@
       {/if}
     </div>
 
-    <!-- ═══ Gait Section ═══ -->
+    <!-- ═══ Gait Section (collapsible) ═══ -->
     {#if gaitActions.length > 0}
-      <div class="category-header">
+      <button class="category-header collapsible" onclick={() => showGaitSection = !showGaitSection}>
         <span class="category-label">🚶 Gait</span>
-      </div>
+        <svg class="collapse-chevron" class:collapsed={!showGaitSection} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+      </button>
+      {#if showGaitSection}
       <div class="actions-grid">
         {#each gaitActions as action}
           {@const isAssigned = localAssignments[selectedPosition] === action.id}
@@ -189,6 +227,7 @@
           </button>
         {/each}
       </div>
+      {/if}
     {/if}
 
     <!-- ═══ Skill Section ═══ -->
@@ -199,10 +238,13 @@
       <div class="actions-grid">
         {#each skillActions as action}
           {@const isAssigned = localAssignments[selectedPosition] === action.id}
-          <button
+          {@const isCustom = action.category === "skill" || action.category === "custom"}
+          <div
             class="action-item"
             class:selected={isAssigned}
             style="--action-color: {action.color}"
+            role="button"
+            tabindex="0"
             onclick={() => assignAction(action.id)}
           >
             <div class="action-icon" style="background: {action.color}">
@@ -216,7 +258,22 @@
                 </svg>
               </div>
             {/if}
-          </button>
+            {#if isCustom}
+            <button
+              class="delete-action-item-btn"
+              onclick={(e) => {
+                e.stopPropagation();
+                onDeleteAction?.(action.id);
+              }}
+              aria-label="Delete {action.label}"
+            >
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+              </svg>
+            </button>
+            {/if}
+          </div>
         {/each}
       </div>
     {/if}
@@ -432,6 +489,27 @@
     padding: 8px 2px 6px;
     flex-shrink: 0;
   }
+  .category-header.collapsible {
+    cursor: pointer;
+    border: none;
+    background: none;
+    width: 100%;
+    border-radius: 8px;
+    transition: background 0.15s;
+  }
+  .category-header.collapsible:hover {
+    background: rgba(0,0,0,0.04);
+  }
+
+  .collapse-chevron {
+    color: #888;
+    transition: transform 0.2s;
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+  .collapse-chevron.collapsed {
+    transform: rotate(-90deg);
+  }
   .category-label {
     font-size: 0.75rem;
     font-weight: 700;
@@ -500,6 +578,28 @@
     align-items: center;
     justify-content: center;
     box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  }
+
+  .delete-action-item-btn {
+    position: absolute;
+    top: -6px;
+    left: -6px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #d14949;
+    border: 1.5px solid #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+    padding: 0;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+  }
+  .action-item:hover .delete-action-item-btn {
+    opacity: 1;
   }
 
   /* ── Add Action Button ────────────────── */

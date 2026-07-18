@@ -3,6 +3,12 @@
 
   const YELLOW = colors.mpx.primary;
 
+  /** Fraction of joystick radius that is a deadzone (0–1) */
+  const DEADZONE = 0.18;
+  const LOOK_DEADZONE = 0.35;
+
+  let { assignments = {} } = $props();
+
   // ── Joystick state ──────────────────────────────────────────
   let joystickLX = $state(0);
   let joystickLY = $state(0);
@@ -59,6 +65,34 @@
         body: JSON.stringify({ mode }),
       });
     } catch {}
+  }
+
+  // ── Look direction (head pose) mapping ──────────────────────
+  /** Map joystick normalised (-1..1) position to a look gait command */
+  function joystickToLookMode(nx, ny) {
+    const dist = Math.sqrt(nx * nx + ny * ny);
+    if (dist < LOOK_DEADZONE) return 'init';
+
+    const angle = Math.atan2(ny, nx) * 180 / Math.PI;
+
+    if (angle > -22.5 && angle <= 22.5) return 'lookright';
+    if (angle > 22.5 && angle <= 67.5) return 'looklr';
+    if (angle > 67.5 && angle <= 112.5) return 'lookdown';
+    if (angle > 112.5 && angle <= 157.5) return 'lookll';
+    if (angle > 157.5 || angle <= -157.5) return 'lookleft';
+    if (angle > -157.5 && angle <= -112.5) return 'lookul';
+    if (angle > -112.5 && angle <= -67.5) return 'lookup';
+    if (angle > -67.5 && angle <= -22.5) return 'lookur';
+
+    return 'init';
+  }
+
+  let lastLookMode = $state('init');
+
+  function sendLookMode(mode) {
+    if (mode === lastLookMode) return;
+    lastLookMode = mode;
+    sendGait(mode);
   }
 
   // ── Keyboard state ──────────────────────────────────────────
@@ -121,10 +155,13 @@
       joystickLX = 0; joystickLY = 0;
       joystickLDx = 0; joystickLDy = 0;
       joyF = 0; joyS = 0;
+      // Explicitly stop the gait — zero joy values alone don't halt walking
+      sendGait('none');
     } else {
       joystickRx = 0; joystickRy = 0;
       joystickRDx = 0; joystickRDy = 0;
-      joyT = 0;
+      // Center the head on release
+      sendLookMode('init');
     }
     activeJoystick = null;
     joyStopIfIdle();
@@ -147,20 +184,35 @@
       dy = (dy / dist) * jMaxRadius;
     }
 
-    const nx = jMaxRadius > 0 ? +(dx / jMaxRadius).toFixed(4) : 0;
-    const ny = jMaxRadius > 0 ? +(dy / jMaxRadius).toFixed(4) : 0;
+    let nx = jMaxRadius > 0 ? +(dx / jMaxRadius).toFixed(4) : 0;
+    let ny = jMaxRadius > 0 ? +(dy / jMaxRadius).toFixed(4) : 0;
+
+    // ── deadzone: snap small deflections to zero ──────────────
+    const dz = activeJoystick === 'left' ? DEADZONE : LOOK_DEADZONE;
+    const mag = Math.sqrt(nx * nx + ny * ny);
+    if (mag < dz) {
+      nx = 0;
+      ny = 0;
+      dx = 0;
+      dy = 0;
+    }
 
     if (activeJoystick === 'left') {
       joystickLX = nx; joystickLY = ny;
       joystickLDx = dx; joystickLDy = dy;
       joyF = -ny;
       joyS = -nx;
-      joyStartTimer();
+      if (mag < DEADZONE) {
+        joyStopIfIdle();
+      } else {
+        joyStartTimer();
+      }
     } else {
       joystickRx = nx; joystickRy = ny;
       joystickRDx = dx; joystickRDy = dy;
-      joyT = -nx;
-      joyStartTimer();
+      // Right pad: head pose (look direction)
+      const mode = joystickToLookMode(nx, ny);
+      sendLookMode(mode);
     }
   }
 
@@ -182,13 +234,17 @@
   function handlePress(action) {
     if (pressedButtons.has(action)) return;
     pressedButtons.add(action);
-    const gait = buttonGaitMap[action];
+    // Check action assignments first, fall back to hardcoded map
+    const gait = assignments[action] || buttonGaitMap[action];
     if (gait) sendGait(gait);
   }
 
   function handleRelease(action) {
     if (!pressedButtons.has(action)) return;
     pressedButtons.delete(action);
+    // stop the gait when the button is released (hold-to-action)
+    const gait = assignments[action] || buttonGaitMap[action];
+    if (gait) sendGait('none');
   }
 
   function onButtonPointerDown(e, action) {
@@ -368,6 +424,7 @@
     >
       <div class="joy-inner">
         <div class="joy-ring">
+          <div class="deadzone-indicator" style="--dz-pct:{DEADZONE * 100}%"></div>
           <div
             class="joy-thumb"
             style="transform: translate(calc(-50% + {joystickLDx}px), calc(-50% + {joystickLDy}px))"
@@ -392,6 +449,7 @@
     >
       <div class="joy-inner">
         <div class="joy-ring">
+          <div class="deadzone-indicator" style="--dz-pct:{LOOK_DEADZONE * 100}%"></div>
           <div
             class="joy-thumb"
             style="transform: translate(calc(-50% + {joystickRDx}px), calc(-50% + {joystickRDy}px))"
@@ -627,6 +685,21 @@
     top: 50%;
     left: 0;
     transform: translateY(-50%);
+  }
+
+  /* ── deadzone ring ─────────────────────── */
+  .deadzone-indicator {
+    position: absolute;
+    width: calc(var(--dz-pct, 30%) * 2);
+    aspect-ratio: 1;
+    border-radius: 50%;
+    border: 1.5px dashed rgba(0, 0, 0, 0.18);
+    background: rgba(0, 0, 0, 0.04);
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    z-index: 1;
   }
 
   .joy-thumb {
