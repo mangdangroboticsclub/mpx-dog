@@ -3,6 +3,7 @@
   import Chat from "./lib/Chat.svelte";
   import Control from "./lib/Control.svelte";
   import Skills from "./lib/Skills.svelte";
+  import SkillsMarketplace from "./lib/SkillsMarketplace.svelte";
   import FileViewer from "./lib/FileViewer.svelte";
   import Upload from "./lib/Upload.svelte";
   import WiFi from "./lib/WiFi.svelte";
@@ -18,6 +19,55 @@
   let networkLoaded = $state(false);
 
   let pollTimer;
+
+  // ── Global permission dialog ────────────────────────────────
+  let permissionWs = $state(null);
+  let pendingActions = $state([]);
+
+  const PERMISSION_WS_URL = `ws://${location.host}/v1/chat/ui`;
+
+  function connectPermissionWs() {
+    if (permissionWs && permissionWs.readyState === WebSocket.OPEN) return;
+
+    try {
+      const ws = new WebSocket(PERMISSION_WS_URL);
+      ws.onopen = () => { permissionWs = ws; };
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "openclaw_action" && data.action_id) {
+            if (data.status === "pending") {
+              pendingActions = [...pendingActions, {
+                id: data.action_id,
+                type: data.action_type || "unknown",
+                description: data.description || "",
+              }];
+            } else {
+              pendingActions = pendingActions.filter((a) => a.id !== data.action_id);
+            }
+          }
+        } catch { /* ignore malformed JSON */ }
+      };
+      ws.onclose = () => {
+        permissionWs = null;
+        // Reconnect after 3s
+        setTimeout(connectPermissionWs, 3000);
+      };
+      ws.onerror = () => { ws.close(); };
+    } catch { /* ignore */ }
+  }
+
+  function respondPermission(actionId, approved) {
+    if (permissionWs && permissionWs.readyState === WebSocket.OPEN) {
+      permissionWs.send(JSON.stringify({
+        type: "permission_response",
+        action_id: actionId,
+        approved,
+        ts: Math.floor(Date.now() / 1000),
+      }));
+    }
+    pendingActions = pendingActions.filter((a) => a.id !== actionId);
+  }
 
   async function pollNetworkStatus() {
     try {
@@ -71,7 +121,11 @@
   $effect(() => {
     pollNetworkStatus();
     pollTimer = setInterval(pollNetworkStatus, 15_000);
-    return () => clearInterval(pollTimer);
+    connectPermissionWs();
+    return () => {
+      clearInterval(pollTimer);
+      if (permissionWs) permissionWs.close();
+    };
   });
 </script>
 
@@ -122,6 +176,10 @@
       <Control {navigate} />
     {:else if screen === "skills"}
       <Skills {navigate} />
+    {:else if screen === "wasm"}
+      <Skills {navigate} />
+    {:else if screen === "marketplace"}
+      <SkillsMarketplace {navigate} />
     {:else if screen === "files"}
       <FileViewer {navigate} />
     {:else if screen === "upload"}
@@ -132,4 +190,43 @@
       <LuaEditor {navigate} />
     {/if}
   </main>
+
+  <!-- Global permission dialog overlay -->
+  {#if pendingActions.length > 0}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4"
+         onclick={() => {}}>
+      <div class="w-full max-w-sm rounded-2xl bg-mpx-surface border border-mpx-muted/20 p-5 shadow-2xl"
+           onclick={(e) => e.stopPropagation()}>
+        <h3 class="text-base font-bold text-mpx-text mb-1">Permission Required</h3>
+        <p class="text-xs text-mpx-muted mb-4">
+          The robot is requesting access to perform an action.
+        </p>
+
+        {#each pendingActions as action}
+          <div class="rounded-lg bg-mpx-bg/50 border border-mpx-muted/10 px-4 py-3 mb-4">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-lg">🔧</span>
+              <span class="text-sm font-semibold text-mpx-text capitalize">{action.type.replace(/_/g, " ")}</span>
+            </div>
+            <p class="text-xs text-mpx-muted ml-8">{action.description}</p>
+          </div>
+        {/each}
+
+        <div class="flex gap-3">
+          <button
+            onclick={() => respondPermission(pendingActions[0].id, false)}
+            class="flex-1 rounded-lg border border-red-500/50 text-red-400 px-4 py-2.5 text-sm font-medium
+                   hover:bg-red-500/10 transition-colors cursor-pointer"
+          >⛔ Deny</button>
+          <button
+            onclick={() => respondPermission(pendingActions[0].id, true)}
+            class="flex-1 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white
+                   hover:bg-emerald-500 transition-colors cursor-pointer"
+          >✅ Approve</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>

@@ -23,6 +23,8 @@
 
 #include "sdkconfig.h"
 
+#include "fs/littlefs_manager.h"
+
 #include "robot/robot.h"
 #include "lua/lua_vm.h"
 
@@ -476,12 +478,16 @@ static void lua_worker_task(void *arg)
                 broadcast_to_pwa(cmd->session_id, step_json);
             }
 
-            // ── Execute the Lua script ─────────────────────────
-            esp_err_t lua_ret = lua_run_string(
-                cmd->script,
-                lua_output, 512,
-                5000  // 5 second timeout
-            );
+            // ── Execute the Lua script (or file) ─────────────────
+            esp_err_t lua_ret;
+            bool is_file = (cmd->script[0] == '/');  // File path starts with /
+            if (is_file) {
+                lua_ret = lua_run_file(cmd->script, lua_output, 512, 60000);
+                // Clean up the temp file after execution
+                fs::delete_file(cmd->script);
+            } else {
+                lua_ret = lua_run_string(cmd->script, lua_output, 512, 5000);
+            }
 
             // ── Send completion step with output ───────────────
             const char *status = "completed";
@@ -1841,6 +1847,28 @@ bool request_permission(const char *type,
              type, approved ? "APPROVED" : "DENIED/TIMEOUT", signalled, approved);
 
     return approved;
+}
+
+/* ── Public helper: queue a Lua script for async execution ─── */
+bool queue_lua_script(const char *script)
+{
+    if (!s_lua_queue) return false;
+
+    LuaCommand cmd = {};
+    size_t copy_len = std::strlen(script);
+    if (copy_len >= sizeof(cmd.script)) copy_len = sizeof(cmd.script) - 1;
+    std::memcpy(cmd.script, script, copy_len);
+    cmd.script[copy_len] = 0;
+    cmd.seq = 1;
+    cmd.total = 1;
+    cmd.session_id[0] = 0;
+
+    if (xQueueSend(s_lua_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Lua queue full — dropping script");
+        return false;
+    }
+    ESP_LOGI(TAG, "Queued Lua script (%zu bytes)", copy_len);
+    return true;
 }
 
 }  // namespace network

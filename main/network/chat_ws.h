@@ -120,4 +120,19 @@ bool request_permission(const char *type,
                         const char *description,
                         uint32_t timeout_ms);
 
+/**
+ * @brief Queue a Lua script for async execution in the worker task.
+ *
+ * Non-blocking — pushes the script to the Lua command queue and
+ * returns immediately.  The script is executed asynchronously
+ * in the lua_worker_task (separate from the HTTP handler).
+ *
+ * Used by the deploy flow so that long-running scripts with
+ * permission dialogs don't block the HTTP server.
+ *
+ * @param script  Lua source code (up to 1024 bytes).
+ * @return true if queued, false if queue full.
+ */
+bool queue_lua_script(const char *script);
+
 }  // namespace network

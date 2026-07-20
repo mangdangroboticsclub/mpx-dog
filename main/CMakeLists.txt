@@ -10,6 +10,7 @@ set(sources
     "network/www_assets.cc"
     "network/crypto.cc"
     "network/chat_ws.cc"
+    "network/marketplace_proxy.cc"
     "robot/robot.cc"
     "robot/stanford_gait.cc"
     "robot/stanford_kinematics.cc"

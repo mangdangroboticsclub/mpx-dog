@@ -48,6 +48,8 @@ extern "C" {
  *   robot.ik_fr(x, th0, z)     — Front-right leg IK (no flush)
  *   robot.ik_fl(x, th0, z)     — Front-left  leg IK
  *   robot.ik_rr(x, th0, z)     — Rear-right  leg IK
+ *
+ *   crypto.base64_decode(str)  → Decode base64 string to raw bytes
  *   robot.ik_rl(x, th0, z)     — Rear-left   leg IK
  *
  *   robot.imu_read()           → {ax, ay, az, gx, gy, gz}
@@ -85,3 +87,4 @@ void lua_register_wasm_bindings(lua_State *L);
  * @param L  Lua state to register into
  */
 void lua_register_fs_bindings(lua_State *L);
+void lua_register_crypto_bindings(lua_State *L);

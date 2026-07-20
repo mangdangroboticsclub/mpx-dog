@@ -184,6 +184,9 @@ esp_err_t lua_init(void)
     /* Register wasm bindings (.wasm skill execution) */
     lua_register_wasm_bindings(g_L);
 
+    /* Register crypto bindings (base64_decode for WASM deploy) */
+    lua_register_crypto_bindings(g_L);
+
     /* Register fs bindings (file I/O with user permission) */
     lua_register_fs_bindings(g_L);
 

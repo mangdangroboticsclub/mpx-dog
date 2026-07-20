@@ -1,5 +1,6 @@
 #include "network/http_server.h"
 #include "network/chat_ws.h"
+#include "network/marketplace_proxy.h"
 #include "network/wifi_ap.h"
 #include "network/wifi_sta.h"
 
@@ -1191,6 +1192,50 @@ static char *read_body(httpd_req_t *req)
 
 /* ── Lua API endpoints ─────────────────────────────────────── */
 
+/* POST /v1/lua/enqueue — enqueue a Lua script for async execution.
+ * Saves the script to a temp file and queues the path to the worker.
+ * Non-blocking — returns immediately.  Script runs in lua_worker_task. */
+static esp_err_t api_lua_enqueue(httpd_req_t *req)
+{
+    char *buf = read_body(req);
+    if (!buf) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+
+    std::string script = json_get_str(buf, "script");
+    free(buf);
+
+    if (script.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "need 'script' field", -1);
+        return ESP_OK;
+    }
+
+    // Write script to temp file on LittleFS
+    static int enqueue_seq = 0;
+    char path[64];
+    std::snprintf(path, sizeof(path), "/lua/_deploy_%d.lua", enqueue_seq++);
+    if (!fs::write_file(path, script.data(), script.size())) {
+        httpd_resp_set_status(req, "500 Server Error");
+        httpd_resp_send(req, R"({"ok":false,"error":"Failed to save script"})", -1);
+        return ESP_OK;
+    }
+
+    // Enqueue the file path — worker reads and executes via lua_run_file
+    if (!network::queue_lua_script(path)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, R"({"ok":false,"error":"Lua queue full"})", -1);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
 /* POST /v1/lua/run — run a Lua script
  *   Body: {"script":"..."}  or  {"path":"/lua/foo.lua"}
  *   Response: {"ok":true,"output":"..."}  or  {"ok":false,"error":"..."}
@@ -1376,6 +1421,115 @@ static void register_api(httpd_handle_t server, const char *method_str,
     ESP_LOGI(TAG, "  API: %s %s", method_str, uri);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ *  Marketplace Gateway Proxy API
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* GET /v1/gateway/config — return gateway connection info */
+static esp_err_t api_gateway_config(httpd_req_t *req)
+{
+    std::string host = CONFIG_APP_CHAT_SERVER_IP;
+    int port = CONFIG_APP_CHAT_SERVER_PORT;
+    std::string uuid = CONFIG_APP_ROBOT_UUID;
+
+    char resp[512];
+    int n = std::snprintf(resp, sizeof(resp),
+        R"({"host":"%s","port":%d,"robot_uuid":"%s"})",
+        host.c_str(), port, uuid.c_str());
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, n);
+    return ESP_OK;
+}
+
+/**
+ * @brief Generic proxy handler for all /v1/marketplace/ endpoints.
+ *
+ * Translates the local URI into the corresponding Gateway path and
+ * forwards the request via gateway_request().
+ *
+ * URI translation rules:
+ *   /v1/marketplace/skills[/...]        -> /v1/skills[/...]
+ *   /v1/marketplace/robot/skills[/...]  -> /v1/robots/{uuid}/skills[/...]
+ */
+static esp_err_t api_marketplace_proxy(httpd_req_t *req)
+{
+    // ── Determine the target Gateway path ─────────────────────
+    const char *uri = req->uri;
+    std::string target_path;
+
+    const char *prefix_skills = "/v1/marketplace/skills";
+    const char *prefix_robot  = "/v1/marketplace/robot/";
+
+    if (std::strncmp(uri, prefix_robot, std::strlen(prefix_robot)) == 0) {
+        // /v1/marketplace/robot/{action}[/...] → /v1/robots/{uuid}/{action}[/...]
+        // e.g.  /v1/marketplace/robot/skills      → /v1/robots/{uuid}/skills
+        //       /v1/marketplace/robot/skills/{id}  → /v1/robots/{uuid}/skills/{id}
+        //       /v1/marketplace/robot/deploy       → /v1/robots/{uuid}/deploy
+        std::string suffix = uri + std::strlen(prefix_robot);
+        target_path = "/v1/robots/" + std::string(CONFIG_APP_ROBOT_UUID) + "/" + suffix;
+    } else if (std::strncmp(uri, prefix_skills, std::strlen(prefix_skills)) == 0) {
+        // /v1/marketplace/skills[/...] → /v1/skills[/...]
+        // Strip "/v1/marketplace/" (16 chars), prepend "/v1/"
+        target_path = std::string("/v1/") + (uri + 16);
+    } else {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_send(req, "unknown marketplace path", -1);
+        return ESP_OK;
+    }
+
+    // ── Read request body if present ──────────────────────────
+    std::string body;
+    if (req->content_len > 0 && req->content_len < 4096) {
+        char *buf = static_cast<char *>(std::malloc(req->content_len + 1));
+        if (buf) {
+            int total = 0;
+            while (total < req->content_len) {
+                int r = httpd_req_recv(req, buf + total, req->content_len - total);
+                if (r <= 0) break;
+                total += r;
+            }
+            buf[total] = 0;
+            body.assign(buf, total);
+            std::free(buf);
+        }
+    }
+
+    // ── Map HTTP method ───────────────────────────────────────
+    const char *method_str = "GET";
+    if (req->method == HTTP_POST)   method_str = "POST";
+    else if (req->method == HTTP_PATCH)  method_str = "PATCH";
+    else if (req->method == HTTP_DELETE) method_str = "DELETE";
+
+    // ── Forward to Gateway ────────────────────────────────────
+    bool ok = false;
+    std::string resp_body = gateway_request(method_str, target_path.c_str(), body, ok);
+
+    ESP_LOGI(TAG, "Marketplace proxy: %s %s → %s (ok=%d, body=%zu bytes)",
+             method_str, uri, target_path.c_str(), ok, resp_body.size());
+
+    if (!ok) {
+        // Gateway returned an error or is unreachable
+        if (resp_body.empty()) {
+            ESP_LOGW(TAG, "Gateway unreachable for %s", target_path.c_str());
+            httpd_resp_set_status(req, "502 Bad Gateway");
+            httpd_resp_send(req, "gateway unreachable", -1);
+        } else {
+            ESP_LOGW(TAG, "Gateway error response: %.*s",
+                     (int)std::min(resp_body.size(), size_t(256)),
+                     resp_body.c_str());
+            httpd_resp_set_status(req, "502 Bad Gateway");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, resp_body.c_str(), resp_body.size());
+        }
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp_body.c_str(), resp_body.size());
+    return ESP_OK;
+}
+
 /* ── Public API ─────────────────────────────────────────────── */
 
 bool start_http_server()
@@ -1386,12 +1540,13 @@ bool start_http_server()
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 40;
+    config.max_uri_handlers = 48;
     config.max_open_sockets = 12;   // Must leave room for 3 internal HTTPD sockets
     config.stack_size = 8192;
     config.task_priority = 6;            // Priority 6 (per REQ-ROB-02)
     config.core_id = 0;                  // Pin to Core 0 (PRO_CPU)
     config.server_port = 80;
+    config.uri_match_fn = httpd_uri_match_wildcard;  // Enable wildcard (*) URIs
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 60;       // Allow idle WS up to 60 s between frames
     config.send_wait_timeout = 30;       // Allow slow sends (e.g. large replies)
@@ -1483,6 +1638,9 @@ bool start_http_server()
     register_api(s_server, "POST", "/v1/wifi/forget",          HTTP_POST, api_wifi_forget);
     register_api(s_server, "POST", "/v1/wifi/ap-config",       HTTP_POST, api_wifi_ap_config);
 
+    // ── Register Lua async enqueue endpoint (non-blocking) ──
+    register_api(s_server, "POST", "/v1/lua/enqueue",          HTTP_POST, api_lua_enqueue);
+
     // ── Register Lua API endpoints ──
     register_api(s_server, "POST", "/v1/lua/run",              HTTP_POST, api_lua_run);
     register_api(s_server, "GET",  "/v1/lua/list",             HTTP_GET,  api_lua_list);
@@ -1492,6 +1650,30 @@ bool start_http_server()
 
     // ── Register Chat REST endpoint ──
     register_api(s_server, "POST", "/v1/chat/send",            HTTP_POST, chat_send_handler);
+
+    // ── Register Marketplace Gateway endpoints ──
+    register_api(s_server, "GET",  "/v1/gateway/config",             HTTP_GET,   api_gateway_config);
+
+    // Wildcard: catch all /v1/marketplace/* paths
+    {
+        httpd_uri_t h = {
+            .uri       = "/v1/marketplace/*",
+            .method    = HTTP_GET,
+            .handler   = api_marketplace_proxy,
+            .user_ctx  = nullptr,
+            .is_websocket = false,
+            .handle_ws_control_frames = false,
+            .supported_subprotocol = nullptr,
+        };
+        httpd_register_uri_handler(s_server, &h);
+        h.method = HTTP_POST;
+        httpd_register_uri_handler(s_server, &h);
+        h.method = HTTP_PATCH;
+        httpd_register_uri_handler(s_server, &h);
+        h.method = HTTP_DELETE;
+        httpd_register_uri_handler(s_server, &h);
+        ESP_LOGI(TAG, "  API: GET|POST|PATCH|DELETE /v1/marketplace/* (proxied to gateway)");
+    }
 
     ESP_LOGI(TAG, "HTTP server running on port 80 (Core 0, Priority 6)");
     ESP_LOGI(TAG, "  → PWA:  http://%s/", AP_IP_ADDR);

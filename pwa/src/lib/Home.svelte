@@ -6,8 +6,9 @@
     { id: "lua",     icon: "🌙", label: "Lua Editor",   desc: "Write & run Lua scripts" },
     { id: "chat",    icon: "💬", label: "Chat",         desc: "Conversation interface" },
     { id: "wifi",    icon: "📶", label: "WiFi",         desc: "Connect robot to LAN" },
-    { id: "skills",  icon: "⚡", label: "Skills",       desc: "Run .wasm skill files" },
-    { id: "files",   icon: "📁", label: "File Viewer",  desc: "Browse LittleFS storage" },
+    { id: "marketplace", icon: "🛒", label: "Marketplace",   desc: "Browse & manage skills" },
+    { id: "wasm",       icon: "⚡", label: "WASM-Runner",   desc: "Run .wasm skill files" },
+    { id: "files",      icon: "📁", label: "File Viewer",   desc: "Browse LittleFS storage" },
     { id: "upload",  icon: "📤", label: "Upload Skill", desc: "Upload .wasm to robot" },
   ];
 
