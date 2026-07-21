@@ -20,7 +20,7 @@
     return () => mq.removeEventListener("change", handler);
   });
 
-  function isWasm(n) { return n.endsWith(".wasm"); }
+  function isWasm(n) { return n.endsWith(".wasm") || n.endsWith(".mpxe"); }
   function isLua(n)  { return n.endsWith(".lua"); }
   function isAllowed(n) { return isWasm(n) || isLua(n); }
 

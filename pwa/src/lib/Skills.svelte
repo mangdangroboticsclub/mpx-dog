@@ -64,7 +64,7 @@
         No skill files found on the robot.
       </p>
       <p class="text-center text-xs text-mpx-muted mt-2">
-        Upload a .wasm file from the Upload page.
+        Upload a .wasm or .mpxe file from the Upload page.
       </p>
     {:else}
       <div class="space-y-2">

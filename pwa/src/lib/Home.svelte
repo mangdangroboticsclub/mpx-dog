@@ -7,9 +7,9 @@
     { id: "chat",    icon: "💬", label: "Chat",         desc: "Conversation interface" },
     { id: "wifi",    icon: "📶", label: "WiFi",         desc: "Connect robot to LAN" },
     { id: "marketplace", icon: "🛒", label: "Marketplace",   desc: "Browse & manage skills" },
-    { id: "wasm",       icon: "⚡", label: "WASM-Runner",   desc: "Run .wasm skill files" },
+    { id: "wasm",       icon: "⚡", label: "WASM-Runner",   desc: "Run .wasm / .mpxe skills" },
     { id: "files",      icon: "📁", label: "File Viewer",   desc: "Browse LittleFS storage" },
-    { id: "upload",  icon: "📤", label: "Upload Skill", desc: "Upload .wasm to robot" },
+    { id: "upload",  icon: "📤", label: "Upload Skill", desc: "Upload .wasm / .mpxe to robot" },
   ];
 
   // ── Viewport / magnification / pagination state ─────────────

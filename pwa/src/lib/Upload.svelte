@@ -87,7 +87,7 @@
     >
       <input
         type="file"
-        accept=".wasm"
+        accept=".wasm,.mpxe"
         onchange={onFileSelect}
         class="hidden"
       />
@@ -98,7 +98,7 @@
       {:else}
         <span class="text-4xl">📤</span>
         <p class="mt-2 text-sm text-mpx-text">
-          {dragging ? "Drop it here!" : "Drag & drop a .wasm file, or tap to browse"}
+          {dragging ? "Drop it here!" : "Drag & drop a .wasm or .mpxe file, or tap to browse"}
         </p>
         <p class="text-xs text-mpx-muted mt-1">Max file size: 128 KB</p>
       {/if}
