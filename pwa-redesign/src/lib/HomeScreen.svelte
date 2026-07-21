@@ -13,6 +13,8 @@
   import ActionAssignment from "./ActionAssignment.svelte";
   import AddActionView from "./AddActionView.svelte";
   import ChatView from "./chat/ChatView.svelte";
+  import SkillsMarketplace from "./SkillsMarketplace.svelte";
+  import SkillsManagement from "./SkillsManagement.svelte";
 
   const YELLOW = colors.mpx.primary;
 
@@ -88,6 +90,8 @@
   let showCalibration = $state(false);
   let showWiFi = $state(false);
   let showAPConfig = $state(false);
+  let showMarketplace = $state(false);
+  let showSkillManagement = $state(false);
   let adjustDraggingId = $state(null);
   let adjustDragBarEl = $state(null);
 
@@ -841,6 +845,10 @@
         <APModeConfig onNavigate={() => showAPConfig = false} {network} />
       {:else if showCalibration}
         <Calibration onBack={() => showCalibration = false} />
+      {:else if showMarketplace}
+        <SkillsMarketplace onNavigate={() => showMarketplace = false} />
+      {:else if showSkillManagement}
+        <SkillsManagement onNavigate={() => showSkillManagement = false} />
       {:else}
         <div class="settings-page" style="--yellow: {YELLOW}">
           <header class="settings-header" style="background: {YELLOW}">
@@ -891,6 +899,40 @@
               <div class="settings-item-content">
                 <span class="settings-item-label">Calibration</span>
                 <span class="settings-item-desc">Adjust leg positions and offsets</span>
+              </div>
+              <svg class="settings-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="9 18 15 12 9 6"/>
+              </svg>
+            </button>
+            <button class="settings-item" onclick={() => showMarketplace = true}>
+              <div class="settings-item-icon">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/>
+                  <line x1="3" y1="6" x2="21" y2="6"/>
+                  <path d="M16 10a4 4 0 0 1-8 0"/>
+                </svg>
+              </div>
+              <div class="settings-item-content">
+                <span class="settings-item-label">Marketplace</span>
+                <span class="settings-item-desc">Browse and subscribe to skills</span>
+              </div>
+              <svg class="settings-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="9 18 15 12 9 6"/>
+              </svg>
+            </button>
+            <button class="settings-item" onclick={() => showSkillManagement = true}>
+              <div class="settings-item-icon">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                  <line x1="3" y1="9" x2="21" y2="9"/>
+                  <line x1="9" y1="21" x2="9" y2="9"/>
+                  <path d="M14 15l3 3"/>
+                  <path d="M14 18l3-3"/>
+                </svg>
+              </div>
+              <div class="settings-item-content">
+                <span class="settings-item-label">Skill Management</span>
+                <span class="settings-item-desc">Manage installed skills on MPX</span>
               </div>
               <svg class="settings-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="9 18 15 12 9 6"/>
