@@ -49,7 +49,8 @@ extern "C" {
  *   robot.ik_fl(x, th0, z)     — Front-left  leg IK
  *   robot.ik_rr(x, th0, z)     — Rear-right  leg IK
  *
- *   crypto.base64_decode(str)  → Decode base64 string to raw bytes
+ *   crypto.base64_decode(str)  → Decode standard base64 to raw bytes
+ *   crypto.base64_encode(str)  → Encode raw bytes as base64 string
  *   robot.ik_rl(x, th0, z)     — Rear-left   leg IK
  *
  *   robot.imu_read()           → {ax, ay, az, gx, gy, gz}

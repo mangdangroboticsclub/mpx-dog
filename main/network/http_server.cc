@@ -46,6 +46,7 @@ const char *get_mime_type(const char *path)
     if (std::strcmp(ext, ".png")  == 0) return "image/png";
     if (std::strcmp(ext, ".ico")  == 0) return "image/x-icon";
     if (std::strcmp(ext, ".wasm") == 0) return "application/wasm";
+    if (std::strcmp(ext, ".mpxe") == 0) return "application/wasm";
     return "application/octet-stream";
 }
 
@@ -275,7 +276,10 @@ static esp_err_t api_skills_list(httpd_req_t *req)
 
     bool first = true;
     for (const auto &f : files) {
-        if (f.size() < 6 || f.substr(f.size() - 5) != ".wasm") continue;
+        // Accept .wasm and .mpxe skill files
+        bool is_skill = (f.size() >= 6 && f.substr(f.size() - 5) == ".wasm")
+                     || (f.size() >= 6 && f.substr(f.size() - 5) == ".mpxe");
+        if (!is_skill) continue;
         if (is_www_path(f)) continue;
 
         if (!first) json += ",\n";
@@ -522,6 +526,7 @@ static esp_err_t api_fs_delete(httpd_req_t *req)
         std::string lower = file_path;
         for (auto &c : lower) c = std::tolower(c);
         bool allowed = (lower.size() >= 5 && lower.substr(lower.size() - 5) == ".wasm")
+                    || (lower.size() >= 5 && lower.substr(lower.size() - 5) == ".mpxe")
                     || (lower.size() >= 4 && lower.substr(lower.size() - 4) == ".lua");
         if (!allowed) {
             httpd_resp_set_status(req, "403 Forbidden");

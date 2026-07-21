@@ -32,6 +32,7 @@ extern "C" {
 #include "fs/littlefs_manager.h"
 #include "robot/robot.h"
 #include "wasm/wasm_sandbox.h"
+#include "wasm/wasm_decrypt.h"
 #include "network/chat_ws.h"
 
 static const char *TAG = "lua_bind";
@@ -614,8 +615,9 @@ static int l_wasm_run(lua_State *L)
 /**
  * wasm.run_bytes(data, func_name?) → bool
  *
- * Loads a .wasm module from a Lua string, instantiates it, and
- * calls the exported function.  func_name defaults to "on_start".
+ * Loads a .wasm module (plain or MPXE-encrypted) from a Lua string,
+ * instantiates it, and calls the exported function.
+ * func_name defaults to "on_start".
  *
  * Example:
  *   local data = fs.read("/walk.wasm")
@@ -635,9 +637,34 @@ static int l_wasm_run_bytes(lua_State *L)
     ESP_LOGI(TAG, "wasm.run_bytes: %zu bytes func='%s'",
              data_len, func_name ? func_name : "on_start");
 
+    // ── MPXE auto-detection (for raw bytes, no extension) ────
+    const uint8_t *effective_bytes = reinterpret_cast<const uint8_t *>(data);
+    size_t effective_size = data_len;
+    uint8_t *decrypted_buf = nullptr;
+
+    wasm::DecryptResult dr = wasm::decrypt_mpxe_autodetect(
+        effective_bytes, effective_size, &decrypted_buf, &effective_size);
+
+    if (dr == wasm::DecryptResult::Success) {
+        ESP_LOGI(TAG, "wasm.run_bytes: decrypted MPXE → %zu bytes", effective_size);
+        effective_bytes = decrypted_buf;
+    } else if (dr != wasm::DecryptResult::NotEncrypted) {
+        ESP_LOGE(TAG, "wasm.run_bytes: MPXE decrypt failed (result=%d)",
+                 static_cast<int>(dr));
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
     wasm::SandboxResult result = wasm::load_and_run_bytes(
-        reinterpret_cast<const uint8_t *>(data), data_len,
+        effective_bytes, effective_size,
         func_name ? func_name : "on_start", 30000);
+
+    // Zero and free decrypted buffer
+    if (decrypted_buf) {
+        volatile uint8_t *p = decrypted_buf;
+        for (size_t i = 0; i < effective_size; i++) p[i] = 0;
+        std::free(decrypted_buf);
+    }
 
     bool ok = (result == wasm::SandboxResult::Success);
     lua_pushboolean(L, ok ? 1 : 0);
@@ -852,8 +879,12 @@ static int l_fs_info(lua_State *L)
 /**
  * crypto.base64_decode(str) → string (raw bytes)
  *
- * Decodes a base64-encoded string into raw bytes.
- * Supports standard base64 with '+' and '/', and optional '=' padding.
+ * Decodes a standard base64-encoded string into raw bytes.
+ * Supports both RFC 4648 base64 ('+', '/') with optional '=' padding
+ * and unpadded base64 (no '=' chars).
+ *
+ * This handles '=' padding correctly, so callers can use standard
+ * base64 encoding without needing null-byte padding tricks.
  */
 static int l_crypto_base64_decode(lua_State *L)
 {
@@ -886,17 +917,15 @@ static int l_crypto_base64_decode(lua_State *L)
         0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
     };
 
-    // Count valid characters and padding
+    // Count valid base64 characters (a-z, A-Z, 0-9, +, /)
+    // '=' is padding — excluded from valid count
     size_t valid = 0;
-    size_t pad = 0;
     for (size_t i = 0; i < in_len; i++) {
         unsigned char c = static_cast<unsigned char>(in[i]);
         if (DEC[c] != 0xFF) {
             valid++;
-        } else if (c == '=') {
-            pad++;
         }
-        // Skip whitespace and other invalid chars silently
+        // '=' and other chars (whitespace, newlines) are silently skipped
     }
 
     if (valid == 0) {
@@ -904,13 +933,16 @@ static int l_crypto_base64_decode(lua_State *L)
         return 1;
     }
 
-    // Output size: 3 bytes per 4 input chars, minus padding
+    // Output size calculation:
+    //   Each complete group of 4 valid chars → 3 bytes.
+    //   Trailing partial group: 2 valid → 1 byte, 3 valid → 2 bytes.
+    //   '=' padding is already excluded from valid, so no extra
+    //   subtraction is needed — the partial-group logic handles it.
     size_t out_len = (valid / 4) * 3;
-    if (pad > 0) out_len -= pad;
-    // Handle trailing partial group (3 valid chars → 2 bytes, 2 valid → 1 byte)
     size_t rem = valid % 4;
     if (rem == 2) out_len += 1;
     else if (rem == 3) out_len += 2;
+    // rem == 0 or 1: no partial output (1 valid char is invalid base64)
 
     // Allocate output buffer on heap (WASM files can be large)
     auto *out = static_cast<char *>(std::malloc(out_len + 1));
@@ -928,7 +960,7 @@ static int l_crypto_base64_decode(lua_State *L)
         unsigned char c = static_cast<unsigned char>(in[i]);
         unsigned char val = DEC[c];
 
-        if (val == 0xFF) continue;  // skip whitespace / invalid
+        if (val == 0xFF) continue;  // skip whitespace, '=', and other non-base64 chars
 
         buf[buf_pos++] = val;
 
@@ -940,14 +972,65 @@ static int l_crypto_base64_decode(lua_State *L)
         }
     }
 
-    // Handle remaining bytes
+    // Handle trailing partial group
     if (buf_pos >= 2) {
         out[out_pos++] = (buf[0] << 2) | (buf[1] >> 4);
     }
     if (buf_pos >= 3) {
         out[out_pos++] = (buf[1] << 4) | (buf[2] >> 2);
     }
-    // buf_pos == 4 is handled in the loop above
+
+    // Sanity check: decoded bytes should match our size prediction
+    if (out_pos != out_len) {
+        ESP_LOGW(TAG, "base64_decode: size mismatch (expected=%zu, actual=%zu) — "
+                 "input may be malformed", out_len, out_pos);
+    }
+
+    out[out_pos] = 0;
+    lua_pushlstring(L, out, out_pos);  // use actual decoded size, not prediction
+    std::free(out);
+    return 1;
+}
+
+/**
+ * crypto.base64_encode(str) → string (base64)
+ *
+ * Encodes raw bytes as standard RFC 4648 base64 with '=' padding.
+ * Useful for debugging and for generating deploy-compatible data.
+ */
+static int l_crypto_base64_encode(lua_State *L)
+{
+    size_t data_len = 0;
+    const char *data = luaL_checklstring(L, 1, &data_len);
+
+    if (!data || data_len == 0) {
+        lua_pushliteral(L, "");
+        return 1;
+    }
+
+    static const char ENC[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    size_t out_len = ((data_len + 2) / 3) * 4;  // +2 for ceiling division
+    auto *out = static_cast<char *>(std::malloc(out_len + 1));
+    if (!out) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    size_t out_pos = 0;
+    for (size_t i = 0; i < data_len; i += 3) {
+        uint32_t triple = static_cast<unsigned char>(data[i]) << 16;
+        if (i + 1 < data_len)
+            triple |= static_cast<unsigned char>(data[i + 1]) << 8;
+        if (i + 2 < data_len)
+            triple |= static_cast<unsigned char>(data[i + 2]);
+
+        out[out_pos++] = ENC[(triple >> 18) & 0x3F];
+        out[out_pos++] = ENC[(triple >> 12) & 0x3F];
+        out[out_pos++] = (i + 1 < data_len) ? ENC[(triple >> 6) & 0x3F] : '=';
+        out[out_pos++] = (i + 2 < data_len) ? ENC[triple & 0x3F] : '=';
+    }
 
     out[out_pos] = 0;
     lua_pushlstring(L, out, out_len);
@@ -957,12 +1040,13 @@ static int l_crypto_base64_decode(lua_State *L)
 
 static const struct luaL_Reg CRYPTO_LIB[] = {
     { "base64_decode", l_crypto_base64_decode },
+    { "base64_encode", l_crypto_base64_encode },
     { NULL, NULL }
 };
 
 void lua_register_crypto_bindings(lua_State *L)
 {
-    lua_createtable(L, 0, 1);
+    lua_createtable(L, 0, 2);
 
     for (const struct luaL_Reg *lib = CRYPTO_LIB; lib->func != NULL; lib++) {
         lua_pushcfunction(L, lib->func);
@@ -970,7 +1054,7 @@ void lua_register_crypto_bindings(lua_State *L)
     }
 
     lua_setglobal(L, "crypto");
-    ESP_LOGI(TAG, "Registered crypto module (base64_decode)");
+    ESP_LOGI(TAG, "Registered crypto module (base64_decode, base64_encode)");
 }
 
 /* ═══════════════════════════════════════════════════════════════

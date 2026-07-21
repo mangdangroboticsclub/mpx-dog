@@ -1,9 +1,11 @@
 #include "wasm/wasm_sandbox.h"
+#include "wasm/wasm_decrypt.h"
 
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <pthread.h>
 
 #include "esp_heap_caps.h"
@@ -273,17 +275,77 @@ SandboxResult load_and_run(const char *path,
 		return SandboxResult::NotInitialized;
 	}
 
-	// Read .wasm from LittleFS
-	auto wasm_bytes = fs::read_file(path);
-	if (wasm_bytes.empty()) {
+	// ── Extension whitelist & routing ──────────────────────────
+	// .wasm → plain WASM, pass directly to WAMR.
+	// .mpxe → MPXE encrypted blob, decrypt before loading.
+	// Anything else is rejected before any file I/O.
+	const char *ext = std::strrchr(path, '.');
+	if (!ext || (std::strcmp(ext, ".wasm") != 0 &&
+				 std::strcmp(ext, ".mpxe") != 0)) {
+		ESP_LOGE(TAG, "Rejected '%s': unsupported extension '%s' "
+				 "(only .wasm and .mpxe are allowed)", path,
+				 ext ? ext : "(none)");
+		return SandboxResult::LoadFailed;
+	}
+
+	bool is_mpxe = (std::strcmp(ext, ".mpxe") == 0);
+
+	// Read file from LittleFS
+	auto raw_bytes = fs::read_file(path);
+	if (raw_bytes.empty()) {
 		ESP_LOGE(TAG, "Failed to read '%s' from LittleFS", path);
 		return SandboxResult::LoadFailed;
 	}
 
-	ESP_LOGI(TAG, "Read %zu bytes from '%s'", wasm_bytes.size(), path);
+	ESP_LOGI(TAG, "Read %zu bytes from '%s'", raw_bytes.size(), path);
 
-	return load_and_run_bytes(wasm_bytes.data(), wasm_bytes.size(),
-							  func_name, timeout_ms);
+	// ── Route by extension ─────────────────────────────────────
+	uint8_t *wasm_data = nullptr;
+	size_t wasm_size = 0;
+	bool needs_free = false;
+	SandboxResult result;
+
+	if (is_mpxe) {
+		// .mpxe → decrypt the encrypted blob
+		DecryptResult dr = decrypt_mpxe(raw_bytes.data(), raw_bytes.size(),
+										&wasm_data, &wasm_size);
+		if (dr != DecryptResult::Success) {
+			ESP_LOGE(TAG, "MPXE decryption failed (result=%d), rejecting skill",
+					 static_cast<int>(dr));
+			return SandboxResult::LoadFailed;
+		}
+
+		ESP_LOGI(TAG, "Decrypted MPXE blob → %zu bytes plain WASM", wasm_size);
+		needs_free = true;
+
+		// Diagnostic: print WASM magic + version
+		if (wasm_size >= 8) {
+			ESP_LOGI(TAG, "WASM header: %02x %02x %02x %02x %02x %02x %02x %02x",
+					 wasm_data[0], wasm_data[1], wasm_data[2], wasm_data[3],
+					 wasm_data[4], wasm_data[5], wasm_data[6], wasm_data[7]);
+		} else {
+			ESP_LOGW(TAG, "Decrypted WASM too small: %zu bytes (min 8)", wasm_size);
+		}
+	} else {
+		// .wasm → plain, pass through unchanged (developer mode)
+		wasm_data = const_cast<uint8_t *>(raw_bytes.data());
+		wasm_size = raw_bytes.size();
+	}
+
+	result = load_and_run_bytes(wasm_data, wasm_size,
+								func_name, timeout_ms);
+
+	// Zero and free the decrypted buffer if we allocated one
+	if (needs_free && wasm_data) {
+		// Secure zero before free — see §6.3 Step 6 of WASM_ENCRYPTION.md
+		volatile uint8_t *p = wasm_data;
+		for (size_t i = 0; i < wasm_size; i++) {
+			p[i] = 0;
+		}
+		std::free(wasm_data);
+	}
+
+	return result;
 }
 
 SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
@@ -294,6 +356,13 @@ SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
 	if (!s_initialized) {
 		ESP_LOGE(TAG, "Sandbox not initialised");
 		return SandboxResult::NotInitialized;
+	}
+
+	// Diagnostic: log WASM header for troubleshooting
+	if (wasm_size >= 8) {
+		ESP_LOGI(TAG, "WASM header: %02x %02x %02x %02x %02x %02x %02x %02x",
+				 wasm_bytes[0], wasm_bytes[1], wasm_bytes[2], wasm_bytes[3],
+				 wasm_bytes[4], wasm_bytes[5], wasm_bytes[6], wasm_bytes[7]);
 	}
 
 	// Everything that touches WAMR (load, instantiate, lookup, execute)
@@ -329,19 +398,11 @@ SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
 
 			s_cancelled = true;
 
-			// Forcibly terminate the WASM instance so that
-			// wasm_runtime_call_wasm() returns, even if the
-			// WASM code is stuck in an infinite loop that
-			// never calls a host function.
 			if (args.module_inst != nullptr) {
 				ESP_LOGW(TAG, "Calling wasm_runtime_terminate()");
 				wasm_runtime_terminate(args.module_inst);
 			}
 
-			// Wait for the thread to finish — after terminate()
-			// the interpreter will raise a trap and
-			// wasm_runtime_call_wasm() returns (with false),
-			// so the pthread should exit promptly.
 			while (!args.completed) {
 				vTaskDelay(pdMS_TO_TICKS(poll_ms));
 			}
@@ -351,18 +412,13 @@ SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
 			return SandboxResult::Timeout;
 		}
 	} else {
-		// No timeout — just wait forever
 		while (!args.completed) {
 			vTaskDelay(pdMS_TO_TICKS(10));
 		}
 	}
 
-	// Thread has finished — ensure it's joined to reclaim resources
 	pthread_join(thread, nullptr);
-
-	// Reset cancellation flag for next invocation
 	s_cancelled = false;
-
 	return args.result;
 }
 

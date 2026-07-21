@@ -3,6 +3,7 @@ set(sources
     "main.cc"
     "fs/littlefs_manager.cc"
     "wasm/wasm_sandbox.cc"
+    "wasm/wasm_decrypt.cc"
     "sdk/wasm_host_functions.cc"
     "network/wifi_ap.cc"
     "network/wifi_sta.cc"

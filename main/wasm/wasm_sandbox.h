@@ -44,13 +44,21 @@ bool register_natives(const char *module_name,
 					  void *symbols, std::uint32_t count);
 
 /**
- * @brief Load a .wasm file from LittleFS, instantiate it, and call
- *        an exported function.
+ * @brief Load a .wasm or .mpxe file from LittleFS, instantiate it,
+ *        and call an exported function.
  *
- * If func_name is nullptr or empty, calls the default "_start" entry.
- * The instance is destroyed after the call returns.
+ * If the file starts with "MPXE" magic (encrypted skill), it is
+ * automatically decrypted using the robot's AES-256 root key before
+ * loading.  Plain .wasm files pass through unchanged.
  *
- * @param path       Path within LittleFS (e.g. "/skill.wasm").
+ * By convention, encrypted files should use the .mpxe extension and
+ * plain developer-mode files should use .wasm, but the loader
+ * detects the format by content (magic bytes), not by extension.
+ *
+ * If func_name is nullptr or empty, calls the default "on_start"
+ * entry.  The instance is destroyed after the call returns.
+ *
+ * @param path       Path within LittleFS (e.g. "/skill.wasm" or "/skill.mpxe").
  * @param func_name  Name of the exported function to call.
  * @param timeout_ms Maximum execution time in milliseconds (0 = no watchdog).
  * @return SandboxResult indicating the outcome.

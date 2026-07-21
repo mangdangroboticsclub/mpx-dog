@@ -180,6 +180,45 @@ config APP_CHAT_AES_KEY_HEX
         WARNING: The default key is INSECURE and for development only.
         In production, provision a unique key per device via NVS.
 
+# ── WASM skill encryption ─────────────────────────────────────────
+
+config APP_MPX_WASM_ENCRYPTION
+    bool "Enable MPXE WASM skill decryption"
+    default y
+    help
+        Enables the MPXE (MPX Encrypted) WASM blob decryption
+        pipeline in the firmware.  When enabled, wasm.run() will
+        detect "MPXE" magic bytes in WASM files and decrypt them
+        using the robot's AES-256 root key (APP_CHAT_AES_KEY_HEX).
+
+        Encrypted skills are hardware-bound: a skill encrypted
+        for one robot cannot be loaded on another.  Plain .wasm
+        files (developer mode) continue to load without encryption
+        regardless of this setting.
+
+        Disable this to save ~2 KB of flash if WASM encryption
+        is not needed.
+
+config APP_MPX_EFUSE_BLK
+    int "eFuse block for robot AES key (0 = use Kconfig)"
+    range 0 5
+    default 0
+    help
+        eFuse key block index where the robot's AES-256 root key
+        is stored.  Set to 0 (default) to read the key from the
+        APP_CHAT_AES_KEY_HEX Kconfig string.
+
+        In production, set this to 1-5 to read from a hardware
+        eFuse block that was provisioned at manufacturing time.
+        The key block must be configured as read-protected so it
+        cannot be read by application code via esp_efuse_read_*()
+        — mbedTLS will use it directly via the hardware crypto
+        engine's key register.
+
+        NOTE: eFuse key block support is not yet implemented.
+        Setting this to a non-zero value currently does nothing;
+        the key is always read from Kconfig.
+
 # ── Lua scripting ────────────────────────────────────────────────────
 
 config APP_LUA_ENABLE
