@@ -4,7 +4,6 @@
     listRobotSkills,
     toggleSkill,
     deploySkill,
-    removeSkill,
     enqueueLua,
   } from "./marketplaceApi.js";
 
@@ -17,6 +16,34 @@
   let loading = $state(true);
   let error = $state("");
   let actionInFlight = $state(null); // skill_id being acted on, or "deploy:ID" / "delete:ID"
+
+  // ── Deployed-skill tracking (persisted to localStorage) ─────
+  // The robot API doesn't return a `deployed` flag, so we track it
+  // client-side. Each entry stores the file paths written during deploy
+  // so we can delete them from LittleFS later.
+  // Shape: { [skillId]: string[] }  — skill_id → array of file paths
+  const DEPLOYED_STORAGE_KEY = "mpx_deployed_skills";
+
+  /** @type {Record<string, string[]>} */
+  let deployedSkills = $state({});
+
+  function loadDeployedState() {
+    try {
+      const raw = localStorage.getItem(DEPLOYED_STORAGE_KEY);
+      if (raw) {
+        deployedSkills = JSON.parse(raw);
+      }
+    } catch { /* ignore */ }
+  }
+
+  function saveDeployedState() {
+    try {
+      localStorage.setItem(DEPLOYED_STORAGE_KEY, JSON.stringify(deployedSkills));
+    } catch { /* ignore */ }
+  }
+
+  // Load persisted state on mount
+  $effect(() => { loadDeployedState(); });
 
   // ── Fetch ────────────────────────────────────────────────────
   async function fetchSkills() {
@@ -38,6 +65,22 @@
     return (skill.skill_type || "").toLowerCase() === "wasm";
   }
 
+  /**
+   * Extract file paths from Lua deploy scripts.
+   * Looks for file_write("/path", ...) calls in the script text.
+   */
+  function extractFilePaths(scripts) {
+    const paths = [];
+    for (const script of scripts) {
+      const re = /file_write\s*\(\s*["']([^"']+)["']/g;
+      let match;
+      while ((match = re.exec(script)) !== null) {
+        paths.push(match[1]);
+      }
+    }
+    return paths;
+  }
+
   // ── Toggle (non-WASM skills only) ────────────────────────────
   async function handleToggle(skillId, enabled) {
     actionInFlight = skillId;
@@ -56,13 +99,20 @@
     actionInFlight = key;
     try {
       const data = await deploySkill(skill.skill_id);
+      const allScripts = [];
       if (data.skills && data.skills.length > 0) {
         for (const s of data.skills) {
           for (const cmd of s.commands || []) {
+            allScripts.push(cmd.script);
             await enqueueLua(cmd.script);
           }
         }
       }
+      // Extract file paths written by the deploy scripts
+      const filePaths = extractFilePaths(allScripts);
+      // Mark as deployed with file paths for later deletion
+      deployedSkills = { ...deployedSkills, [skill.skill_id]: filePaths };
+      saveDeployedState();
       await fetchSkills();
     } catch (e) {
       console.error("Deploy failed:", e);
@@ -70,12 +120,26 @@
     actionInFlight = null;
   }
 
-  // ── Delete WASM skill from MPX ───────────────────────────────
+  // ── Delete deployed WASM files from LittleFS ─────────────────
+  // Does NOT unsubscribe/refund — only removes the files.
   async function handleDelete(skill) {
     const key = "delete:" + skill.skill_id;
     actionInFlight = key;
     try {
-      await removeSkill(skill.skill_id);
+      const filePaths = deployedSkills[skill.skill_id] || [];
+      // Delete each deployed file from LittleFS
+      for (const filePath of filePaths) {
+        await fetch("/v1/fs/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: filePath }),
+        });
+      }
+      // Remove from deployed tracking
+      const next = { ...deployedSkills };
+      delete next[skill.skill_id];
+      deployedSkills = next;
+      saveDeployedState();
       await fetchSkills();
     } catch (e) {
       console.error("Delete failed:", e);
@@ -84,11 +148,8 @@
   }
 
   // ── Determine button state for WASM skills ───────────────────
-  // If the skill has been deployed (has a local file or was recently deployed),
-  // show "Delete from MPX"; otherwise show "Download to MPX".
-  // We track deployed state via the skill's `deployed` flag from the API.
   function isDeployed(skill) {
-    return skill.deployed === true;
+    return skill.skill_id in deployedSkills;
   }
 </script>
 

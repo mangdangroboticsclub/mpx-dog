@@ -16,12 +16,12 @@
   let fileContent = $state(null);
   let searchQuery = $state("");
 
-  function isWasm(n) { return n.endsWith(".wasm"); }
+  function isWasm(n) { return n.endsWith(".wasm") || n.endsWith(".mpxe"); }
   function isLua(n)  { return n.endsWith(".lua"); }
   function isAllowed(n) { return isWasm(n) || isLua(n); }
 
   function icon(n) {
-    if (isWasm(n)) return "⚡";
+    if (isWasm(n)) return n.endsWith(".mpxe") ? "🧩" : "⚡";
     if (isLua(n))  return "🌙";
     if (n.endsWith(".gz")) return "📦";
     if (n.endsWith(".json")) return "📋";

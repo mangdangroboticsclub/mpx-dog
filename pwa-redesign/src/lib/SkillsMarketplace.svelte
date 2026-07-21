@@ -92,6 +92,32 @@
     return robotSkills.some(s => s.skill_id === skillId);
   }
 
+  /**
+   * Extract the author/developer name from available data.
+   *
+   * Priority:
+   *   1. `detailManifest.author` (if manifest was fetched and has it)
+   *   2. Parse from skill ID: everything before `~` (e.g. "haris_dev" from "haris_dev~amazon"),
+   *      with underscores replaced by spaces and title-cased.
+   *   3. Fall back to "Unknown".
+   */
+  function extractAuthor(skill) {
+    // 1. Try manifest
+    if (detailManifest?.author) return detailManifest.author;
+
+    // 2. Parse from skill ID (developer namespace before ~)
+    if (skill?.id) {
+      const parts = skill.id.split("~");
+      if (parts.length >= 2 && parts[0]) {
+        return parts[0]
+          .replace(/_/g, " ")
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+      }
+    }
+
+    return "Unknown";
+  }
+
   function toggleFilter(key) {
     if (activeFilters.includes(key)) {
       activeFilters = activeFilters.filter(f => f !== key);
@@ -220,7 +246,7 @@
           {/if}
           <div class="mp-detail-hero-info">
             <h3 class="mp-detail-name">{detailManifest.name || detailSkill.title}</h3>
-            <p class="mp-detail-author">by {detailManifest.author || "Unknown"} · v{detailManifest.version || detailSkill.current_version || "1.0"}</p>
+            <p class="mp-detail-author">by {extractAuthor(detailSkill)} · v{detailManifest.version || detailSkill.current_version || "1.0"}</p>
             <span
               class="mp-type-badge mp-type-badge-lg"
               style="--badge-color: {skillTypeColor(detailSkill.skill_type)}"
@@ -408,6 +434,7 @@
                 </div>
 
                 <h3 class="mp-card-title">{skill.title}</h3>
+                <p class="mp-card-author">{extractAuthor(skill)}</p>
                 {#if skill.description}
                   <p class="mp-card-desc">{skill.description}</p>
                 {/if}
@@ -746,6 +773,11 @@
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+
+  .mp-card-author {
+    font-size: 0.68rem;
+    color: #969494;
   }
 
   .mp-card-desc {

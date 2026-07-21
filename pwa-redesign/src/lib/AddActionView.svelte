@@ -14,12 +14,12 @@
   let showHidden = $state(false);
   let searchQuery = $state("");
 
-  function isWasm(n) { return n.endsWith(".wasm"); }
+  function isWasm(n) { return n.endsWith(".wasm") || n.endsWith(".mpxe"); }
   function isLua(n)  { return n.endsWith(".lua"); }
   function isAllowed(n) { return isWasm(n) || isLua(n); }
 
   function icon(n) {
-    if (isWasm(n)) return "⚡";
+    if (isWasm(n)) return n.endsWith(".mpxe") ? "🧩" : "⚡";
     if (isLua(n))  return "🌙";
     if (n.endsWith(".gz")) return "📦";
     if (n.endsWith(".json")) return "📋";
@@ -86,10 +86,12 @@
 
   function selectFile(f) {
     const dirPath = currentDir === "/" ? "" : currentDir;
+    let fileType = "lua";
+    if (isWasm(f.n)) fileType = f.n.endsWith(".mpxe") ? "mpxe" : "wasm";
     selectedFile = {
       path: dirPath + "/" + f.n,
       name: f.n,
-      type: isWasm(f.n) ? "wasm" : "lua",
+      type: fileType,
     };
     // Auto-suggest a name from the file name
     if (!actionName) {
@@ -137,7 +139,7 @@
     <!-- ═══ Step 1: Browse & pick a file ═══ -->
     <section class="form-section">
       <h2 class="section-title">1. Browse &amp; select a file</h2>
-      <p class="section-desc">Navigate to a .wasm or .lua file on the robot.</p>
+      <p class="section-desc">Navigate to a .wasm, .mpxe, or .lua file on the robot.</p>
 
       <!-- Search bar -->
       <div class="fv-search-wrap">

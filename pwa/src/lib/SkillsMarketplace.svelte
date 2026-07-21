@@ -154,6 +154,23 @@
     return robotSkills.some((s) => s.skill_id === skillId);
   }
 
+  /**
+   * Extract author from available data.
+   * Priority: manifest.author → parse from skill ID (before `~`) → "Unknown"
+   */
+  function extractAuthor(skill) {
+    if (detailManifest?.author) return detailManifest.author;
+    if (skill?.id) {
+      const parts = skill.id.split("~");
+      if (parts.length >= 2 && parts[0]) {
+        return parts[0]
+          .replace(/_/g, " ")
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+      }
+    }
+    return "Unknown";
+  }
+
   function getAssignedSkill(skillId) {
     return robotSkills.find((s) => s.skill_id === skillId);
   }
@@ -199,7 +216,7 @@
           {/if}
           <div>
             <h3 class="text-lg font-bold text-mpx-text">{detailManifest.name}</h3>
-            <p class="text-xs text-mpx-muted">by {detailManifest.author} · v{detailManifest.version}</p>
+            <p class="text-xs text-mpx-muted">by {extractAuthor(detailSkill)} · v{detailManifest.version}</p>
           </div>
         </div>
 
