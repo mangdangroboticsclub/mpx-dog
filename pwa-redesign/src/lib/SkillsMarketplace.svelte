@@ -16,8 +16,8 @@
   const SKILL_TYPES = [
     { key: "awa",  label: "AWA" },
     { key: "wasm", label: "WASM" },
-    { key: "type3", label: "Type 3" },
-    { key: "type4", label: "Type 4" },
+    // { key: "type3", label: "Type 3" },
+    // { key: "type4", label: "Type 4" },
   ];
 
   // ── State ────────────────────────────────────────────────────
@@ -131,7 +131,8 @@
     actionInFlight = skillId;
     try {
       await assignSkill(skillId);
-      await refreshAll();
+      // Only refresh robot skills — marketplace listing hasn't changed
+      await fetchRobotSkills();
     } catch (e) {
       console.error("Subscribe failed:", e);
     }
@@ -142,7 +143,8 @@
     actionInFlight = skillId;
     try {
       await removeSkill(skillId);
-      await refreshAll();
+      // Only refresh robot skills — marketplace listing hasn't changed
+      await fetchRobotSkills();
     } catch (e) {
       console.error("Refund failed:", e);
     }

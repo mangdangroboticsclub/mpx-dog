@@ -78,7 +78,8 @@
     actionInFlight = skillId;
     try {
       await assignSkill(skillId);
-      await refreshAll();
+      // Only refresh robot skills — marketplace listing hasn't changed
+      await fetchRobotSkills();
     } catch (e) {
       console.error("Subscribe failed:", e);
     }
@@ -90,7 +91,8 @@
     actionInFlight = skillId;
     try {
       await removeSkill(skillId);
-      await refreshAll();
+      // Only refresh robot skills — marketplace listing hasn't changed
+      await fetchRobotSkills();
     } catch (e) {
       console.error("Refund failed:", e);
     }
