@@ -185,7 +185,7 @@
         <div class="mgmt-empty-icon">📦</div>
         <p class="mgmt-empty-title">No Skills Yet</p>
         <p class="mgmt-empty-desc">
-          Browse the Marketplace to find and subscribe to skills for your MPX Dog.
+          Browse the Skill Store to find and subscribe to skills for your MPX Dog.
         </p>
       </div>
     {:else}

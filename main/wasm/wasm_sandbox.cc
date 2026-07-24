@@ -36,7 +36,11 @@ static std::atomic<bool> s_running{false};
 static constexpr std::size_t RUNTIME_HEAP_SIZE = 128 * 1024;
 
 // Linear memory limits per wasm instance (REQ-ROB-03: ≤128 KB).
-static constexpr std::size_t DEFAULT_STACK_SIZE = 8 * 1024;   // 8 KB wasm stack
+// NOTE: this is the WASM *operand stack* (interpreter value stack), NOT linear
+// memory.  8 KB was too small — richer skills (e.g. dance-uptown) overflowed it
+// with "wasm operand stack overflow".  WAMR allocates this from PSRAM, so 32 KB
+// is cheap and gives deep skills plenty of headroom.
+static constexpr std::size_t DEFAULT_STACK_SIZE = 32 * 1024;  // 32 KB wasm operand stack
 static constexpr std::size_t DEFAULT_HEAP_SIZE = 128 * 1024;  // 128 KB host-managed heap
 
 // --- Global state -----------------------------------------------------------
@@ -374,7 +378,10 @@ SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
 						 false, SandboxResult::NotInitialized, nullptr };
 
 	pthread_attr_init(&attr);
-	pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE + 4096);
+	// Native C thread stack (internal RAM) — separate from the WASM operand
+	// stack above.  16 KB is plenty for WAMR's interpreter recursion; keep it
+	// fixed so growing the WASM operand stack doesn't inflate internal-RAM use.
+	pthread_attr_setstacksize(&attr, 16 * 1024);
 
 	int ret = pthread_create(&thread, &attr, wasm_load_run_thread, &args);
 	pthread_attr_destroy(&attr);

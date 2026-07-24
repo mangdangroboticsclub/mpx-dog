@@ -913,7 +913,7 @@
                 </svg>
               </div>
               <div class="settings-item-content">
-                <span class="settings-item-label">Marketplace</span>
+                <span class="settings-item-label">Skill Store</span>
                 <span class="settings-item-desc">Browse and subscribe to skills</span>
               </div>
               <svg class="settings-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">

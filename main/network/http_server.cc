@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <cerrno>
 #include <sys/stat.h>
 #include <dirent.h>
 
@@ -17,12 +18,18 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "fs/littlefs_manager.h"
 #include "lua/lua_vm.h"
 #include "sdkconfig.h"
 #include "robot/robot.h"
 #include "wasm/wasm_sandbox.h"
+
+#include "lwip/sockets.h"
+#ifndef LWIP_SOCKET_OFFSET
+#define LWIP_SOCKET_OFFSET 0
+#endif
 
 static const char *TAG = "http_server";
 
@@ -298,7 +305,30 @@ static esp_err_t api_skills_list(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /v1/skills/run — execute a .wasm skill via WAMR */
+/* ── Async skill execution ───────────────────────────────────────
+ * WASM skills can run for up to 60 s.  Running them inline in the HTTP
+ * handler blocked the whole web server for that entire time — connections
+ * piled up and the socket pool was exhausted ("accept (23)", stuck after a
+ * dance).  Instead we launch the skill on its own FreeRTOS task and return
+ * immediately, so httpd stays responsive while the skill runs.
+ */
+static volatile bool s_skill_running = false;
+
+struct SkillRunArgs { std::string path; std::string name; };
+
+static void skill_run_task(void *arg)
+{
+    SkillRunArgs *a = static_cast<SkillRunArgs *>(arg);
+    ESP_LOGI(TAG, "Running skill (async): %s", a->path.c_str());
+    auto result = wasm::load_and_run(a->path.c_str(), "on_start", 60000);
+    ESP_LOGI(TAG, "Skill '%s' completed with result=%d",
+             a->name.c_str(), static_cast<int>(result));
+    delete a;
+    s_skill_running = false;
+    vTaskDelete(nullptr);
+}
+
+/* POST /v1/skills/run — execute a .wasm skill via WAMR (async) */
 static esp_err_t api_skills_run(httpd_req_t *req)
 {
     char buf[256] = {};
@@ -322,39 +352,35 @@ static esp_err_t api_skills_run(httpd_req_t *req)
     while (*val && *val != '"') skill_name += *val++;
 
     std::string path = "/" + skill_name;
-    ESP_LOGI(TAG, "Running skill: %s", path.c_str());
 
-    std::string output;
-    auto result = wasm::load_and_run(path.c_str(), "on_start", 60000);
-    ESP_LOGI(TAG, "Skill '%s' completed with result=%d", skill_name.c_str(),
-             static_cast<int>(result));
-
-    switch (result) {
-        case wasm::SandboxResult::Success:
-            output = "{\"output\":\"Skill '" + skill_name + "' executed successfully\"}";
-            break;
-        case wasm::SandboxResult::LoadFailed:
-            output = "{\"output\":\"Failed to load " + skill_name + "\"}";
-            break;
-        case wasm::SandboxResult::InstantiateFailed:
-            output = "{\"output\":\"Failed to instantiate " + skill_name + "\"}";
-            break;
-        case wasm::SandboxResult::FunctionNotFound:
-            output = "{\"output\":\"Entry point 'on_start' not found in " + skill_name + "\"}";
-            break;
-        case wasm::SandboxResult::ExecutionFailed:
-            output = "{\"output\":\"Execution failed for " + skill_name + "\"}";
-            break;
-        case wasm::SandboxResult::Timeout:
-            output = "{\"output\":\"Skill '" + skill_name + "' timed out\"}";
-            break;
-        default:
-            output = "{\"output\":\"Unknown error running " + skill_name + "\"}";
-            break;
+    // ── Reject if a skill is already running (single WASM instance) ──
+    if (s_skill_running) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"output\":\"a skill is already running\"}", -1);
+        return ESP_OK;
     }
 
+    // ── Launch the skill on its own task and return immediately ──
+    s_skill_running = true;
+    auto *args = new SkillRunArgs{ path, skill_name };
+    // No core affinity: the scheduler keeps httpd (core 0) responsive while the
+    // skill yields during its robot_delay_ms calls.  8 KB task stack is enough;
+    // the WASM operand stack is allocated separately inside load_and_run.
+    BaseType_t created = xTaskCreate(skill_run_task, "skill_run", 8192,
+                                     args, 4, nullptr);
+    if (created != pdPASS) {
+        s_skill_running = false;
+        delete args;
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"output\":\"failed to start skill task\"}", -1);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Skill '%s' started (async)", skill_name.c_str());
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, output.c_str(), output.size());
+    httpd_resp_send(req, "{\"output\":\"started\"}", -1);
     return ESP_OK;
 }
 
@@ -1457,6 +1483,76 @@ static esp_err_t api_gateway_config(httpd_req_t *req)
  *   /v1/marketplace/skills[/...]        -> /v1/skills[/...]
  *   /v1/marketplace/robot/skills[/...]  -> /v1/robots/{uuid}/skills[/...]
  */
+/* ── Marketplace GET response cache ──────────────────────────────
+ * Serving repeated marketplace polls from a short-lived cache avoids one
+ * outbound proxy socket PER request.  Under a stress test the browser hammers
+ * these read-only endpoints, and each proxied request cost an inbound + an
+ * outbound socket — doubling demand until the LWIP pool ran dry.  Caching GETs
+ * for a few seconds collapses that back to (at most) one proxy call per TTL.
+ */
+struct MpxCacheEntry {
+    std::string  path;
+    std::string  body;
+    TickType_t   expires = 0;
+    bool         valid = false;
+};
+static MpxCacheEntry     s_mpx_cache[4];
+static SemaphoreHandle_t s_mpx_cache_mutex = nullptr;
+static constexpr uint32_t MPX_CACHE_TTL_MS = 15000;   // 15 s
+
+static SemaphoreHandle_t mpx_cache_mutex()
+{
+    if (!s_mpx_cache_mutex) s_mpx_cache_mutex = xSemaphoreCreateMutex();
+    return s_mpx_cache_mutex;
+}
+
+// Return cached body for `path` if present and unexpired, else empty string.
+static std::string mpx_cache_get(const std::string &path)
+{
+    SemaphoreHandle_t m = mpx_cache_mutex();
+    if (!m) return {};
+    std::string out;
+    xSemaphoreTake(m, portMAX_DELAY);
+    TickType_t now = xTaskGetTickCount();
+    for (auto &e : s_mpx_cache) {
+        if (e.valid && e.path == path && (int32_t)(e.expires - now) > 0) {
+            out = e.body;
+            break;
+        }
+    }
+    xSemaphoreGive(m);
+    return out;
+}
+
+static void mpx_cache_put(const std::string &path, const std::string &body)
+{
+    SemaphoreHandle_t m = mpx_cache_mutex();
+    if (!m) return;
+    xSemaphoreTake(m, portMAX_DELAY);
+    TickType_t now = xTaskGetTickCount();
+    // Reuse a matching/empty/expired slot, else the oldest.
+    MpxCacheEntry *slot = nullptr;
+    for (auto &e : s_mpx_cache) {
+        if (!e.valid || e.path == path || (int32_t)(e.expires - now) <= 0) { slot = &e; break; }
+    }
+    if (!slot) slot = &s_mpx_cache[0];
+    slot->path    = path;
+    slot->body    = body;
+    slot->expires = now + pdMS_TO_TICKS(MPX_CACHE_TTL_MS);
+    slot->valid   = true;
+    xSemaphoreGive(m);
+}
+
+// Drop all cached entries (called after any write — deploy/remove/etc.).
+static void mpx_cache_invalidate_all()
+{
+    SemaphoreHandle_t m = mpx_cache_mutex();
+    if (!m) return;
+    xSemaphoreTake(m, portMAX_DELAY);
+    for (auto &e : s_mpx_cache) e.valid = false;
+    xSemaphoreGive(m);
+}
+
 static esp_err_t api_marketplace_proxy(httpd_req_t *req)
 {
     // ── Determine the target Gateway path ─────────────────────
@@ -1506,12 +1602,32 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
     else if (req->method == HTTP_PATCH)  method_str = "PATCH";
     else if (req->method == HTTP_DELETE) method_str = "DELETE";
 
+    const bool is_get = (req->method == HTTP_GET);
+
+    // ── Serve GETs from the short-lived cache (no proxy socket) ──
+    if (is_get) {
+        std::string cached = mpx_cache_get(target_path);
+        if (!cached.empty()) {
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, cached.c_str(), cached.size());
+            return ESP_OK;
+        }
+    } else {
+        // Any write changes the catalog — drop cached reads.
+        mpx_cache_invalidate_all();
+    }
+
     // ── Forward to Gateway ────────────────────────────────────
     bool ok = false;
     std::string resp_body = gateway_request(method_str, target_path.c_str(), body, ok);
 
-    ESP_LOGI(TAG, "Marketplace proxy: %s %s → %s (ok=%d, body=%zu bytes)",
+    ESP_LOGI(TAG, "Marketplace proxy [socketfix-v14]: %s %s → %s (ok=%d, body=%zu bytes)",
              method_str, uri, target_path.c_str(), ok, resp_body.size());
+
+    // Cache successful GET responses so repeated polls don't re-proxy.
+    if (is_get && ok && !resp_body.empty()) {
+        mpx_cache_put(target_path, resp_body);
+    }
 
     if (!ok) {
         // Gateway returned an error or is unreachable
@@ -1535,6 +1651,64 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ── Dead-connection reaper ──────────────────────────────────────
+ * The socket census proved the pool was exhausted by DEAD browser
+ * connections on port 80 (peer=0.0.0.0) that httpd never freed.  This task
+ * periodically peeks every port-80 socket; if the peer has closed (recv
+ * returns 0 / the socket is no longer connected), it asks httpd to close that
+ * session.  Using httpd_sess_trigger_close (not a raw close) keeps it safe —
+ * httpd owns the actual close and ignores fds that aren't its sessions.
+ */
+static void socket_reaper_task(void *)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(4000));
+        if (!s_server) continue;
+
+        int reaped = 0, zombies = 0;
+        for (int fd = LWIP_SOCKET_OFFSET;
+             fd < LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS; ++fd) {
+            int type = 0; socklen_t tl = sizeof(type);
+            if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0) continue;
+
+            struct sockaddr_in local {}; socklen_t ll = sizeof(local);
+            bool has_local = (getsockname(fd, (struct sockaddr *)&local, &ll) == 0);
+
+            // ── Zombie: an open socket whose TCP PCB is gone (getsockname
+            // fails → no address).  These are aborted/RST connections that
+            // leaked.  A freshly created-but-unconnected socket still reports
+            // 0.0.0.0:0 (success), so it is NOT mistaken for a zombie.
+            if (!has_local) {
+                close(fd);            // single close — reclaim the fd
+                zombies++;
+                continue;
+            }
+
+            if (ntohs(local.sin_port) != 80) continue;   // only the web server
+
+            // Listener has no connected peer — never reap it.
+            struct sockaddr_in peer {}; socklen_t pl = sizeof(peer);
+            if (getpeername(fd, (struct sockaddr *)&peer, &pl) != 0) continue;
+
+            // Peek one byte, non-blocking.  0 = peer closed (EOF); a hard
+            // error other than "would block" also means the link is dead.
+            // A live/idle WS client returns EWOULDBLOCK and is left alone.
+            char probe;
+            int r = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            bool dead = (r == 0) ||
+                        (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN);
+            if (dead) {
+                close(fd);            // single close — peer already gone
+                reaped++;
+            }
+        }
+        if (reaped || zombies) {
+            ESP_LOGW(TAG, "socket_reaper: reclaimed %d dead + %d zombie socket(s)",
+                     reaped, zombies);
+        }
+    }
+}
+
 /* ── Public API ─────────────────────────────────────────────── */
 
 bool start_http_server()
@@ -1546,7 +1720,15 @@ bool start_http_server()
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 48;
-    config.max_open_sockets = 12;   // Must leave room for 3 internal HTTPD sockets
+    // LWIP has CONFIG_LWIP_MAX_SOCKETS (16) total.  HTTPD also reserves 3
+    // internal sockets on top of max_open_sockets.  At 5, HTTPD uses at most
+    // 5+3=8, GUARANTEEING ~8 sockets stay free for OUTBOUND use (upstream cloud
+    // WebSocket, marketplace proxy, DNS) plus the PWA WS clients.  A browser
+    // opens up to ~6 persistent connections per tab, so a lower cap here forces
+    // it to reuse/cycle connections instead of pinning the whole pool.  With
+    // lru_purge_enable the oldest idle connection is dropped when the cap is hit
+    // rather than starving everything else.
+    config.max_open_sockets = 5;
     config.stack_size = 8192;
     config.task_priority = 6;            // Priority 6 (per REQ-ROB-02)
     config.core_id = 0;                  // Pin to Core 0 (PRO_CPU)
@@ -1561,6 +1743,14 @@ bool start_http_server()
         ESP_LOGE(TAG, "Failed to start HTTP server");
         return false;
     }
+
+    // ── BUILD MARKER — confirms which firmware is actually running ──
+    ESP_LOGW(TAG, "==== MPX BUILD socketfix-v14 : max_open_sockets=%d ====",
+             config.max_open_sockets);
+
+    // Start the dead-connection reaper so leaked port-80 sockets can't
+    // accumulate and exhaust the pool.
+    xTaskCreate(socket_reaper_task, "sock_reaper", 3072, nullptr, 3, nullptr);
 
     // ── Helper to register a static file handler ──
     auto register_static = [&](const char *uri) {

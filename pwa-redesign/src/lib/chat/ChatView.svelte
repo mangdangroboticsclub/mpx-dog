@@ -35,6 +35,7 @@
 
   // ── State ──────────────────────────────────
   let ws = null;
+  let reconnectTimer = null;   // single-flight reconnect guard (prevents socket storms)
   let connected = $state(false);
   let sending = $state(false);
   let sessionId = $state(restoreSessionId());
@@ -221,44 +222,66 @@
   // ═══════════════════════════════════════════
   const WS_URL = `ws://${location.host}/v1/chat/ui`;
 
+  function scheduleReconnect() {
+    // Single-flight: never stack more than one pending reconnect.
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (document.visibilityState !== "hidden") connect();
+    }, 3000);
+  }
+
   function connect() {
+    // Don't open a second socket if one is already open OR still connecting.
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
+    // Make sure any previous socket is fully torn down before opening a new one.
+    if (ws) {
+      ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+      try { ws.close(); } catch {}
+      ws = null;
+    }
+
     const socket = new WebSocket(WS_URL);
+    ws = socket;   // claim the slot immediately so re-entrant calls are guarded
 
     socket.onopen = () => {
+      if (socket !== ws) return;        // stale socket — ignore
       connected = true;
       socket.send(JSON.stringify({
         type: "session_reset",
         session_id: sessionId,
         ts: Math.floor(Date.now() / 1000),
+        pwa_build: "stormfix-v14",
       }));
     };
 
     socket.onclose = () => {
+      if (socket !== ws) return;        // a stale/replaced socket closing — do NOT reconnect
       connected = false;
       ws = null;
-      setTimeout(() => {
-        if (document.visibilityState !== "hidden") connect();
-      }, 3000);
+      scheduleReconnect();
     };
 
-    socket.onerror = () => { connected = false; };
+    socket.onerror = () => {
+      if (socket === ws) connected = false;
+    };
 
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         handleMessage(data);
-      } catch {}
+      } catch (e) {
+        console.warn("chat WS: unparseable frame dropped", e, event.data);
+      }
     };
-
-    ws = socket;
   }
 
   function disconnect() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) {
-      ws.onclose = null;
-      ws.close();
+      ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+      try { ws.close(); } catch {}
       ws = null;
     }
     connected = false;

@@ -49,8 +49,8 @@ export function skillTypeColor(skillType) {
 export function skillTypeLabel(skillType) {
   const key = (skillType || "").toLowerCase();
   const labels = {
-    awa: "AWA",
-    wasm: "WASM",
+    awa: "AISkill",
+    wasm: "MoveSkill",
     type3: "TYPE3",
     type4: "TYPE4",
   };

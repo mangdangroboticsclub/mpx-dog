@@ -7,6 +7,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <string>
+#include <cerrno>
+#include <fcntl.h>
 
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -82,7 +84,11 @@ struct PwaWsClient {
     char frag_buf[4096] = {};
     size_t frag_len = 0;
     bool fragmenting = false;
+    uint32_t reg_seq = 0;       // registration order — used to evict the oldest
 };
+
+// Monotonic counter so we can identify the oldest registered client.
+static uint32_t s_pwa_reg_counter = 0;
 
 static constexpr size_t MAX_PWA_WS_CLIENTS = 4;
 
@@ -109,7 +115,6 @@ static constexpr size_t REPLY_TEXT_MAX = 2048;
 /* ── Forward declarations for PWA client helpers ──────────── */
 static PwaWsClient *get_pwa_client(httpd_req_t *req);
 static void release_pwa_client(httpd_req_t *req);
-static bool send_to_pwa_client(PwaWsClient *client, const char *json_text);
 static void broadcast_to_pwa(const char *session_id, const char *json_text);
 
 /* ── WebSocket protocol helpers ───────────────────────────────
@@ -878,21 +883,52 @@ PwaWsClient *get_pwa_client(httpd_req_t *req)
 {
     if (!s_pwa_mutex) return nullptr;
     xSemaphoreTake(s_pwa_mutex, portMAX_DELAY);
+
+    int slot = -1;
     for (size_t i = 0; i < MAX_PWA_WS_CLIENTS; ++i) {
-        if (s_pwa_clients[i].req == nullptr) {
-            s_pwa_clients[i].req = req;
-            s_pwa_clients[i].fd = httpd_req_to_sockfd(req);
-            s_pwa_clients[i].reply_ready = false;
-            s_pwa_clients[i].session_id[0] = 0;
-            s_pwa_clients[i].pending_reply[0] = 0;
-            s_httpd_handle = req->handle;
-            xSemaphoreGive(s_pwa_mutex);
-            return &s_pwa_clients[i];
+        if (s_pwa_clients[i].req == nullptr) { slot = (int)i; break; }
+    }
+
+    // ── No free slot: evict a DEAD client only ───────────────────
+    // Under a reconnect storm the slots fill with fresh sockets.  Evicting a
+    // *live* client here (the old behaviour) would kill a good connection and
+    // make it reconnect too — amplifying the storm.  Instead, only reclaim a
+    // slot whose peer has already closed; if every client is alive, reject the
+    // newcomer (return nullptr) and let the reaper free slots as they die.
+    if (slot < 0) {
+        for (size_t i = 0; i < MAX_PWA_WS_CLIENTS; ++i) {
+            char probe;
+            int r = recv(s_pwa_clients[i].fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            bool dead = (r == 0) ||
+                        (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN);
+            if (dead) {
+                ESP_LOGW(TAG, "PWA slots full — reclaiming dead slot %zu (fd=%d)",
+                         i, s_pwa_clients[i].fd);
+                if (s_httpd_handle) {
+                    httpd_sess_trigger_close(s_httpd_handle, s_pwa_clients[i].fd);
+                }
+                s_pwa_clients[i] = PwaWsClient{};
+                slot = (int)i;
+                break;
+            }
         }
     }
+    if (slot < 0) {
+        // All clients alive — refuse the new (storm) connection.
+        xSemaphoreGive(s_pwa_mutex);
+        ESP_LOGW(TAG, "PWA slots full and all alive — rejecting new WS");
+        return nullptr;
+    }
+
+    s_pwa_clients[slot].req = req;
+    s_pwa_clients[slot].fd = httpd_req_to_sockfd(req);
+    s_pwa_clients[slot].reply_ready = false;
+    s_pwa_clients[slot].session_id[0] = 0;
+    s_pwa_clients[slot].pending_reply[0] = 0;
+    s_pwa_clients[slot].reg_seq = ++s_pwa_reg_counter;
+    s_httpd_handle = req->handle;
     xSemaphoreGive(s_pwa_mutex);
-    ESP_LOGW(TAG, "All PWA WS client slots full");
-    return nullptr;
+    return &s_pwa_clients[slot];
 }
 
 void release_pwa_client(httpd_req_t *req)
@@ -914,51 +950,72 @@ void release_pwa_client(httpd_req_t *req)
     xSemaphoreGive(s_pwa_mutex);
 }
 
-bool send_to_pwa_client(PwaWsClient *client, const char *json_text)
-{
-    if (!client || client->fd < 0 || !json_text || !s_httpd_handle) return false;
-
-    httpd_ws_frame_t resp_pkt{};
-    resp_pkt.payload = const_cast<uint8_t *>(
-        reinterpret_cast<const uint8_t *>(json_text));
-    resp_pkt.len = std::strlen(json_text);
-    resp_pkt.type = HTTPD_WS_TYPE_TEXT;
-
-    // Use httpd_ws_send_data which queues the work to the HTTP server task
-    // via httpd_queue_work internally, making it safe to call from any task.
-    // The calling task blocks until the send completes, so the stack-allocated
-    // json_text payload remains valid.
-    esp_err_t ret = httpd_ws_send_data(s_httpd_handle, client->fd, &resp_pkt);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to send to PWA WS: %s", esp_err_to_name(ret));
-        return false;
-    }
-    return true;
-}
 
 void broadcast_to_pwa(const char *session_id, const char *json_text)
 {
     if (!s_pwa_mutex) return;
+
+    // ── Phase 1: snapshot the target fds UNDER the mutex ──────────
+    // We must NOT hold s_pwa_mutex during the actual send: httpd_ws_send_data
+    // blocks until the send completes, and a half-dead ("zombie") client whose
+    // TCP send buffer is full can block for seconds.  Holding the mutex during
+    // that block froze the entire chat path — new connections, evictions and
+    // other broadcasts all wait on the same mutex.  So we copy the target fds
+    // out, release the mutex, then send lock-free.
+    struct Target { int fd; size_t slot; };
+    Target targets[MAX_PWA_WS_CLIENTS];
+    int n_targets = 0;
+    int connected = 0;
+
     xSemaphoreTake(s_pwa_mutex, portMAX_DELAY);
     for (size_t i = 0; i < MAX_PWA_WS_CLIENTS; ++i) {
         if (s_pwa_clients[i].fd < 0) continue;
-        // If session_id specified, only send to matching clients
+        connected++;
+        // Skip only clients already bound to a DIFFERENT non-empty session.
         if (session_id && session_id[0] != 0 &&
+            s_pwa_clients[i].session_id[0] != 0 &&
             std::strcmp(s_pwa_clients[i].session_id, session_id) != 0) {
             continue;
         }
-        if (!send_to_pwa_client(&s_pwa_clients[i], json_text)) {
-            // Send failed — client is gone.  Release the slot so we
-            // don't keep trying to push messages to a dead connection.
-            ESP_LOGI(TAG, "Removing stale PWA client slot %zu", i);
-            s_pwa_clients[i].req = nullptr;
-            s_pwa_clients[i].fd = -1;
-            s_pwa_clients[i].reply_ready = false;
-            s_pwa_clients[i].session_id[0] = 0;
-            s_pwa_clients[i].pending_reply[0] = 0;
-        }
+        targets[n_targets].fd   = s_pwa_clients[i].fd;
+        targets[n_targets].slot = i;
+        n_targets++;
     }
     xSemaphoreGive(s_pwa_mutex);
+
+    ESP_LOGI(TAG, "broadcast_to_pwa: target_session='%s' connected=%d matched=%d",
+             session_id ? session_id : "(null)", connected, n_targets);
+
+    // ── Phase 2: send WITHOUT holding the mutex ───────────────────
+    for (int t = 0; t < n_targets; ++t) {
+        httpd_ws_frame_t pkt{};
+        pkt.payload = const_cast<uint8_t *>(
+            reinterpret_cast<const uint8_t *>(json_text));
+        pkt.len  = std::strlen(json_text);
+        pkt.type = HTTPD_WS_TYPE_TEXT;
+
+        esp_err_t ret = s_httpd_handle
+            ? httpd_ws_send_data(s_httpd_handle, targets[t].fd, &pkt)
+            : ESP_FAIL;
+
+        if (ret != ESP_OK) {
+            // Send failed → the client is dead.  Close its socket and free the
+            // slot (only if it still holds the same fd — it may have been
+            // reused while we were unlocked).
+            ESP_LOGW(TAG, "  slot %zu send failed (fd=%d: %s) — reaping",
+                     targets[t].slot, targets[t].fd, esp_err_to_name(ret));
+            xSemaphoreTake(s_pwa_mutex, portMAX_DELAY);
+            if (s_pwa_clients[targets[t].slot].fd == targets[t].fd) {
+                if (s_httpd_handle) {
+                    httpd_sess_trigger_close(s_httpd_handle, targets[t].fd);
+                }
+                s_pwa_clients[targets[t].slot] = PwaWsClient{};
+            }
+            xSemaphoreGive(s_pwa_mutex);
+        } else {
+            ESP_LOGI(TAG, "  slot %zu DELIVERED (fd=%d)", targets[t].slot, targets[t].fd);
+        }
+    }
 }
 
 /* ── Upstream connection management task ─────────────────────
@@ -1042,9 +1099,30 @@ static void upstream_task(void *arg)
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
 
-        // ── Connect ────────────────────────────────────────────
+        // ── Connect (bounded, non-blocking) ────────────────────
+        // The gateway may be firewalled/unreachable; a blocking connect
+        // would pin this socket for the full TCP timeout (tens of seconds).
+        // Use non-blocking connect with a 5 s select() cap so the socket is
+        // freed quickly and the retry loop stays responsive.
         ESP_LOGI(TAG, "Connecting to %s:%d ...", SERVER_IP, SERVER_PORT);
-        if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+        int up_fl = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, up_fl | O_NONBLOCK);
+        int up_cres = connect(sock, res->ai_addr, res->ai_addrlen);
+        bool up_ok = (up_cres == 0);
+        if (up_cres != 0 && errno == EINPROGRESS) {
+            fd_set wset;
+            FD_ZERO(&wset);
+            FD_SET(sock, &wset);
+            struct timeval up_ctv = {.tv_sec = 5, .tv_usec = 0};
+            if (select(sock + 1, nullptr, &wset, nullptr, &up_ctv) > 0) {
+                int soerr = 0;
+                socklen_t slen = sizeof(soerr);
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                up_ok = (soerr == 0);
+            }
+        }
+        fcntl(sock, F_SETFL, up_fl);   // restore blocking for recv/send
+        if (!up_ok) {
             ESP_LOGW(TAG, "TCP connect failed");
             close(sock);
             freeaddrinfo(res);
@@ -1474,6 +1552,12 @@ esp_err_t chat_ws_handler(httpd_req_t *req)
             setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &keep_idle,  sizeof(keep_idle));
             setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
             setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &keep_cnt,   sizeof(keep_cnt));
+            // Bound outbound sends: if a zombie client stops reading, its TCP
+            // send buffer fills and send() would block indefinitely, stalling
+            // the broadcast task.  A 5 s send timeout makes the send fail fast
+            // so we reap the dead client instead of hanging.
+            struct timeval snd_to = { .tv_sec = 5, .tv_usec = 0 };
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
         }
 
         // Register the PWA client for streaming push

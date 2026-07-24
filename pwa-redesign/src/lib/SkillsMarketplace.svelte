@@ -14,8 +14,8 @@
 
   // ── Known skill types for filter chips ────────────────────────
   const SKILL_TYPES = [
-    { key: "awa",  label: "AWA" },
-    { key: "wasm", label: "WASM" },
+    { key: "awa",  label: "AISkill" },
+    { key: "wasm", label: "MoveSkill" },
     // { key: "type3", label: "Type 3" },
     // { key: "type4", label: "Type 4" },
   ];
@@ -207,6 +207,51 @@
     const symbol = price.currency === "USD" ? "$" : price.currency;
     return `${symbol}${price.amount.toFixed(2)}`;
   }
+
+  // ── Demo pricing + fake checkout ─────────────────────────────
+  // NOTE: cosmetic only. The API has no price yet, so prices are derived
+  // deterministically from the skill id. Replace skillPrice() and confirmPay()
+  // with the real pricing + payment integration when ready.
+  const DEMO_PRICES = [0.99, 1.99, 9.99];
+  function skillPrice(skill) {
+    const id = skill?.id || skill?.title || "";
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    return DEMO_PRICES[h % DEMO_PRICES.length];
+  }
+  function priceLabel(skill) { return `$${skillPrice(skill).toFixed(2)}`; }
+
+  // Payment sheet state
+  let payingSkill = $state(null);  // skill being "purchased"
+  let payStage = $state("form");   // "form" | "processing" | "success"
+  let payOrderId = $state("");
+  let payMethod = $state("card");
+
+  function openPay(skill) {
+    payingSkill = skill;
+    payStage = "form";
+    payMethod = "card";
+  }
+  function closePay() {
+    payingSkill = null;
+    payStage = "form";
+  }
+  function confirmPay() {
+    if (payStage === "processing") return;
+    payStage = "processing";
+    const skill = payingSkill;
+    // Simulate payment processing, then actually subscribe so the robot demo works.
+    setTimeout(async () => {
+      try {
+        await assignSkill(skill.id);
+        await fetchRobotSkills();
+      } catch (e) {
+        console.error("Subscribe failed:", e);
+      }
+      payOrderId = "#MD-" + Math.floor(100000 + Math.random() * 899999);
+      payStage = "success";
+    }, 1900);
+  }
 </script>
 
 <div class="marketplace-root" style="--yellow: {YELLOW}">
@@ -218,7 +263,7 @@
         <polyline points="12 19 5 12 12 5"/>
       </svg>
     </button>
-    <h2 class="mp-title">{detailSkill ? detailSkill.title : "Marketplace"}</h2>
+    <h2 class="mp-title">{detailSkill ? detailSkill.title : "Skill Store"}</h2>
     {#if !detailSkill}
       <button class="refresh-btn" onclick={refreshAll} aria-label="Refresh">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -258,16 +303,11 @@
           </div>
         </div>
 
-        <!-- Price (future) -->
-        <!-- TODO: Uncomment and wire up when pricing is available -->
-        {#if false}
-          {#if detailSkill.price}
-            <div class="mp-detail-price-row">
-              <span class="mp-detail-price-label">Price</span>
-              <span class="mp-detail-price-value">{formatPrice(detailSkill.price)}</span>
-            </div>
-          {/if}
-        {/if}
+        <!-- Price -->
+        <div class="mp-detail-price-row">
+          <span class="mp-detail-price-label">Price</span>
+          <span class="mp-detail-price-value">{priceLabel(detailSkill)}</span>
+        </div>
 
         <!-- Description -->
         {#if detailManifest.description}
@@ -321,10 +361,9 @@
           {:else}
             <button
               class="mp-action-btn mp-action-subscribe"
-              disabled={actionInFlight === detailSkill.id}
-              onclick={() => handleSubscribe(detailSkill.id)}
+              onclick={() => openPay(detailSkill)}
             >
-              {actionInFlight === detailSkill.id ? "Subscribing…" : "Subscribe"}
+              Subscribe
             </button>
           {/if}
 
@@ -441,16 +480,9 @@
                   <p class="mp-card-desc">{skill.description}</p>
                 {/if}
 
-                <!--
-                  TODO: Price tag (future)
-                  Uncomment when pricing data is available from the API.
-
-                  {#if skill.price}
-                    <div class="mp-card-price">
-                      <span class="mp-card-price-value">{formatPrice(skill.price)}</span>
-                    </div>
-                  {/if}
-                -->
+                <div class="mp-card-price">
+                  <span class="mp-card-price-value">{priceLabel(skill)}</span>
+                </div>
               </button>
 
               <!-- Action row -->
@@ -466,10 +498,9 @@
                 {:else}
                   <button
                     class="mp-card-btn mp-card-btn-sub"
-                    disabled={actionInFlight === skill.id}
-                    onclick={() => handleSubscribe(skill.id)}
+                    onclick={() => openPay(skill)}
                   >
-                    {actionInFlight === skill.id ? "…" : "Subscribe"}
+                    Subscribe
                   </button>
                 {/if}
 
@@ -488,6 +519,88 @@
             </div>
           {/each}
         </div>
+      {/if}
+    </div>
+  {/if}
+
+  <!-- ═══ PAYMENT SHEET (cosmetic demo — wire real payment later) ═══ -->
+  {#if payingSkill}
+    <div class="pay-scrim" onclick={closePay} role="presentation"></div>
+    <div class="pay-sheet">
+      <div class="pay-grab"></div>
+
+      {#if payStage === "success"}
+        <div class="pay-success">
+          <div class="pay-check">
+            <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4 12.5 10 18 20 6"/>
+            </svg>
+          </div>
+          <h3 class="pay-success-title">Payment successful</h3>
+          <p class="pay-success-sub">{payingSkill.title} is now in your library.</p>
+          <div class="pay-receipt">
+            <div class="pay-receipt-row"><span>Item</span><b>{payingSkill.title}</b></div>
+            <div class="pay-receipt-row"><span>Order ID</span><b>{payOrderId}</b></div>
+            <div class="pay-receipt-row"><span>Paid</span><b>{priceLabel(payingSkill)}</b></div>
+            <div class="pay-receipt-row"><span>Status</span><b class="pay-ok">Installed ✓</b></div>
+          </div>
+          <button class="pay-done" onclick={closePay}>Start using it</button>
+        </div>
+      {:else}
+        <h3 class="pay-title">Checkout</h3>
+        <p class="pay-sub">Complete your purchase to unlock this skill.</p>
+
+        <div class="pay-order">
+          <div class="pay-order-icon" style="background: {skillTypeColor(payingSkill.skill_type)}">
+            {payingSkill.title?.charAt(0) || "⚡"}
+          </div>
+          <div class="pay-order-info">
+            <span class="pay-order-name">{payingSkill.title}</span>
+            <span class="pay-order-type">{skillTypeLabel(payingSkill.skill_type)}</span>
+          </div>
+          <span class="pay-order-amt">{priceLabel(payingSkill)}</span>
+        </div>
+
+        <div class="pay-methods">
+          <button class="pay-method" class:active={payMethod === "card"} onclick={() => payMethod = "card"}>Card</button>
+          <button class="pay-method" class:active={payMethod === "apple"} onclick={() => payMethod = "apple"}>Apple Pay</button>
+          <button class="pay-method" class:active={payMethod === "gpay"} onclick={() => payMethod = "gpay"}>Google Pay</button>
+        </div>
+
+        {#if payMethod === "card"}
+          <div class="pay-field">
+            <label for="pay-cc">Card number</label>
+            <input id="pay-cc" type="text" value="4242 4242 4242 4242" inputmode="numeric" />
+          </div>
+          <div class="pay-field-row">
+            <div class="pay-field">
+              <label for="pay-exp">Expiry</label>
+              <input id="pay-exp" type="text" value="09/28" />
+            </div>
+            <div class="pay-field">
+              <label for="pay-cvc">CVC</label>
+              <input id="pay-cvc" type="text" value="123" inputmode="numeric" />
+            </div>
+          </div>
+          <div class="pay-field">
+            <label for="pay-name">Name on card</label>
+            <input id="pay-name" type="text" value="Mang Dang" />
+          </div>
+        {:else}
+          <div class="pay-wallet">
+            <span class="pay-wallet-label">{payMethod === "apple" ? "Apple Pay" : "Google Pay"} selected</span>
+            <span class="pay-wallet-hint">Confirm with a single tap below.</span>
+          </div>
+        {/if}
+
+        <button class="pay-confirm" disabled={payStage === "processing"} onclick={confirmPay}>
+          {#if payStage === "processing"}
+            <span class="pay-spinner"></span> Processing…
+          {:else}
+            Pay {priceLabel(payingSkill)}
+          {/if}
+        </button>
+        <p class="pay-secure">🔒 Secured payment · 256-bit encryption</p>
       {/if}
     </div>
   {/if}
@@ -1009,5 +1122,158 @@
   .mp-action-checkout {
     background: #000;
     color: #fff;
+  }
+
+  /* ═══ PAYMENT SHEET (demo) ═══ */
+  .pay-scrim {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 10;
+    animation: pay-fade 0.2s ease;
+  }
+  @keyframes pay-fade { from { opacity: 0; } to { opacity: 1; } }
+
+  .pay-sheet {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    z-index: 11;
+    background: #fff;
+    border-radius: 22px 22px 0 0;
+    padding: 8px 20px 22px;
+    max-height: 92%;
+    overflow-y: auto;
+    animation: pay-slide 0.32s cubic-bezier(.22, 1, .36, 1);
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.18);
+  }
+  @keyframes pay-slide { from { transform: translateY(100%); } to { transform: translateY(0); } }
+
+  .pay-grab { width: 40px; height: 5px; border-radius: 3px; background: #dcdcdc; margin: 6px auto 14px; }
+
+  .pay-title { font-size: 1.15rem; font-weight: 700; color: #000; }
+  .pay-sub { font-size: 0.8rem; color: #969494; margin: 2px 0 16px; }
+
+  .pay-order {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: #f7f7f8;
+    border-radius: 14px;
+    padding: 12px;
+    margin-bottom: 16px;
+  }
+  .pay-order-icon {
+    width: 42px; height: 42px;
+    border-radius: 11px;
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 700; font-size: 1.1rem;
+  }
+  .pay-order-info { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+  .pay-order-name { font-size: 0.9rem; font-weight: 700; color: #000; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pay-order-type { font-size: 0.72rem; color: #969494; }
+  .pay-order-amt { font-size: 1.05rem; font-weight: 800; color: #000; }
+
+  .pay-methods { display: flex; gap: 8px; margin-bottom: 14px; }
+  .pay-method {
+    flex: 1;
+    padding: 10px 4px;
+    border-radius: 10px;
+    border: 2px solid #ececec;
+    background: #fff;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #666;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .pay-method.active { border-color: #000; color: #000; background: #fafafa; }
+
+  .pay-field { margin-bottom: 12px; flex: 1; }
+  .pay-field label { display: block; font-size: 0.72rem; font-weight: 600; color: #555; margin-bottom: 5px; }
+  .pay-field input {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1.5px solid #e4e4e4;
+    border-radius: 10px;
+    padding: 11px 12px;
+    font-size: 0.9rem;
+    outline: none;
+    color: #000;
+    letter-spacing: 0.02em;
+  }
+  .pay-field input:focus { border-color: var(--yellow); }
+  .pay-field-row { display: flex; gap: 12px; }
+
+  .pay-wallet {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: center;
+    background: #f7f7f8;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 4px;
+  }
+  .pay-wallet-label { font-size: 0.9rem; font-weight: 700; color: #000; }
+  .pay-wallet-hint { font-size: 0.75rem; color: #969494; }
+
+  .pay-confirm {
+    width: 100%;
+    margin-top: 8px;
+    padding: 14px;
+    border-radius: 12px;
+    border: none;
+    background: #000;
+    color: #fff;
+    font-size: 0.95rem;
+    font-weight: 700;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .pay-confirm:disabled { opacity: 0.9; cursor: default; }
+
+  .pay-spinner {
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    border: 2.5px solid rgba(255, 255, 255, 0.35);
+    border-top-color: #fff;
+    animation: pay-spin 0.7s linear infinite;
+  }
+  @keyframes pay-spin { to { transform: rotate(360deg); } }
+
+  .pay-secure { text-align: center; font-size: 0.7rem; color: #969494; margin-top: 12px; }
+
+  /* success */
+  .pay-success { text-align: center; padding: 10px 0 4px; }
+  .pay-check {
+    width: 74px; height: 74px;
+    border-radius: 50%;
+    background: #28c76f;
+    margin: 8px auto 16px;
+    display: flex; align-items: center; justify-content: center;
+    animation: pay-pop 0.4s cubic-bezier(.18, 1.5, .4, 1);
+  }
+  @keyframes pay-pop { from { transform: scale(0); } to { transform: scale(1); } }
+  .pay-success-title { font-size: 1.15rem; font-weight: 700; color: #000; }
+  .pay-success-sub { font-size: 0.82rem; color: #969494; margin: 6px 0 0; }
+  .pay-receipt { background: #f7f7f8; border-radius: 12px; padding: 12px 14px; margin: 16px 0 6px; text-align: left; }
+  .pay-receipt-row { display: flex; justify-content: space-between; font-size: 0.8rem; color: #555; padding: 4px 0; }
+  .pay-receipt-row b { color: #000; font-weight: 700; }
+  .pay-ok { color: #28c76f !important; }
+  .pay-done {
+    width: 100%;
+    margin-top: 14px;
+    padding: 14px;
+    border-radius: 12px;
+    border: none;
+    background: var(--yellow);
+    color: #000;
+    font-size: 0.95rem;
+    font-weight: 700;
+    cursor: pointer;
   }
 </style>

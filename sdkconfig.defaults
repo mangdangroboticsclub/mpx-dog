@@ -7,6 +7,14 @@
 # start. 16 leaves a little headroom for the websocket chat + PWA serving.
 CONFIG_LWIP_MAX_SOCKETS=16
 
+# Socket recycling.  With frequent PWA polling (wifi/status, robot/status,
+# marketplace), the default TIME_WAIT of 2*MSL = 2*60 s = 120 s made closed
+# sockets linger for two minutes and exhaust the 16-socket pool ("Failed to
+# create socket", accept errno 23).  Shorten MSL to 10 s (TIME_WAIT ~20 s) and
+# enable SO_LINGER so the marketplace proxy can force an immediate close.
+CONFIG_LWIP_TCP_MSL=10000
+CONFIG_LWIP_SO_LINGER=y
+
 # External PSRAM. Board is ESP32-S3-WROOM-1-N16R8 = 8 MB OCTAL PSRAM (see
 # partitions.csv). It was disabled, so the WASM sandbox's 128 KB linear
 # memory fell back to internal DRAM and every skill failed with
