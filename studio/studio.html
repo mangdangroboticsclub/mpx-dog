@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0B0B0B">
+<title>MangDang Servo Studio</title>
+<style>
+/* ══ MangDang Servo Studio ═══════════════════════════════════════
+   Palette is deliberately black + yellow only. No red/green status
+   hues: state is carried by yellow plus a word, never by colour
+   alone, which is also what keeps it readable for colour-blind eyes.
+   ═════════════════════════════════════════════════════════════ */
+:root{
+  --y:#FFE605; --y2:#A49714; --y-glow:rgba(255,230,5,.2); --y-wash:rgba(255,230,5,.09);
+  --ink:#0B0B0B; --pane:#121212; --well:#181818; --sunk:#0E0E0E;
+  --line:#242424; --line2:#2F2F2F;
+  --w:#FFFFFF; --mute:#8C8C8C; --dim:#5A5A5A;
+  --mono:"JetBrains Mono","SF Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--ink);color:var(--w);overflow:hidden;
+  font-family:Inter,"SF Pro Display",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased;
+  display:flex;flex-direction:column;
+}
+::selection{background:var(--y);color:#000}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer;border:none;background:none}
+button:disabled{cursor:not-allowed;opacity:.3}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:#2A2A2A;border-radius:9px}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ── Top bar ─────────────────────────────────────────────────── */
+#bar{
+  flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:10px 16px;background:var(--pane);border-bottom:1px solid var(--line);
+}
+#bar::after{content:"";position:absolute;left:0;top:52px;width:230px;height:2px;background:var(--y)}
+#brand{display:flex;align-items:center;gap:10px;margin-right:6px}
+#paw{
+  width:34px;height:34px;border-radius:10px;background:var(--y);color:#000;
+  display:grid;place-items:center;font-size:18px;flex:none;box-shadow:0 4px 16px var(--y-glow);
+}
+#brand h1{font-size:14px;font-weight:750;letter-spacing:-.015em;white-space:nowrap}
+#brand h1 em{font-style:normal;color:var(--y)}
+#brand p{font-size:9px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--dim)}
+.btngrp{display:flex;gap:6px;align-items:center}
+.sep{width:1px;height:22px;background:var(--line2);margin:0 3px}
+#banner{margin-left:auto;font-size:11.5px;color:var(--mute);display:flex;align-items:center;gap:7px;white-space:nowrap}
+#banner .dot{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:none}
+#banner .dot.on{background:var(--y);box-shadow:0 0 0 3px var(--y-wash)}
+
+/* ── Buttons ─────────────────────────────────────────────────── */
+.b{
+  display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:9px;
+  background:var(--well);border:1px solid var(--line2);font-size:12px;font-weight:650;
+  white-space:nowrap;transition:background .12s,border-color .12s,color .12s;
+}
+.b:hover:not(:disabled){border-color:#454545}
+.b.on{background:var(--y);color:#000;border-color:var(--y)}
+.b.out{background:transparent;color:var(--mute)}
+.b.out:hover:not(:disabled){color:var(--w)}
+.b.warn{background:transparent;color:var(--y2);border-color:rgba(164,151,20,.5)}
+.b.warn:hover:not(:disabled){color:var(--y);border-color:var(--y)}
+.b.sm{padding:5px 9px;font-size:11px;border-radius:7px}
+
+/* ── 3-column workbench ──────────────────────────────────────── */
+#main{flex:1;display:grid;grid-template-columns:216px minmax(0,1fr) 268px;min-height:0}
+#tree,#mid,#right{min-height:0;overflow-y:auto}
+#tree{border-right:1px solid var(--line);background:var(--pane);padding:12px 10px 24px}
+#mid{padding:12px 14px 24px;display:flex;flex-direction:column;gap:12px}
+#right{border-left:1px solid var(--line);background:var(--pane);padding:12px 12px 24px;display:flex;flex-direction:column;gap:12px}
+@media(max-width:1080px){
+  body{overflow:auto}
+  #main{grid-template-columns:minmax(0,1fr);height:auto}
+  #tree,#right{border:none;border-top:1px solid var(--line)}
+  #tree,#mid,#right{overflow:visible}
+}
+
+.lbl{font-size:9px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);
+  display:flex;align-items:center;gap:7px;margin-bottom:8px}
+.lbl::after{content:"";flex:1;height:1px;background:var(--line)}
+
+/* ── Servo tree ──────────────────────────────────────────────── */
+.leg{margin-bottom:12px}
+.srv{
+  position:relative;width:100%;display:grid;grid-template-columns:22px 1fr auto;align-items:center;gap:8px;
+  padding:7px 9px;border-radius:8px;border:1px solid transparent;text-align:left;margin-bottom:3px;
+  transition:background .12s,border-color .12s;
+}
+.srv:hover{background:var(--well)}
+.srv.on{background:var(--y-wash);border-color:var(--y)}
+.srv.on .sid{background:var(--y);color:#000}
+.srv.gone{opacity:.32}
+.sid{
+  width:22px;height:22px;border-radius:6px;background:var(--well);color:var(--mute);
+  display:grid;place-items:center;font-size:10.5px;font-weight:800;font-family:var(--mono);
+}
+.snm{font-size:11.5px;font-weight:600;color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srv.on .snm{color:var(--w)}
+.sdg{font-size:11px;font-family:var(--mono);color:var(--dim);white-space:nowrap}
+.srv.on .sdg{color:var(--y)}
+.hot{color:var(--y)!important;font-weight:700}
+
+/* ── Parameter table ─────────────────────────────────────────── */
+.card{background:var(--pane);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.card>.hd{
+  padding:11px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px;
+  font-size:9.5px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:var(--mute);
+}
+.card>.hd::before{content:"";width:3px;height:11px;background:var(--y);border-radius:2px;flex:none}
+.card>.hd .sp{margin-left:auto;letter-spacing:0;text-transform:none;font-weight:600;font-size:11px;color:var(--dim)}
+.bd{padding:4px 14px 14px}
+
+table{width:100%;border-collapse:collapse}
+th{font-size:9px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);
+   text-align:left;padding:9px 7px 7px}
+th.n,td.n{text-align:right}
+td{padding:4px 7px;border-top:1px solid var(--line);font-size:12.5px}
+tbody tr:hover{background:rgba(255,255,255,.02)}
+.addr{font-family:var(--mono);font-size:11px;color:var(--dim);width:38px}
+.pn{font-weight:650}
+.ph{font-size:10.5px;color:var(--dim)}
+.act{font-family:var(--mono);font-size:12px;color:var(--y2);width:78px}
+input[type=number],input[type=text]{
+  width:92px;padding:6px 9px;border-radius:8px;background:var(--sunk);border:1px solid var(--line2);
+  font-size:12.5px;text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;
+}
+input:focus{outline:none;border-color:var(--y);box-shadow:0 0 0 3px var(--y-wash)}
+.grp td{font-size:9px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--y2);
+  padding:11px 7px 5px;background:rgba(255,255,255,.015)}
+.chk{width:15px;height:15px;accent-color:var(--y)}
+.empty{padding:26px 8px;text-align:center;color:var(--dim);font-size:12px}
+
+/* ── Graph ───────────────────────────────────────────────────── */
+#gpanel{display:none}
+#gpanel.show{display:block;position:relative}
+#gtools{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:0 14px 10px}
+#gtools .sp{margin-left:auto;font-size:11px;color:var(--dim);font-family:var(--mono)}
+.plot{position:relative;padding:0 8px 6px}
+.plot h4{
+  font-size:9px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);
+  padding:2px 6px 5px;display:flex;gap:10px;align-items:baseline;
+}
+.plot h4 .k{display:inline-flex;align-items:center;gap:5px;font-weight:700;letter-spacing:.02em;
+  text-transform:none;font-size:10.5px;color:var(--mute)}
+.plot h4 .k i{width:14px;height:0;border-top:2px solid var(--y);display:inline-block}
+.plot h4 .k i.ref{border-top:2px dashed var(--mute)}
+canvas{display:block;width:100%;height:150px;border-radius:9px;background:var(--sunk)}
+#gtip{
+  position:absolute;pointer-events:none;display:none;z-index:8;
+  background:#000;border:1px solid var(--line2);border-radius:8px;padding:7px 10px;
+  font-family:var(--mono);font-size:11px;white-space:nowrap;box-shadow:0 6px 20px rgba(0,0,0,.7);
+}
+#gtip b{color:var(--y);font-weight:700}
+
+/* ── Right rail ──────────────────────────────────────────────── */
+.big{font-size:40px;font-weight:750;letter-spacing:-.04em;text-align:center;color:var(--y);
+  font-family:var(--mono);font-variant-numeric:tabular-nums;margin:2px 0}
+.big small{font-size:16px;color:var(--mute);font-weight:600}
+.slider{-webkit-appearance:none;appearance:none;width:100%;height:4px;border-radius:99px;
+  background:var(--line2);margin:12px 0 6px;outline:none}
+.slider::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;
+  background:var(--y);border:3px solid var(--ink);box-shadow:0 0 0 1px var(--y);cursor:pointer}
+.slider::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:var(--y);
+  border:3px solid var(--ink);cursor:pointer}
+.scale{display:flex;justify-content:space-between;font-size:10px;color:var(--dim);font-weight:650}
+.frow{display:flex;align-items:center;gap:9px;margin-top:12px;font-size:11.5px;font-weight:650}
+.frow input{width:74px}
+.frow .u{color:var(--mute);font-weight:600}
+.stack{display:flex;gap:7px;margin-top:12px}
+.stack .b{flex:1;justify-content:center}
+
+dl.live{display:grid;grid-template-columns:1fr auto;gap:0}
+dl.live dt{font-size:11px;color:var(--mute);padding:6px 0;border-top:1px solid var(--line)}
+dl.live dd{font-size:12.5px;font-family:var(--mono);text-align:right;padding:6px 0;border-top:1px solid var(--line)}
+dl.live dd small{color:var(--dim);margin-left:3px;font-size:10px}
+dl.live dt:first-of-type,dl.live dd:first-of-type{border-top:none}
+
+.note{font-size:11px;color:var(--dim);line-height:1.5;padding:10px 14px 0}
+.note b{color:var(--mute);font-weight:650}
+
+/* ── Toast ───────────────────────────────────────────────────── */
+#toast{
+  position:fixed;left:50%;bottom:22px;transform:translate(-50%,150%);
+  background:var(--y);color:#000;padding:10px 20px;border-radius:999px;
+  font-size:12.5px;font-weight:700;box-shadow:0 10px 34px rgba(0,0,0,.7);
+  transition:transform .28s cubic-bezier(.2,.9,.3,1);z-index:60;max-width:90vw;text-align:center;
+}
+#toast.show{transform:translate(-50%,0)}
+#toast.bad{background:#1A1A1A;color:var(--y);border:1px solid var(--y)}
+
+/* ── Set-all modal ───────────────────────────────────────────── */
+#saback{position:fixed;inset:0;background:rgba(0,0,0,.72);display:none;z-index:50;
+  align-items:center;justify-content:center;padding:20px}
+#saback.show{display:flex}
+#samodal{width:100%;max-width:560px;max-height:86vh;display:flex;flex-direction:column;
+  background:var(--pane);border:1px solid var(--line2);border-radius:14px;overflow:hidden}
+#satop{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+#satop h3{font-size:13px;font-weight:750}
+#satop p{font-size:11px;color:var(--dim)}
+#satop .x{margin-left:auto;font-size:20px;color:var(--mute);line-height:1}
+#sabody{overflow-y:auto;padding:0 16px 12px}
+#safoot{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style>
+</head>
+<body>
+
+<!-- ══ Top bar ══════════════════════════════════════════════ -->
+<div id="bar">
+  <div id="brand">
+    <div id="paw">🐶</div>
+    <div>
+      <h1>MangDang <em>Servo Studio</em></h1>
+      <p>Mini Pupper &middot; AT32 driver boards</p>
+    </div>
+  </div>
+
+  <div class="btngrp">
+    <button class="b" id="conn">Connect</button>
+    <button class="b out" id="bscan">Scan</button>
+    <button class="b out" id="brefresh">Refresh</button>
+  </div>
+  <div class="sep"></div>
+  <div class="btngrp"><button class="b out" id="gbtn">Graph</button></div>
+  <div class="sep"></div>
+  <div class="btngrp"><button class="b out" id="bsa">Set All Servos</button></div>
+  <div class="sep"></div>
+  <div class="btngrp">
+    <button class="b out" id="bsave">Save</button>
+    <button class="b out" id="bsaveall">Save All</button>
+  </div>
+
+  <div id="banner"><span class="dot" id="bdot"></span><span id="btxt">checking…</span></div>
+</div>
+
+<!-- ══ Workbench ════════════════════════════════════════════ -->
+<div id="main">
+
+  <!-- ── Servo tree ── -->
+  <div id="tree"></div>
+
+  <!-- ── Parameters + graph ── -->
+  <div id="mid">
+    <div class="card">
+      <div class="hd">Parameters <span class="sp" id="curname">no servo selected</span></div>
+      <div class="bd">
+        <table>
+          <thead><tr>
+            <th class="addr">Addr</th><th>Parameter</th>
+            <th class="n">Value</th><th class="n">Actual</th><th class="n" style="width:64px"></th>
+          </tr></thead>
+          <tbody id="tbl"><tr><td colspan="5" class="empty">Press <b>Connect</b>, then pick a servo.</td></tr></tbody>
+        </table>
+        <div class="stack" style="flex-wrap:wrap">
+          <button class="b out" id="breload" disabled>Reload</button>
+          <button class="b on" id="bflash" disabled>Save to Flash</button>
+          <button class="b warn" id="bfactory" disabled>Factory Reset</button>
+        </div>
+        <p class="note" style="padding-left:0">
+          <b>Set</b> writes to the board's RAM only — use <b>Save to Flash</b> to keep values after power-off.
+        </p>
+      </div>
+    </div>
+
+    <div class="card" id="gpanel">
+      <div class="hd">Live scope <span class="sp" id="ginfo">idle</span></div>
+      <div id="gtools">
+        <button class="b on" id="gstart">▶ Start</button>
+        <button class="b out" id="greset">↺ Reset</button>
+        <button class="b out" id="gcap">Capture PNG</button>
+        <button class="b out" id="gcsv">Save CSV</button>
+        <span class="sp" id="gwin">20 s window</span>
+      </div>
+      <div class="plot">
+        <h4>Angle
+          <span class="k"><i></i>measured</span>
+          <span class="k"><i class="ref"></i>goal (reference)</span>
+        </h4>
+        <canvas id="cvA"></canvas>
+      </div>
+      <div class="plot" style="padding-bottom:12px">
+        <h4>Current
+          <span class="k"><i></i>measured</span>
+          <span class="k"><i class="ref"></i>cap (reference)</span>
+        </h4>
+        <canvas id="cvB"></canvas>
+        <div id="gtip"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Direct control + live values ── -->
+  <div id="right">
+    <div class="card">
+      <div class="hd">Degrees</div>
+      <div class="bd">
+        <div class="big"><span id="degout">135.0</span><small>°</small></div>
+        <input class="slider" type="range" id="deg" min="0" max="270" step="0.5" value="135">
+        <div class="scale"><span>0</span><span>135 centre</span><span>270</span></div>
+        <div class="frow"><span>Current cap</span><input type="number" id="cap" value="200" min="0" max="1500" step="10"><span class="u">mA</span></div>
+        <div class="stack">
+          <button class="b on" id="bhold" disabled>Torque</button>
+          <button class="b out" id="bidle" disabled>Motor off</button>
+        </div>
+        <p class="note" style="padding:10px 0 0">
+          Raw AT32 angle — 135° is mechanical centre. This bypasses the gait and its IK limits, so start with a low cap.
+        </p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="hd">Live <span class="sp"><button class="b sm out" id="bpoll" disabled>Poll</button></span></div>
+      <div class="bd">
+        <dl class="live" id="livedl"></dl>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- ══ Set-all modal ════════════════════════════════════════ -->
+<div id="saback">
+  <div id="samodal">
+    <div id="satop">
+      <div>
+        <h3>Set All Servos</h3>
+        <p>write the ticked parameters to all 12 servos at once</p>
+      </div>
+      <button class="x" id="saclose">&times;</button>
+    </div>
+    <div id="sabody">
+      <div class="stack" style="margin:12px 0">
+        <button class="b out sm" id="saall">Tick all</button>
+        <button class="b out sm" id="sanone">Untick all</button>
+        <button class="b out sm" id="sagains">Gains only</button>
+        <button class="b out sm" id="safrom">↻ From selected</button>
+      </div>
+      <table>
+        <thead><tr><th style="width:34px"></th><th class="addr">Addr</th><th>Parameter</th><th class="n">Value</th><th class="n">Result</th></tr></thead>
+        <tbody id="satbl"></tbody>
+      </table>
+      <p class="note" style="padding-left:0">
+        Calibration values (min/max ADC, range, reverse flags) are per-servo and are
+        <b>unticked by default</b>. Ticking them overwrites each servo's own calibration.
+      </p>
+    </div>
+    <div id="safoot">
+      <button class="b on" id="saapply">Apply to all 12</button>
+      <label style="display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--mute);font-weight:650">
+        <input class="chk" type="checkbox" id="sasave"> save to flash when done
+      </label>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+/* ══ Model ═══════════════════════════════════════════════════ */
+const PARAMS = [
+  {a:0, n:"Reverse position sensor", h:"0 or 1",               cal:1, s:1},
+  {a:1, n:"Min position ADC",        h:"raw sensor floor",     cal:1, s:1},
+  {a:2, n:"Max position ADC",        h:"raw sensor ceiling",   cal:1, s:1},
+  {a:3, n:"Range position",          h:"degrees",              cal:1, s:1},
+  {a:4, n:"Reverse motor",           h:"0 or 1",               cal:1, s:1},
+  {a:5, n:"Kp position",             h:"position P gain",      cal:0, s:0.01},
+  {a:6, n:"Kd position",             h:"position D gain",      cal:0, s:0.01},
+  {a:7, n:"Kp current",              h:"current P gain",       cal:0, s:0.01},
+  {a:8, n:"Kff current",             h:"current feed-forward", cal:0, s:0.01},
+  {a:9, n:"Max PWM duty",            h:"0 to 1",               cal:0, s:0.01},
+];
+const LEGS = [
+  {t:"Front Right", ids:[1,2,3]}, {t:"Front Left", ids:[4,5,6]},
+  {t:"Rear Right",  ids:[7,8,9]}, {t:"Rear Left",  ids:[10,11,12]},
+];
+const JOINT = ["Abduction","Thigh","Calf"];
+
+let cli   = false;   // studio mode armed
+let cur   = 0;       // selected servo
+let actual= {};      // addr -> value read back
+let gone  = new Set();
+let poll  = false;   // live poll running
+let live  = null;
+
+/* ══ Utilities ═══════════════════════════════════════════════ */
+let tT = null;
+function toast(m, bad){
+  const t = $("toast");
+  t.textContent = m;
+  t.className = "show" + (bad ? " bad" : "");
+  clearTimeout(tT); tT = setTimeout(() => t.className = "", 2600);
+}
+async function jget(p){
+  const r = await fetch(p, {cache:"no-store"});
+  if(!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+const fmt = (v,d=1) => (v===null||v===undefined||Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
+const pad3 = (n) => String(n).padStart(2,"0");
+
+function setConn(on){
+  cli = on;
+  $("conn").textContent = on ? "Disconnect" : "Connect";
+  $("conn").className = "b" + (on ? " on" : "");
+  const has = on && cur > 0;
+  ["breload","bflash","bfactory","bhold","bidle","bpoll"].forEach(id => $(id).disabled = !has);
+  if(!on){ stopPoll(); gStop(); }
+}
+
+/* ══ Servo tree ══════════════════════════════════════════════ */
+function buildTree(){
+  let h = "";
+  for(const leg of LEGS){
+    h += '<div class="leg"><div class="lbl">' + leg.t + "</div>";
+    leg.ids.forEach((id,j) => {
+      h += '<button class="srv" id="sv'+id+'" data-id="'+id+'">' +
+             '<span class="sid">'+pad3(id)+'</span>' +
+             '<span class="snm">'+JOINT[j]+'</span>' +
+             '<span class="sdg" id="sd'+id+'">—</span>' +
+           "</button>";
+    });
+    h += "</div>";
+  }
+  $("tree").innerHTML = h;
+  $("tree").querySelectorAll(".srv").forEach(b =>
+    b.onclick = () => selServo(Number(b.dataset.id)));
+}
+
+function selServo(id){
+  cur = id;
+  document.querySelectorAll(".srv").forEach(e => e.classList.remove("on"));
+  $("sv"+id).classList.add("on");
+  for(const leg of LEGS){
+    const j = leg.ids.indexOf(id);
+    if(j >= 0) $("curname").textContent = "servo " + id + " · " + leg.t + " " + JOINT[j];
+  }
+  setConn(cli);
+  gReset();
+  if(cli) refreshSel();
+}
+
+/* ══ Status poll — runs with or without studio mode ══════════ */
+async function pollStatus(){
+  try{
+    const d = await jget("/v1/studio/status");
+    setConn(d.studio);
+    $("bdot").className = "dot on";
+    $("btxt").textContent = d.studio ? "studio mode — gait parked" : "telemetry only — press Connect";
+    for(const s of d.servos){
+      const e = $("sd"+s.id);
+      if(!e) continue;
+      const hot = s.c !== null && s.c >= 55;
+      e.textContent = fmt(s.deg) + "°" + (s.c === null ? "" : "  " + fmt(s.c,0) + "°C");
+      e.className = "sdg" + (hot ? " hot" : "");
+      e.title = hot ? "running hot" : "";
+    }
+  }catch(e){
+    $("bdot").className = "dot";
+    $("btxt").textContent = "no connection";
+  }
+}
+setInterval(pollStatus, 600);
+
+/* ══ Parameter table ═════════════════════════════════════════ */
+function buildTable(map){
+  let h = "", grp = null;
+  for(const p of PARAMS){
+    const g = p.cal ? "Calibration" : "Control gains";
+    if(g !== grp){ grp = g; h += '<tr class="grp"><td colspan="5">'+g+"</td></tr>"; }
+    const v = map[p.a];
+    h += "<tr>" +
+      '<td class="addr">'+pad3(p.a)+"</td>" +
+      '<td><div class="pn">'+p.n+'</div><div class="ph">'+p.h+"</div></td>" +
+      '<td class="n"><input type="number" step="'+p.s+'" id="pv'+p.a+'" value="'+
+        (v===null||v===undefined?"":v)+'"></td>' +
+      '<td class="n act" id="pa'+p.a+'">'+(v===null||v===undefined?"—":v)+"</td>" +
+      '<td class="n"><button class="b sm on" data-set="'+p.a+'">Set</button></td>' +
+      "</tr>";
+  }
+  $("tbl").innerHTML = h;
+  $("tbl").querySelectorAll("[data-set]").forEach(b =>
+    b.onclick = () => applyParam(Number(b.dataset.set)));
+}
+
+async function refreshSel(){
+  if(!cli || !cur) return;
+  $("tbl").innerHTML = '<tr><td colspan="5" class="empty">Reading…</td></tr>';
+  try{
+    const d = await jget("/v1/studio/dump?id=" + cur);
+    if(!d.ok){ $("tbl").innerHTML = '<tr><td colspan="5" class="empty">'+(d.err||"read failed")+"</td></tr>"; return; }
+    actual = {};
+    for(const p of d.params) actual[p.p] = p.v;
+    buildTable(actual);
+  }catch(e){
+    $("tbl").innerHTML = '<tr><td colspan="5" class="empty">read failed</td></tr>';
+  }
+}
+
+async function applyParam(a){
+  const el = $("pv"+a), v = el.value.trim();
+  if(v === "") return toast("enter a value first", 1);
+  try{
+    const d = await jget("/v1/studio/set?id="+cur+"&p="+a+"&v="+encodeURIComponent(v));
+    if(!d.ok) return toast(d.err || "write refused", 1);
+    actual[a] = d.v;
+    $("pa"+a).textContent = d.v;
+    el.value = d.v;
+    toast(PARAMS[a].n + " → " + d.v);
+  }catch(e){ toast("write failed", 1); }
+}
+
+/* ══ Top-bar actions ═════════════════════════════════════════ */
+$("conn").onclick = async () => {
+  try{
+    const d = await jget("/v1/studio/mode?on=" + (cli ? 0 : 1));
+    setConn(d.studio);
+    toast(d.studio ? "connected — gait parked" : "disconnected — gait resumed");
+    if(d.studio && cur) refreshSel();
+  }catch(e){ toast("could not change mode", 1); }
+};
+
+$("bscan").onclick = async () => {
+  if(!cli) return toast("press Connect first", 1);
+  try{
+    const d = await jget("/v1/studio/scan");
+    if(!d.ok) return toast(d.err || "scan failed", 1);
+    const f = new Set(d.found);
+    gone = new Set([1,2,3,4,5,6,7,8,9,10,11,12].filter(i => !f.has(i)));
+    document.querySelectorAll(".srv").forEach(e =>
+      e.classList.toggle("gone", gone.has(Number(e.dataset.id))));
+    toast(d.found.length + " of 12 servos answered", d.found.length !== 12);
+  }catch(e){ toast("scan failed", 1); }
+};
+
+$("brefresh").onclick = refreshSel;
+$("breload").onclick  = refreshSel;
+
+$("bflash").onclick = async () => {
+  try{ const d = await jget("/v1/studio/save?id="+cur);
+       toast(d.ok ? "saved to board flash" : (d.err||"save failed"), !d.ok); }
+  catch(e){ toast("save failed", 1); }
+};
+$("bsave").onclick    = () => $("bflash").click();
+$("bsaveall").onclick = async () => {
+  if(!cli) return toast("press Connect first", 1);
+  try{ const d = await jget("/v1/studio/save?id=0");
+       toast(d.ok ? "all four boards saved" : (d.err||"save failed"), !d.ok); }
+  catch(e){ toast("save failed", 1); }
+};
+
+$("bfactory").onclick = async () => {
+  try{
+    const d = await jget("/v1/studio/restore?id="+cur);
+    toast(d.ok ? "factory defaults in RAM — save to keep" : (d.err||"restore failed"), !d.ok);
+    if(d.ok) refreshSel();
+  }catch(e){ toast("restore failed", 1); }
+};
+
+/* ══ Direct control ══════════════════════════════════════════ */
+$("deg").oninput = (e) => $("degout").textContent = Number(e.target.value).toFixed(1);
+
+async function direct(mode){
+  try{
+    const d = await jget("/v1/studio/direct?id="+cur+"&m="+mode+
+                         "&deg="+$("deg").value+"&cur="+($("cap").value||200));
+    toast(d.ok ? (mode ? "holding "+Number($("deg").value).toFixed(1)+"°" : "motor off")
+               : (d.err||"refused"), !d.ok);
+  }catch(e){ toast("command failed", 1); }
+}
+$("bhold").onclick = () => direct(1);
+$("bidle").onclick = () => direct(0);
+
+/* ══ Live readouts ═══════════════════════════════════════════ */
+const LIVE = [
+  ["now_deg","Position","°",1],  ["set_deg","Goal","°",1],
+  ["err_deg","Pos error","°",2], ["now_ma","Current","mA",0],
+  ["cap_ma","Current cap","mA",0],["duty","PWM duty","",3],
+  ["temp_c","NTC temp","°C",1],  ["mode","Mode","",0],
+];
+const MODES = ["idle","position","torque"];
+
+function renderLive(d){
+  let h = "";
+  for(const [k,label,unit,dg] of LIVE){
+    if(!(k in d)) continue;
+    const v = (k === "mode") ? (MODES[d[k]] || d[k]) : fmt(d[k], dg);
+    h += "<dt>"+label+"</dt><dd>"+v+(unit?"<small>"+unit+"</small>":"")+"</dd>";
+  }
+  $("livedl").innerHTML = h || '<dt>—</dt><dd>no data</dd>';
+}
+
+async function tickPoll(){
+  if(!poll || !cur) return;
+  try{
+    const d = await jget("/v1/studio/live?id="+cur);
+    if(!d.ok){ stopPoll(); return toast(d.err || "live read failed", 1); }
+    live = d;
+    renderLive(d);
+    gPush(d);
+  }catch(e){ stopPoll(); toast("live read failed", 1); }
+}
+let pollTimer = null;
+function stopPoll(){
+  poll = false; clearInterval(pollTimer); pollTimer = null;
+  $("bpoll").textContent = "Poll"; $("bpoll").className = "b sm out";
+}
+$("bpoll").onclick = () => {
+  if(poll) return stopPoll();
+  poll = true;
+  $("bpoll").textContent = "Stop"; $("bpoll").className = "b sm on";
+  tickPoll(); pollTimer = setInterval(tickPoll, 140);
+};
+
+/* ══ Scope ═══════════════════════════════════════════════════
+ * Two time-aligned plots rather than one dual-axis plot: degrees and
+ * milliamps have no common scale, so overlaying them on two y-axes
+ * would invent a correlation that is not in the data. Stacked panes
+ * share the x-axis, so you still read cause and effect together.
+ * One measured series per pane (brand yellow) plus its commanded
+ * value as a dashed reference — identity never depends on hue.
+ * ═════════════════════════════════════════════════════════ */
+const GWIN = 20000, GMAX = 4000;
+let gbuf = [], grun = false, gt0 = 0, gHover = null;
+
+function gStop(){
+  grun = false;
+  $("gstart").innerHTML = "▶ Start";
+  $("gstart").className = "b on";
+}
+function gReset(){ gbuf = []; $("ginfo").textContent = "idle"; gDraw(); }
+
+$("gbtn").onclick = () => {
+  const on = $("gpanel").classList.toggle("show");
+  $("gbtn").className = "b" + (on ? " on" : " out");
+  if(on){ gSize(); gDraw(); }
+};
+$("gstart").onclick = () => {
+  if(grun) return gStop();
+  if(!cli || !cur) return toast("connect and pick a servo first", 1);
+  if(!poll) $("bpoll").click();          // the scope is fed by the live poll
+  if(!gbuf.length) gt0 = Date.now();
+  grun = true;
+  $("gstart").innerHTML = "■ Stop";
+  $("gstart").className = "b warn";
+};
+$("greset").onclick = gReset;
+
+function gPush(d){
+  if(!grun) return;
+  const p = {t: Date.now() - gt0};
+  for(const k of ["now_deg","set_deg","err_deg","now_ma","cap_ma","duty","temp_c"])
+    if(d[k] !== undefined) p[k] = d[k];
+  gbuf.push(p);
+  if(gbuf.length > GMAX) gbuf.shift();
+  $("ginfo").textContent = "servo " + cur + " · " + gbuf.length + " samples · " + (p.t/1000).toFixed(1) + " s";
+  gDraw();
+}
+
+function gSize(){
+  for(const id of ["cvA","cvB"]){
+    const c = $(id), r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    c.width = Math.max(80, Math.round(r.width * dpr));
+    c.height = Math.round(150 * dpr);
+    c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+}
+window.addEventListener("resize", () => { if($("gpanel").classList.contains("show")){ gSize(); gDraw(); } });
+
+function niceStep(span){
+  const raw = span / 4, p = Math.pow(10, Math.floor(Math.log10(raw))), n = raw / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+}
+
+function drawPlot(canvasId, keyMain, keyRef, unit, digits){
+  const c = $(canvasId), x = c.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const W = c.width / dpr, H = c.height / dpr;
+  const L = 52, R = 12, T = 10, B = 20, pw = W - L - R, ph = H - T - B;
+
+  x.clearRect(0, 0, W, H);
+  if(pw < 40 || ph < 30) return;
+
+  if(!gbuf.length){
+    x.fillStyle = "#5A5A5A";
+    x.font = "12px Inter,sans-serif"; x.textAlign = "center"; x.textBaseline = "middle";
+    x.fillText("Press Start to record", W/2, H/2);
+    return;
+  }
+
+  const tmax = gbuf[gbuf.length-1].t, tmin = Math.max(0, tmax - GWIN);
+  const win = gbuf.filter(p => p.t >= tmin);
+
+  let mn = Infinity, mx = -Infinity;
+  for(const p of win){
+    for(const k of [keyMain, keyRef]){
+      const v = p[k];
+      if(v !== undefined && isFinite(v)){ if(v < mn) mn = v; if(v > mx) mx = v; }
+    }
+  }
+  if(!isFinite(mn)){ mn = 0; mx = 1; }
+  if(mn === mx){ mn -= 1; mx += 1; }
+  const pad = (mx - mn) * 0.12; mn -= pad; mx += pad;
+
+  const X = (t) => L + (t - tmin) / Math.max(1, tmax - tmin) * pw;
+  const Y = (v) => T + ph - (v - mn) / (mx - mn) * ph;
+
+  // Recessive grid — solid hairlines, one shade off the surface.
+  const step = niceStep(mx - mn);
+  x.strokeStyle = "#242424"; x.lineWidth = 1;
+  x.fillStyle = "#5A5A5A"; x.font = "10px "+getComputedStyle(document.body).getPropertyValue("--mono");
+  x.textAlign = "right"; x.textBaseline = "middle";
+  for(let v = Math.ceil(mn/step)*step; v <= mx; v += step){
+    const y = Math.round(Y(v)) + 0.5;
+    x.beginPath(); x.moveTo(L, y); x.lineTo(L+pw, y); x.stroke();
+    x.fillText(v.toFixed(digits) , L - 8, y);
+  }
+  // time axis
+  x.textAlign = "center"; x.textBaseline = "top";
+  for(let s = Math.ceil(tmin/5000)*5000; s <= tmax; s += 5000){
+    x.fillText((s/1000).toFixed(0)+"s", X(s), T + ph + 5);
+  }
+  x.fillStyle = "#5A5A5A"; x.textAlign = "left"; x.textBaseline = "top";
+  x.fillText(unit, L, T - 2);
+
+  const line = (key, dash, color, width) => {
+    x.save(); x.setLineDash(dash); x.strokeStyle = color; x.lineWidth = width;
+    x.lineJoin = "round"; x.lineCap = "round";
+    x.beginPath();
+    let started = false;
+    for(const p of win){
+      const v = p[key];
+      if(v === undefined || !isFinite(v)){ started = false; continue; }
+      const px = X(p.t), py = Y(v);
+      if(!started){ x.moveTo(px, py); started = true; } else x.lineTo(px, py);
+    }
+    x.stroke(); x.restore();
+  };
+
+  // reference first, so the measured trace sits on top
+  line(keyRef, [4,4], "#8C8C8C", 2);
+  line(keyMain, [], "#FFE605", 2);
+
+  // direct label on the last measured sample — selective, not every point
+  for(let i = win.length - 1; i >= 0; i--){
+    const v = win[i][keyMain];
+    if(v === undefined || !isFinite(v)) continue;
+    const px = X(win[i].t), py = Y(v);
+    x.fillStyle = "#FFE605";
+    x.beginPath(); x.arc(px, py, 3, 0, 6.284); x.fill();
+    break;
+  }
+
+  // hover crosshair
+  if(gHover !== null){
+    const px = X(gHover.t);
+    if(px >= L && px <= L + pw){
+      x.strokeStyle = "#4A4A4A"; x.lineWidth = 1; x.setLineDash([2,3]);
+      x.beginPath(); x.moveTo(px, T); x.lineTo(px, T + ph); x.stroke(); x.setLineDash([]);
+    }
+  }
+}
+
+function gDraw(){
+  if(!$("gpanel").classList.contains("show")) return;
+  if(!$("cvA").width) gSize();
+  drawPlot("cvA", "now_deg", "set_deg", "deg", 1);
+  drawPlot("cvB", "now_ma",  "cap_ma",  "mA",  0);
+}
+
+// Crosshair + tooltip (an HTML chart is interactive by default)
+for(const id of ["cvA","cvB"]){
+  $(id).addEventListener("mousemove", (ev) => {
+    if(!gbuf.length) return;
+    const c = $(id), r = c.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const W = c.width/dpr, L = 52, R = 12, pw = W - L - R;
+    const tmax = gbuf[gbuf.length-1].t, tmin = Math.max(0, tmax - GWIN);
+    const t = tmin + Math.min(1, Math.max(0, (ev.clientX - r.left - L) / pw)) * (tmax - tmin);
+    let best = null, bd = Infinity;
+    for(const p of gbuf){ const d = Math.abs(p.t - t); if(d < bd){ bd = d; best = p; } }
+    gHover = best;
+    // Anchor to the panel, not to whichever canvas fired — otherwise a hover
+    // on the angle plot lands in the current plot's coordinate space.
+    const tip = $("gtip"), pr = $("gpanel").getBoundingClientRect();
+    tip.style.display = "block";
+    const tw = tip.offsetWidth || 150, th = tip.offsetHeight || 52;
+    tip.style.left = Math.max(6, Math.min(pr.width - tw - 6, ev.clientX - pr.left + 14)) + "px";
+    tip.style.top  = Math.max(6, Math.min(pr.height - th - 6, ev.clientY - pr.top - th - 10)) + "px";
+    tip.innerHTML =
+      (best.t/1000).toFixed(2) + " s<br>" +
+      "<b>" + fmt(best.now_deg) + "°</b> / goal " + fmt(best.set_deg) + "°<br>" +
+      "<b>" + fmt(best.now_ma,0) + " mA</b> / cap " + fmt(best.cap_ma,0) + " mA";
+    gDraw();
+  });
+  $(id).addEventListener("mouseleave", () => { gHover = null; $("gtip").style.display = "none"; gDraw(); });
+}
+
+$("gcap").onclick = () => {
+  const a = $("cvA"), b = $("cvB");
+  const out = document.createElement("canvas");
+  out.width = Math.max(a.width, b.width); out.height = a.height + b.height;
+  const o = out.getContext("2d");
+  o.fillStyle = "#0E0E0E"; o.fillRect(0, 0, out.width, out.height);
+  o.drawImage(a, 0, 0); o.drawImage(b, 0, a.height);
+  const l = document.createElement("a");
+  l.download = "servo" + cur + "-trace.png";
+  l.href = out.toDataURL("image/png"); l.click();
+  toast("PNG saved");
+};
+
+$("gcsv").onclick = () => {
+  if(!gbuf.length) return toast("nothing recorded yet", 1);
+  const cols = ["t","now_deg","set_deg","err_deg","now_ma","cap_ma","duty","temp_c"];
+  let csv = cols.join(",") + "\n";
+  for(const p of gbuf) csv += cols.map(k => p[k] === undefined ? "" : p[k]).join(",") + "\n";
+  const l = document.createElement("a");
+  l.download = "servo" + cur + "-trace.csv";
+  l.href = URL.createObjectURL(new Blob([csv], {type:"text/csv"})); l.click();
+  toast(gbuf.length + " samples saved");
+};
+
+/* ══ Set All Servos ══════════════════════════════════════════ */
+function saBuild(){
+  let h = "", grp = null;
+  for(const p of PARAMS){
+    const g = p.cal ? "Calibration — per servo" : "Control gains";
+    if(g !== grp){ grp = g; h += '<tr class="grp"><td colspan="5">'+g+"</td></tr>"; }
+    h += "<tr>" +
+      '<td><input class="chk" type="checkbox" id="sc'+p.a+'"'+(p.cal?"":" checked")+"></td>" +
+      '<td class="addr">'+pad3(p.a)+"</td>" +
+      '<td><div class="pn">'+p.n+'</div><div class="ph">'+p.h+"</div></td>" +
+      '<td class="n"><input type="number" step="'+p.s+'" id="sv_'+p.a+'"></td>' +
+      '<td class="n act" id="sr'+p.a+'">—</td>' +
+      "</tr>";
+  }
+  $("satbl").innerHTML = h;
+}
+$("bsa").onclick     = () => { if(!cli) return toast("press Connect first",1); $("saback").classList.add("show"); };
+$("saclose").onclick = () => $("saback").classList.remove("show");
+$("saback").onclick  = (e) => { if(e.target === $("saback")) $("saback").classList.remove("show"); };
+$("saall").onclick   = () => PARAMS.forEach(p => $("sc"+p.a).checked = true);
+$("sanone").onclick  = () => PARAMS.forEach(p => $("sc"+p.a).checked = false);
+$("sagains").onclick = () => PARAMS.forEach(p => $("sc"+p.a).checked = !p.cal);
+$("safrom").onclick  = async () => {
+  if(!cur) return toast("pick a servo first", 1);
+  try{
+    const d = await jget("/v1/studio/dump?id="+cur);
+    if(!d.ok) return toast(d.err || "read failed", 1);
+    for(const p of d.params) if(p.v !== null && p.v !== undefined) $("sv_"+p.p).value = p.v;
+    toast("loaded servo " + cur);
+  }catch(e){ toast("read failed", 1); }
+};
+
+$("saapply").onclick = async () => {
+  const todo = PARAMS.filter(p => $("sc"+p.a).checked && $("sv_"+p.a).value.trim() !== "");
+  if(!todo.length) return toast("tick a parameter and give it a value", 1);
+  const save = $("sasave").checked;
+  $("saapply").disabled = true;
+  let bad = 0;
+  for(let i = 0; i < todo.length; i++){
+    const p = todo[i], last = (i === todo.length - 1);
+    $("saapply").textContent = "Applying " + (i+1) + "/" + todo.length + "…";
+    $("sr"+p.a).textContent = "…";
+    try{
+      const d = await jget("/v1/studio/setall?p="+p.a+
+                           "&v="+encodeURIComponent($("sv_"+p.a).value)+
+                           "&save="+(save && last ? 1 : 0));
+      if(d.ok){
+        $("sr"+p.a).textContent = d.fail && d.fail.length ? ("fail " + d.fail.join(",")) : (d.n + "/12");
+        if(d.fail && d.fail.length) bad++;
+      }else{ $("sr"+p.a).textContent = "refused"; bad++; }
+    }catch(e){ $("sr"+p.a).textContent = "error"; bad++; }
+  }
+  $("saapply").textContent = "Apply to all 12";
+  $("saapply").disabled = false;
+  toast(bad ? (bad + " parameter(s) had failures") : ("applied to all 12" + (save ? " and saved" : "")), !!bad);
+  if(cur && cli) refreshSel();
+};
+
+/* ══ Boot ════════════════════════════════════════════════════ */
+buildTree();
+saBuild();
+renderLive({});
+setConn(false);
+pollStatus();
+
+// Do not strand the robot with its gait parked because a tab closed.
+window.addEventListener("beforeunload", () => {
+  if(cli && navigator.sendBeacon) navigator.sendBeacon("/v1/studio/mode?on=0");
+});
+</script>
+</body>
+</html>

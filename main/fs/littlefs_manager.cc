@@ -68,6 +68,9 @@ bool write_file(const char *path, const void *data, std::size_t len)
 	const size_t written = fwrite(data, 1, len, f);
 	fclose(f);
 
+	// Even a short write consumed blocks, so invalidate before the error path.
+	invalidate_stats();
+
 	if (written != len) {
 		ESP_LOGE(TAG, "Short write to '%s': %zu/%zu bytes", full_path, written, len);
 		return false;
@@ -117,11 +120,12 @@ bool delete_file(const char *path)
 
 	if (unlink(full_path) != 0) {
 		if (errno == ENOENT) {
-			return true;  // Already gone
+			return true;  // Already gone — nothing freed, cache still good
 		}
 		ESP_LOGE(TAG, "Failed to delete '%s': errno=%d", full_path, errno);
 		return false;
 	}
+	invalidate_stats();
 
 	ESP_LOGI(TAG, "Deleted '%s'", full_path);
 	return true;
@@ -180,9 +184,49 @@ std::vector<std::string> list_files(const char *dir_path)
 	return result;
 }
 
+/* ── Cached partition stats ──────────────────────────────────────
+ * See the header for why this is cached rather than measured per call.
+ * No lock: the two values are written together and only ever read as a pair
+ * by tasks that tolerate a stale reading by design; the worst outcome of a
+ * race is one request seeing the previous figures.
+ */
+static std::size_t s_stat_total = 0;
+static std::size_t s_stat_used  = 0;
+static bool        s_stat_valid = false;
+static TickType_t  s_stat_at    = 0;
+
+/* Long enough that a burst of requests measures once, short enough that a
+ * write from outside this module is not remembered wrongly for long. */
+static constexpr TickType_t STAT_TTL = pdMS_TO_TICKS(15000);
+
+void invalidate_stats()
+{
+	s_stat_valid = false;
+}
+
+bool stats_fresh(std::size_t &total_bytes, std::size_t &used_bytes)
+{
+	std::size_t t = 0, u = 0;
+	if (esp_littlefs_info(PARTITION_LABEL, &t, &u) != ESP_OK) return false;
+
+	s_stat_total = t;
+	s_stat_used  = u;
+	s_stat_at    = xTaskGetTickCount();
+	s_stat_valid = true;
+
+	total_bytes = t;
+	used_bytes  = u;
+	return true;
+}
+
 bool stats(std::size_t &total_bytes, std::size_t &used_bytes)
 {
-	return (esp_littlefs_info(PARTITION_LABEL, &total_bytes, &used_bytes) == ESP_OK);
+	if (s_stat_valid && (xTaskGetTickCount() - s_stat_at) < STAT_TTL) {
+		total_bytes = s_stat_total;
+		used_bytes  = s_stat_used;
+		return true;
+	}
+	return stats_fresh(total_bytes, used_bytes);
 }
 
 }  // namespace fs

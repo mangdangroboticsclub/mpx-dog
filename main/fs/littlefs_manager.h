@@ -67,7 +67,34 @@ std::vector<std::string> list_files(const char *dir_path);
 
 /**
  * @brief Return total and used bytes on the LittleFS partition.
+ *
+ * Cached. The underlying `esp_littlefs_info()` calls `lfs_fs_size()`, which
+ * walks every allocated block on a 13.4 MB partition reading flash as it goes
+ * — hundreds of milliseconds to seconds, and it was being called on the HTTP
+ * request path. esp_http_server serves requests from a single task, so that
+ * traversal did not just delay the storage bar: it delayed whatever request
+ * was queued behind it, which is why opening the Skills screen sometimes hung
+ * for seconds.
+ *
+ * The value only changes when a file changes, and every write in this firmware
+ * goes through write_file()/delete_file(), so both invalidate the cache. The
+ * TTL is a backstop for anything that edits the partition behind our back.
+ *
+ * @return true if a value is available (cached or freshly measured).
  */
 bool stats(std::size_t &total_bytes, std::size_t &used_bytes);
+
+/**
+ * @brief Measure the partition now, ignoring and refreshing the cache.
+ *
+ * Prefer stats(). Use this only where the exact current figure matters more
+ * than the latency — it is the slow path by design.
+ */
+bool stats_fresh(std::size_t &total_bytes, std::size_t &used_bytes);
+
+/**
+ * @brief Mark the cached stats stale. Called by every write path here.
+ */
+void invalidate_stats();
 
 }  // namespace fs

@@ -10,9 +10,18 @@ CONFIG_LWIP_MAX_SOCKETS=16
 # Socket recycling.  With frequent PWA polling (wifi/status, robot/status,
 # marketplace), the default TIME_WAIT of 2*MSL = 2*60 s = 120 s made closed
 # sockets linger for two minutes and exhaust the 16-socket pool ("Failed to
-# create socket", accept errno 23).  Shorten MSL to 10 s (TIME_WAIT ~20 s) and
-# enable SO_LINGER so the marketplace proxy can force an immediate close.
-CONFIG_LWIP_TCP_MSL=10000
+# create socket", accept errno 23).  Shorten MSL and enable SO_LINGER so the
+# marketplace proxy can force an immediate close.
+#
+# 10 s was still not enough: LWIP_MAX_SOCKETS cannot go above 16 in ESP-IDF,
+# and every connection the browser closes holds a slot for 2*MSL afterwards.
+# At MSL=10 s that is a 20 s tail, so roughly one closed connection per second
+# is enough to sit at 16/16 forever — which is exactly what the census in the
+# log showed (12 of the 16 were port-80 sockets with no live peer).  5 s halves
+# the tail.  Safe here: TIME_WAIT guards against delayed duplicate segments
+# from a previous connection, and this is a LAN with sub-millisecond RTT, not
+# an internet path where a packet can be queued for tens of seconds.
+CONFIG_LWIP_TCP_MSL=5000
 CONFIG_LWIP_SO_LINGER=y
 
 # External PSRAM. Board is ESP32-S3-WROOM-1-N16R8 = 8 MB OCTAL PSRAM (see

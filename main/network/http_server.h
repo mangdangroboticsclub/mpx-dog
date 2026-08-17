@@ -6,18 +6,16 @@
 namespace network {
 
 /**
- * @brief Root directory inside LittleFS where www assets are stored.
- */
-constexpr const char *WWW_ROOT = "/fs/www";
-
-/**
  * @brief Start the HTTP / WebSocket server on port 80.
  *
- * Serves PWA static assets from LittleFS under WWW_ROOT.
- * Supports pre-compressed .gz files with Content-Encoding: gzip.
+ * Serves PWA static assets directly from the memory-mapped firmware image
+ * (see network/www_assets.h). Assets are stored pre-gzipped only and are
+ * always sent with Content-Encoding: gzip; nothing is read from LittleFS,
+ * so the UI is unaffected by the state of the storage partition.
+ *
  * Provides WebSocket telemetry at /v1/telemetry/stream.
  *
- * Must be called after init_wifi_ap() and fs::init_littlefs().
+ * Must be called after init_wifi_ap().
  *
  * @return true on success.
  */

@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <cstdint>
 
 #include "esp_log.h"
@@ -11,6 +12,7 @@
 #include "network/wifi_sta.h"
 #include "network/www_assets.h"
 #include "robot/robot.h"
+#include "util/log_ring.h"
 #include "wasm/wasm_sandbox.h"
 
 static const char *TAG = "main";
@@ -27,6 +29,11 @@ static void init_nvs()
 
 extern "C" void app_main(void)
 {
+	// First, so the ring captures boot as well — the failures that are
+	// hardest to debug over Wi-Fi are the ones that happen before the web
+	// server is even up. Chains to the UART sink, so serial is unchanged.
+	util::log_ring_init();
+
 	init_nvs();
 
 	// ── Robot HAL (servo bus, gait task on Core 1) ─────────────
@@ -34,10 +41,22 @@ extern "C" void app_main(void)
 		ESP_LOGE(TAG, "Robot HAL init failed — continuing without servo control");
 	}
 
-	// Mount LittleFS (for .wasm storage and PWA assets)
+	// Mount LittleFS (for .wasm skills and saved Lua scripts — the PWA is
+	// no longer stored here, so a full partition can't take the web UI down)
 	if (!fs::init_littlefs()) {
 		ESP_LOGE(TAG, "LittleFS mount failed — wasm sandbox unavailable");
 		return;
+	}
+
+	{
+		std::size_t total = 0, used = 0;
+		if (fs::stats(total, used) && total > 0 && used * 10 >= total * 9) {
+			ESP_LOGW(TAG, "Storage partition is %zu%% full (%zu of %zu KiB) — "
+			              "skill uploads and script saves will fail",
+			         (used * 100) / total, used / 1024, total / 1024);
+			ESP_LOGW(TAG, "To wipe it: esptool.py --chip esp32s3 -p <port> "
+			              "erase_region 0x290000 0xd70000");
+		}
 	}
 
 	// ── Network: start Wi-Fi AP (Core 0, Priority 6) ──────────
@@ -51,11 +70,13 @@ extern "C" void app_main(void)
 		ESP_LOGW(TAG, "Wi-Fi STA init failed — continuing in AP-only mode");
 	}
 
-	// ── Deploy embedded PWA assets to LittleFS ────────────────
-	if (!network::deploy_www_assets()) {
-		ESP_LOGE(TAG, "PWA asset deployment failed");
-		return;
-	}
+	// ── PWA assets ────────────────────────────────────────────
+	// Nothing to deploy: assets are served straight from the memory-mapped
+	// firmware image, so there is no copy on LittleFS to keep in sync and no
+	// way for a full filesystem to take the web UI down.
+	ESP_LOGI(TAG, "PWA: %d assets, %zu KiB gzipped, served from firmware",
+	         network::embedded_asset_count(),
+	         network::embedded_asset_bytes() / 1024);
 
 	// ── Start HTTP + WebSocket server (Core 0, Priority 6) ───
 	if (!network::start_http_server()) {

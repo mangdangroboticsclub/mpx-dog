@@ -1,7 +1,9 @@
 <script>
   import { colors } from "./colors.js";
 
-  let { onNavigate } = $props();
+  // `embedded` is set when this renders inside the Skills screen's Files
+  // segment, which already supplies the yellow header and the title.
+  let { onNavigate, embedded = false } = $props();
 
   const YELLOW = colors.mpx.primary;
 
@@ -124,24 +126,24 @@
 
 <div class="fv-root">
   <!-- ═══ Header ═══ -->
-  <header class="fv-header" style="background: {YELLOW}">
-    <div class="fv-header-row">
-      <!-- <button class="fv-back-btn" onclick={() => { if (currentDir !== "/") { goUp(); } else if (onNavigate) onNavigate("home"); }} aria-label="Go back">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="19" y1="12" x2="5" y2="12"/>
-          <polyline points="12 19 5 12 12 5"/>
-        </svg>
-      </button> -->
-      <h2 class="fv-title">Files</h2>
-      <div class="fv-header-actions">
-        <button class="fv-pill-btn fv-hidden-toggle"
-                class:fv-hidden-active={showHidden}
-                onclick={() => { showHidden = !showHidden; }}>
-          {showHidden ? '👁 Hidden' : '👁‍🗨'}
-        </button>
-        <button class="fv-pill-btn" onclick={() => fetchDir(currentDir)}>↻</button>
+  <header class="fv-header" class:fv-header-embedded={embedded}
+          style={embedded ? "" : `background: ${YELLOW}`}>
+    <!-- When embedded under the Skills screen's own yellow header, the title
+         row would be a second "Files" heading directly beneath the segmented
+         control. The actions move into the search row instead. -->
+    {#if !embedded}
+      <div class="fv-header-row">
+        <h2 class="fv-title">Files</h2>
+        <div class="fv-header-actions">
+          <button class="fv-pill-btn fv-hidden-toggle"
+                  class:fv-hidden-active={showHidden}
+                  onclick={() => { showHidden = !showHidden; }}>
+            {showHidden ? '👁 Hidden' : '👁‍🗨'}
+          </button>
+          <button class="fv-pill-btn" onclick={() => fetchDir(currentDir)}>↻</button>
+        </div>
       </div>
-    </div>
+    {/if}
 
     <!-- Search bar -->
     <div class="fv-search-wrap">
@@ -155,6 +157,14 @@
         placeholder="Search files…"
         bind:value={searchQuery}
       />
+      {#if embedded}
+        <button class="fv-pill-btn fv-hidden-toggle"
+                class:fv-hidden-active={showHidden}
+                onclick={() => { showHidden = !showHidden; }}>
+          {showHidden ? '👁 Hidden' : '👁‍🗨'}
+        </button>
+        <button class="fv-pill-btn" onclick={() => fetchDir(currentDir)}>↻</button>
+      {/if}
     </div>
   </header>
 
@@ -258,23 +268,6 @@
     margin-bottom: 8px;
   }
 
-  .fv-back-btn {
-    width: 30px;
-    height: 30px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: none;
-    background: rgba(0,0,0,0.12);
-    border-radius: 50%;
-    cursor: pointer;
-    color: #000;
-    flex-shrink: 0;
-  }
-  .fv-back-btn:hover {
-    background: rgba(0,0,0,0.2);
-  }
-
   .fv-title {
     font-size: 1.05rem;
     font-weight: 800;
@@ -321,6 +314,21 @@
     background: rgba(255,255,255,0.5);
     border-radius: 8px;
     padding: 6px 10px;
+  }
+
+  /* Embedded in the Skills screen: the yellow band and the title belong to
+     the parent, so this header is just the search row on the page ground. */
+  .fv-header-embedded {
+    background: #f5f5f5;
+    padding: 10px 14px 4px;
+  }
+  .fv-header-embedded .fv-search-wrap {
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
+  }
+  .fv-header-embedded .fv-pill-btn {
+    background: #ececec;
+    flex-shrink: 0;
   }
   .fv-search-icon {
     flex-shrink: 0;

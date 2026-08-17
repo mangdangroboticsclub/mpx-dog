@@ -212,12 +212,21 @@ bool imu_init()
     bus_cfg.quadhd_io_num   = -1;
     bus_cfg.max_transfer_sz = 128;
 
+    // This bus is SHARED with the four AT32 servo driver boards (same host,
+    // same three pins, their own CS lines — see robot/driver_board.c). Whoever
+    // initialises it first wins; the second caller gets ESP_ERR_INVALID_STATE,
+    // which means "already up", not a failure. robot::init() currently brings
+    // the driver boards up before the IMU, so in practice this is the second
+    // caller — but neither side may assume an order.
     esp_err_t err = spi_bus_initialize(SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGI(TAG, "SPI bus already initialised (shared with servo boards)");
+    } else if (err != ESP_OK) {
         ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
         return false;
+    } else {
+        ESP_LOGI(TAG, "SPI bus initialised");
     }
-    ESP_LOGI(TAG, "SPI bus initialised");
 
     // ── Add SPI device (IMU) ───────────────────────────────────
     spi_device_interface_config_t dev_cfg = {};

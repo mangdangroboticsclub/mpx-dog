@@ -86,7 +86,8 @@ static SemaphoreHandle_t inflight_sem()
 std::string gateway_request(const char *method,
                             const char *path,
                             const std::string &body,
-                            bool &ok)
+                            bool &ok,
+                            int *status_out)
 {
     ok = false;
 
@@ -247,6 +248,7 @@ std::string gateway_request(const char *method,
         if (space1) {
             int status_code = std::atoi(space1 + 1);
             ok = (status_code >= 200 && status_code < 300);
+            if (status_out) *status_out = status_code;
             ESP_LOGI(TAG, "Gateway HTTP status: %d for %s %s",
                      status_code, method, path);
         } else {

@@ -36,16 +36,56 @@
   // and shows a modal so the user can approve/deny from any screen.
   const PERMISSION_WS_URL = `ws://${location.host}/v1/chat/ui`;
 
-  let permissionWs = $state(null);
+  /**
+   * The socket handle is a PLAIN `let`, not `$state`, and this is the whole
+   * point rather than an oversight.
+   *
+   * It used to be `$state(null)`, and `connectPermissionWs()` read it on its
+   * first line — inside the `$effect` below. That made the effect depend on
+   * it, so the socket's own `onopen` assignment invalidated the effect that
+   * had just created the socket: cleanup closed it, `onclose` nulled the
+   * handle, the effect re-ran, opened another one, and round it went. Each
+   * turn of the loop also fired an immediate /v1/wifi/status, which is why the
+   * robot logged that endpoint every ~60 ms and then ran out of sockets
+   * entirely ("error in accept (23)", OPEN SOCKETS = 16/16). Nothing renders
+   * from this handle, so it has no business being reactive.
+   *
+   * Same shape as ChatView's socket, which was hardened for this already.
+   */
+  let permissionWs = null;
+  let permReconnect = null;   // single-flight: never stack pending reconnects
+  let permStopped = false;    // set on teardown so a close does not reconnect
   let pendingActions = $state([]);
 
+  function schedulePermReconnect() {
+    if (permReconnect || permStopped) return;
+    permReconnect = setTimeout(() => {
+      permReconnect = null;
+      // A hidden tab holds a socket the robot only has five of; it will
+      // reconnect when the screen comes back.
+      if (!permStopped && document.visibilityState !== "hidden") connectPermissionWs();
+    }, 3000);
+  }
+
   function connectPermissionWs() {
-    if (permissionWs && permissionWs.readyState === WebSocket.OPEN) return;
+    if (permStopped) return;
+    // CONNECTING counts: without it, a reconnect fired while the previous
+    // handshake was still in flight opened a second socket for the same slot.
+    if (permissionWs && (permissionWs.readyState === WebSocket.OPEN ||
+                         permissionWs.readyState === WebSocket.CONNECTING)) return;
+
+    if (permissionWs) {
+      permissionWs.onopen = permissionWs.onclose =
+        permissionWs.onerror = permissionWs.onmessage = null;
+      try { permissionWs.close(); } catch { /* already gone */ }
+      permissionWs = null;
+    }
 
     try {
       const ws = new WebSocket(PERMISSION_WS_URL);
-      ws.onopen = () => { permissionWs = ws; };
+      permissionWs = ws;   // claim the slot now, so a re-entrant call is guarded
       ws.onmessage = (event) => {
+        if (ws !== permissionWs) return;
         try {
           const data = JSON.parse(event.data);
           if (data.type === "openclaw_action" && data.action_id) {
@@ -62,11 +102,23 @@
         } catch { /* ignore malformed JSON */ }
       };
       ws.onclose = () => {
+        if (ws !== permissionWs) return;   // a replaced socket closing: not ours
         permissionWs = null;
-        setTimeout(connectPermissionWs, 3000);
+        schedulePermReconnect();
       };
-      ws.onerror = () => { ws.close(); };
-    } catch { /* ignore */ }
+      ws.onerror = () => { if (ws === permissionWs) { try { ws.close(); } catch {} } };
+    } catch { schedulePermReconnect(); }
+  }
+
+  function disconnectPermissionWs() {
+    permStopped = true;
+    if (permReconnect) { clearTimeout(permReconnect); permReconnect = null; }
+    if (permissionWs) {
+      permissionWs.onopen = permissionWs.onclose =
+        permissionWs.onerror = permissionWs.onmessage = null;
+      try { permissionWs.close(); } catch { /* already gone */ }
+      permissionWs = null;
+    }
   }
 
   function respondPermission(actionId, approved) {
@@ -82,13 +134,18 @@
   }
 
   // ── Poll on mount, refresh every 15 s ───────────────────────
+  // Deliberately reads NO reactive state. An $effect re-runs whenever anything
+  // it touched changes, and everything in here — a poll, an interval, a socket
+  // — is a side effect that must happen exactly once per mount. Reading a
+  // single `$state` in this block is enough to turn it into a request loop.
   $effect(() => {
+    permStopped = false;
     pollNetworkStatus();
     pollTimer = setInterval(pollNetworkStatus, 15_000);
     connectPermissionWs();
     return () => {
       clearInterval(pollTimer);
-      if (permissionWs) permissionWs.close();
+      disconnectPermissionWs();
     };
   });
 

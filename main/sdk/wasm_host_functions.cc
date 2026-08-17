@@ -1,6 +1,7 @@
 #include "sdk/wasm_host_functions.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 
 #include "esp_log.h"
@@ -9,11 +10,22 @@
 #include "wasm_export.h"
 
 #include "robot/robot.h"
+extern "C" {
+#include "robot/driver_board.h"
+}
 #include "wasm/wasm_sandbox.h"
 
 static const char *TAG = "wasm_sdk";
 
 namespace sdk {
+
+int32_t host_mpx_abi_version(wasm_exec_env_t exec_env)
+{
+	// Deliberately does NOT check was_cancelled(): a skill asking what it is
+	// talking to should always get an answer.
+	(void)exec_env;
+	return MPX_ABI_VERSION;
+}
 
 int32_t host_print(wasm_exec_env_t exec_env,
 				   int32_t text_ptr, int32_t len)
@@ -21,7 +33,7 @@ int32_t host_print(wasm_exec_env_t exec_env,
 	// Check for watchdog cancellation — if the sandbox timeout has
 	// fired, bail out so the WASM thread can terminate promptly.
 	if (wasm::was_cancelled()) {
-		return -1;
+		return MPX_ERR_CANCELLED;
 	}
 
 	if (len <= 0 || text_ptr == 0) {
@@ -68,7 +80,7 @@ int32_t host_robot_gait(wasm_exec_env_t exec_env,
 {
 	// Check for watchdog cancellation
 	if (wasm::was_cancelled()) {
-		return -1;
+		return MPX_ERR_CANCELLED;
 	}
 
 	// With "$" signature, name_ptr is already a native pointer
@@ -151,7 +163,7 @@ int32_t host_robot_set_body_pose(wasm_exec_env_t exec_env,
                                  float roll_deg, float pitch_deg,
                                  float yaw_deg)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 
 	robot::set_body_attitude(roll_deg, pitch_deg, yaw_deg);
 	ESP_LOGI(TAG, "robot_set_body_pose: roll=%.1f pitch=%.1f yaw=%.1f",
@@ -162,7 +174,7 @@ int32_t host_robot_set_body_pose(wasm_exec_env_t exec_env,
 int32_t host_robot_set_attitude_speed(wasm_exec_env_t exec_env,
                                       int32_t dps)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 
 	robot::set_attitude_speed(static_cast<float>(dps));
 	ESP_LOGI(TAG, "robot_set_attitude_speed: %" PRId32 " dps", dps);
@@ -173,7 +185,7 @@ int32_t host_robot_set_attitude_speed_xyz(wasm_exec_env_t exec_env,
                                           int32_t roll_dps, int32_t pitch_dps,
                                           int32_t yaw_dps)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 
 	robot::set_attitude_speed_xyz(static_cast<float>(roll_dps),
 	                              static_cast<float>(pitch_dps),
@@ -281,6 +293,21 @@ int32_t host_robot_read_position(wasm_exec_env_t exec_env,
 	}
 	int32_t val = static_cast<int32_t>(robot::read_position(static_cast<int>(id)));
 	ESP_LOGD(TAG, "read_position: id=%" PRId32 " pos=%" PRId32, id, val);
+	return val;
+}
+
+int32_t host_robot_read_angle_cdeg(wasm_exec_env_t exec_env,
+								   int32_t id)
+{
+	// Same frame as robot_set_servo_angle(), so read -> compare -> correct
+	// actually converges. robot_read_position() is the OPPOSITE frame; see
+	// the frame note at the top of robot.h.
+	if (id < 1 || id > 12) {
+		ESP_LOGW(TAG, "read_angle_cdeg: invalid id %" PRId32, id);
+		return INT32_MIN;
+	}
+	int32_t val = static_cast<int32_t>(robot::read_angle_cdeg(static_cast<int>(id)));
+	ESP_LOGD(TAG, "read_angle_cdeg: id=%" PRId32 " cdeg=%" PRId32, id, val);
 	return val;
 }
 
@@ -433,7 +460,7 @@ int32_t host_robot_delay_ms(wasm_exec_env_t exec_env,
 int32_t host_robot_ik_fr(wasm_exec_env_t exec_env,
 						 float x, float th0, float z)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 	ESP_LOGD(TAG, "ik_fr: x=%.1f th0=%.1f z=%.1f", x, th0, z);
 	robot::front_right_ik(x, th0, z);
 	return 0;
@@ -442,7 +469,7 @@ int32_t host_robot_ik_fr(wasm_exec_env_t exec_env,
 int32_t host_robot_ik_fl(wasm_exec_env_t exec_env,
 						 float x, float th0, float z)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 	ESP_LOGD(TAG, "ik_fl: x=%.1f th0=%.1f z=%.1f", x, th0, z);
 	robot::front_left_ik(x, th0, z);
 	return 0;
@@ -451,7 +478,7 @@ int32_t host_robot_ik_fl(wasm_exec_env_t exec_env,
 int32_t host_robot_ik_rr(wasm_exec_env_t exec_env,
 						 float x, float th0, float z)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 	ESP_LOGD(TAG, "ik_rr: x=%.1f th0=%.1f z=%.1f", x, th0, z);
 	robot::rear_right_ik(x, th0, z);
 	return 0;
@@ -460,7 +487,7 @@ int32_t host_robot_ik_rr(wasm_exec_env_t exec_env,
 int32_t host_robot_ik_rl(wasm_exec_env_t exec_env,
 						 float x, float th0, float z)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 	ESP_LOGD(TAG, "ik_rl: x=%.1f th0=%.1f z=%.1f", x, th0, z);
 	robot::rear_left_ik(x, th0, z);
 	return 0;
@@ -473,7 +500,7 @@ int32_t host_robot_ik_rl(wasm_exec_env_t exec_env,
 int32_t host_robot_imu_read(wasm_exec_env_t exec_env,
 							int32_t buffer_ptr)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 	if (buffer_ptr == 0) {
 		ESP_LOGW(TAG, "robot_imu_read: null buffer pointer");
 		return -1;
@@ -512,10 +539,301 @@ int32_t host_robot_imu_read(wasm_exec_env_t exec_env,
 
 int32_t host_robot_imu_print(wasm_exec_env_t exec_env)
 {
-	if (wasm::was_cancelled()) return -1;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
 	ESP_LOGV(TAG, "robot_imu_print");
 	robot::imu_print();
 	return 0;
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  Low-level servo host functions  (Unitree-style)
+//
+//  These bypass the gait and the IK layer and talk to the AT32 driver boards
+//  directly, so a skill can stream joint commands and tune the control gains.
+//
+//  Two paths, because the hardware has two:
+//
+//   - COMMAND path (fast): position + current limit, staged per servo and
+//     pushed to all four boards in one commit. This is the per-tick path.
+//     Its kp/kd fields exist in the wire frame but the stock AT32 firmware
+//     ignores them — see servo_stage()'s note.
+//
+//   - CONFIG path (slow): kp_position, kd_position, kp_current, kff_current,
+//     max_pwm_duty. Each write is a request/reply pair over SPI, roughly a
+//     millisecond, and it must not interleave with gait traffic. Set these
+//     once when the skill starts, not every tick.
+//
+//  Everything here requires the skill to hold the bus (servo_lock), which
+//  parks the gait. The sandbox force-releases the lock when the skill ends.
+// ═══════════════════════════════════════════════════════════════
+
+namespace {
+
+// Resolve a WASM linear-memory offset to a native pointer, checking that the
+// whole span is inside the sandbox's memory — a skill must not be able to
+// hand us an offset that walks off the end of its heap.
+void *wasm_ptr(wasm_exec_env_t exec_env, int32_t offset, uint32_t bytes)
+{
+	if (offset == 0) return nullptr;
+	wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+	if (!inst) return nullptr;
+	if (!wasm_runtime_validate_app_addr(inst, static_cast<uint32_t>(offset), bytes)) {
+		ESP_LOGW(TAG, "servo: rejected out-of-bounds pointer %" PRId32 " (+%" PRIu32 ")",
+				 offset, bytes);
+		return nullptr;
+	}
+	return wasm_runtime_addr_app_to_native(inst, static_cast<uint32_t>(offset));
+}
+
+inline bool servo_id_ok(int32_t id) { return id >= 1 && id <= 12; }
+
+}  // namespace
+
+int32_t host_servo_lock(wasm_exec_env_t exec_env)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	return robot::servo_lock() ? 0 : -1;
+}
+
+int32_t host_servo_unlock(wasm_exec_env_t exec_env)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	robot::servo_unlock();
+	return 0;
+}
+
+int32_t host_servo_is_locked(wasm_exec_env_t exec_env)
+{
+	// Answers "do *I* hold the bus", which is the only useful question for a
+	// skill. It used to answer "is the bus held by anyone", so a skill could
+	// see 1 while Servo Studio owned it, conclude it was safe to write, and
+	// be wrong.
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	return robot::servo_owned_by_skill() ? 1 : 0;
+}
+
+// ── Config path: the tunable gains ──────────────────────────────
+
+/* Parameters that define the joint's physical angle mapping rather than its
+ * control response. A skill must never write these:
+ *
+ *   1 MIN_POSITION_ADC    2 MAX_POSITION_ADC    3 RANGE_POSITION_DEG
+ *
+ * They are the board's own calibration. Change one and every angle command
+ * afterwards means something different — including the gait's, including the
+ * NVS offsets calibrated against the old mapping — and servo_save_config()
+ * burns the new value into the driver board's flash where a reboot will not
+ * clear it. A typo in a skill could silently mis-calibrate a joint for good.
+ *
+ * Reads stay available through servo_get_gain(), which is how a skill should
+ * discover the mapping it is working in. Genuine recalibration goes through
+ * Servo Studio, where a human is watching the joint move.
+ */
+static inline bool param_is_read_only(int32_t param)
+{
+	return param == DB_PARAM_MIN_POSITION_ADC
+		|| param == DB_PARAM_MAX_POSITION_ADC
+		|| param == DB_PARAM_RANGE_POSITION_DEG;
+}
+
+int32_t host_servo_set_gain(wasm_exec_env_t exec_env,
+							int32_t id, int32_t param, float value)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!servo_id_ok(id) || param < 0 || param >= DB_PARAM_COUNT) return -1;
+	if (param_is_read_only(param)) {
+		ESP_LOGW(TAG, "servo_set_gain: param %" PRId32 " is calibration, not a gain "
+					  "— read-only from a skill", param);
+		return -4;
+	}
+	if (!robot::servo_owned_by_skill()) {
+		ESP_LOGW(TAG, "servo_set_gain: bus not locked — call servo_lock() first");
+		return -2;
+	}
+	if (!driver_board_set_param(id, param, value)) return -3;
+	ESP_LOGD(TAG, "servo_set_gain: id=%" PRId32 " p=%" PRId32 " v=%.4f", id, param, value);
+	return 0;
+}
+
+int32_t host_servo_get_gain(wasm_exec_env_t exec_env,
+							int32_t id, int32_t param, int32_t out_ptr)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!servo_id_ok(id) || param < 0 || param >= DB_PARAM_COUNT) return -1;
+	if (!robot::servo_owned_by_skill()) return -2;
+
+	float *out = static_cast<float *>(wasm_ptr(exec_env, out_ptr, sizeof(float)));
+	if (!out) return -1;
+
+	float v = 0.0f;
+	if (!driver_board_get_param(id, param, &v)) return -3;
+	*out = v;
+	return 0;
+}
+
+/* id 0 means "every board"; 1..12 means "the board that servo lives on".
+ *
+ * These used to compute `servo_id_ok(id) ? (id-1)/3 : -1`, and -1 is
+ * driver_board's code for ALL BOARDS. So id 13, id -5 and id 9999 all quietly
+ * meant "every board" — and for servo_restore_config that is a factory reset
+ * of all twelve servos' calibration, returned as 0 for success. Every other
+ * servo_* entry point rejects a bad id with -1; these two now do too.
+ */
+static inline bool config_scope_ok(int32_t id, int *board_out)
+{
+	if (id == 0) { *board_out = -1; return true; }            // all boards
+	if (!servo_id_ok(id)) return false;                        // reject, do not widen
+	*board_out = (static_cast<int>(id) - 1) / 3;
+	return true;
+}
+
+int32_t host_servo_save_config(wasm_exec_env_t exec_env, int32_t id)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	int board;
+	if (!config_scope_ok(id, &board)) return -1;
+	if (!robot::servo_owned_by_skill()) return -2;
+	return driver_board_save_config(board) ? 0 : -3;
+}
+
+int32_t host_servo_restore_config(wasm_exec_env_t exec_env, int32_t id)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	int board;
+	if (!config_scope_ok(id, &board)) return -1;
+	if (!robot::servo_owned_by_skill()) return -2;
+	return driver_board_factory_restore(board) ? 0 : -3;
+}
+
+// ── Command path: stage / commit ────────────────────────────────
+
+int32_t host_servo_stage(wasm_exec_env_t exec_env,
+						 int32_t id, float q_deg, float tau_ma,
+						 float kp, float kd)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!servo_id_ok(id)) return -1;
+	if (!robot::servo_owned_by_skill()) return -2;
+
+	driver_board_stage(id, DB_MODE_POSITION, q_deg,
+					   static_cast<int16_t>(tau_ma),
+					   static_cast<uint16_t>(kp < 0 ? 0 : kp),
+					   static_cast<uint16_t>(kd < 0 ? 0 : kd));
+	return 0;
+}
+
+int32_t host_servo_commit(wasm_exec_env_t exec_env)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!robot::servo_owned_by_skill()) return -2;
+	return driver_board_commit() ? 0 : -3;
+}
+
+// servo_write_all: the closest thing to a Unitree LowCmd — an array of
+// { q_deg, tau_ma, kp, kd } indexed by servo 1..12, staged and committed in
+// one call, so a whole-robot update costs four SPI frames.
+int32_t host_servo_write_all(wasm_exec_env_t exec_env,
+							 int32_t cmd_ptr, int32_t count)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (count < 1 || count > 12) return -1;
+	if (!robot::servo_owned_by_skill()) return -2;
+
+	const uint32_t bytes = static_cast<uint32_t>(count) * 4u * sizeof(float);
+	const float *cmd = static_cast<const float *>(wasm_ptr(exec_env, cmd_ptr, bytes));
+	if (!cmd) return -1;
+
+	for (int32_t i = 0; i < count; ++i) {
+		const float *c = cmd + i * 4;
+		driver_board_stage(static_cast<int>(i) + 1, DB_MODE_POSITION, c[0],
+						   static_cast<int16_t>(c[1]),
+						   static_cast<uint16_t>(c[2] < 0 ? 0 : c[2]),
+						   static_cast<uint16_t>(c[3] < 0 ? 0 : c[3]));
+	}
+	return driver_board_commit() ? 0 : -3;
+}
+
+// servo_read_all: the LowState side. Four floats per servo:
+//   q_deg   present position, raw AT32 degrees 0..270
+//   tau_ma  present motor current, mA (signed)
+//   temp_c  NTC temperature, degC — NaN if that servo never answered
+//   q_raw   the same position on the SCS 0..1023 scale
+//
+// There is deliberately no velocity field: the boards do not measure one, and
+// a hardcoded zero in a struct named "dq" is worse than its absence.
+int32_t host_servo_read_all(wasm_exec_env_t exec_env, int32_t out_ptr)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+
+	float *out = static_cast<float *>(wasm_ptr(exec_env, out_ptr, 12u * 4u * sizeof(float)));
+	if (!out) return -1;
+
+	for (int id = 1; id <= 12; ++id) {
+		const uint16_t raw = driver_board_present_position(id);
+		const float    t   = driver_board_present_temperature(id);
+		float *o = out + (id - 1) * 4;
+		o[0] = static_cast<float>(raw) * 270.0f / 1024.0f;
+		o[1] = static_cast<float>(driver_board_present_current(id));
+		o[2] = (t > DB_TEMP_INVALID) ? t : NAN;
+		o[3] = static_cast<float>(raw);
+	}
+	return 0;
+}
+
+int32_t host_servo_read(wasm_exec_env_t exec_env, int32_t id, int32_t out_ptr)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!servo_id_ok(id)) return -1;
+
+	float *out = static_cast<float *>(wasm_ptr(exec_env, out_ptr, 4u * sizeof(float)));
+	if (!out) return -1;
+
+	const uint16_t raw = driver_board_present_position(id);
+	const float    t   = driver_board_present_temperature(id);
+	out[0] = static_cast<float>(raw) * 270.0f / 1024.0f;
+	out[1] = static_cast<float>(driver_board_present_current(id));
+	out[2] = (t > DB_TEMP_INVALID) ? t : NAN;
+	out[3] = static_cast<float>(raw);
+	return 0;
+}
+
+// Refresh the feedback cache while the gait is parked. With the gait running
+// the cache is already refreshed every tick and this is unnecessary.
+int32_t host_servo_poll(wasm_exec_env_t exec_env)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!robot::servo_owned_by_skill()) return -2;
+	bool ok = true;
+	for (int b = 0; b < 4; ++b) ok &= driver_board_poll_board(b);
+	return ok ? 0 : -3;
+}
+
+// mode: 0 = idle (motor off), 1 = position hold, 2 = torque
+int32_t host_servo_direct(wasm_exec_env_t exec_env,
+						  int32_t id, int32_t mode, float q_deg, float tau_ma)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!servo_id_ok(id)) return -1;
+	if (!robot::servo_owned_by_skill()) return -2;
+
+	const uint16_t m = (mode == 1) ? DB_MODE_POSITION
+					 : (mode == 2) ? DB_MODE_TORQUE
+								   : DB_MODE_IDLE;
+	return driver_board_direct(id, m, q_deg, static_cast<int16_t>(tau_ma)) ? 0 : -3;
+}
+
+// Bitmask of servos that answered a parameter read: bit 0 = servo 1.
+int32_t host_servo_scan(wasm_exec_env_t exec_env)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!robot::servo_owned_by_skill()) return -2;
+	int32_t mask = 0;
+	for (int id = 1; id <= 12; ++id) {
+		float v;
+		if (driver_board_get_param(id, DB_PARAM_KP_POSITION, &v)) mask |= (1 << (id - 1));
+	}
+	return mask;
 }
 
 }  // namespace sdk

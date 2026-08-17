@@ -1,6 +1,8 @@
 #include "robot/robot.h"
 
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -13,7 +15,7 @@
 #include "nvs.h"
 
 extern "C" {
-#include "SCServo.h"
+#include "robot/driver_board.h"
 }
 
 #include "robot/stanford_gait.h"
@@ -41,8 +43,14 @@ float s_offset[13] = {};
 uint16_t s_goal_pos[13]   = {};
 uint16_t s_goal_speed[13] = {};
 
-// ── Sync‑write ID list for all 12 servos ─────────────────────
-const uint8_t s_sync_ids[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+// ── Servo bus ownership ──────────────────────────────────────
+// While the bus is owned by anything other than the gait, flush() holds the
+// last pose instead of writing, so nothing fights over the SPI transactions.
+// Two owners exist and must not steal from each other: the Servo Studio
+// console (a human) and a WASM skill doing low-level control.
+enum : int { BUS_FREE = 0, BUS_STUDIO = 1, BUS_SKILL = 2 };
+volatile int  s_bus_owner   = BUS_FREE;
+volatile bool s_studio_mode = false;   // true whenever the gait is parked
 
 // ── Gait task handle ─────────────────────────────────────────
 TaskHandle_t s_gait_task_handle = nullptr;
@@ -339,22 +347,46 @@ bool init()
     vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_LOGI(TAG, "Servo power enabled (GPIO%d)", SERVO_POWER_PIN);
 
-    // ── Initialise UART for SCSCL servos ────────────────────────
-    // UART_NUM_1 (UART1), TX=GPIO4, RX=GPIO5, no RTS, 1 Mbaud
-    ESP_LOGI(TAG, "Initialising SCSCL bus on UART1 (TX=%d, RX=%d, %d baud)...",
-             SERVO_TX_PIN, SERVO_RX_PIN, SERVO_BAUD_RATE);
-    ftServo_InitWithType(SERVO_SCSCL, SERVO_TX_PIN, SERVO_RX_PIN, -1, SERVO_BAUD_RATE);
-    ESP_LOGI(TAG, "UART init done");
-
-    // ── Diagnostic: Ping servo ID 1 to verify bus communication ─
-    vTaskDelay(pdMS_TO_TICKS(100));
-    int ping_result = Ping(1);
-    if (ping_result > 0) {
-        ESP_LOGI(TAG, "Servo ping OK — ID=1 responded with model=%d", ping_result);
+    // ── Initialise the SPI servo driver boards ──────────────────
+    // Four AT32F413 boards, three servos each, on SPI2_HOST. The bus is shared
+    // with the IMU, so driver_board_init() attaches instead of failing if the
+    // IMU brought it up first.
+    ESP_LOGI(TAG, "Initialising SPI servo driver boards...");
+    if (!driver_board_init()) {
+        ESP_LOGE(TAG, "Driver board init FAILED — no servo control");
     } else {
-        ESP_LOGW(TAG, "Servo ping FAILED — ID=1 did not respond (err=%d)", ping_result);
-        ESP_LOGW(TAG, "Check: power, baud rate (configured %d), wiring (TX→RX cross?)",
-                 SERVO_BAUD_RATE);
+        ESP_LOGI(TAG, "Driver board init done");
+    }
+
+    // ── Diagnostic: probe all 12 channels ───────────────────────
+    // One parameter read per servo. Unlike the old single ping on ID 1, this
+    // says WHICH channels are alive — and that is the useful answer, because a
+    // whole silent board of three points at that board's CS line or its power
+    // rather than at the servos.
+    vTaskDelay(pdMS_TO_TICKS(100));
+    {
+        int alive = 0, n = 0;
+        char list[64];
+        list[0] = '\0';
+        for (int i = 1; i <= 12; ++i) {
+            float v;
+            if (driver_board_get_param(i, DB_PARAM_KP_POSITION, &v)) {
+                alive++;
+                n += std::snprintf(list + n, sizeof(list) - n, "%s%d", n ? "," : "", i);
+            }
+        }
+        if (alive == 12) {
+            ESP_LOGI(TAG, "Servo probe OK — all 12 channels responded");
+        } else if (alive > 0) {
+            ESP_LOGW(TAG, "Servo probe — %d/12 responded: [%s]", alive, list);
+            ESP_LOGW(TAG, "Silent channels: check board power and CS wiring "
+                          "(FR=9 FL=10 RR=21 RL=14)");
+        } else {
+            ESP_LOGW(TAG, "Servo probe FAILED — no driver board responded");
+            ESP_LOGW(TAG, "Check: servo power (GPIO%d), SPI wiring "
+                          "(MOSI=11 MISO=13 CLK=12), and AT32 board firmware",
+                     SERVO_POWER_PIN);
+        }
     }
 
     // ── Restore persisted config ────────────────────────────────
@@ -532,62 +564,200 @@ void reset_offsets()
 
 // ── Servo feedback ───────────────────────────────────────────
 
+// Every read below is served from the feedback cache that the driver boards
+// refresh on each sync_write, so at gait rate they cost no SPI traffic at all.
+// When the gait is parked (studio mode) that cache goes stale — poll the board
+// first if you need a fresh value there.
+
 int read_position(int servo_id)
 {
+    // AT32 frame, 0..1023 — the same frame servo_read()/servo_read_all() and
+    // Servo Studio report. NOT the frame set_servo_angle() accepts; for that,
+    // use read_angle_cdeg() below.
     if (servo_id < 1 || servo_id > 12) return -1;
-    return ReadPos(servo_id);
+    return static_cast<int>(driver_board_present_position(servo_id));
+}
+
+int read_angle_cdeg(int servo_id)
+{
+    // The measured angle in the SAME frame set_servo_angle() takes: signed
+    // centidegrees relative to centre, positive in the direction a positive
+    // `deg` command moves the joint.
+    //
+    // Without this a closed loop is impossible to write correctly. The only
+    // reader that existed, read_position(), is in the opposite frame, so the
+    // obvious read -> compare -> correct loop diverges instead of converging,
+    // silently and at speed. Anyone writing one had to know about the mirror
+    // in driver_board_sync_write(), and nothing in the SDK mentioned it.
+    if (servo_id < 1 || servo_id > 12) return INT32_MIN;
+
+    const int at32 = static_cast<int>(driver_board_present_position(servo_id));
+    const int gait = at32_raw_to_gait_raw(at32);          // -> gait frame
+    const float deg = (gait - 511) / SERVO_DEG_TO_RAW;    // -> deg from centre
+    return static_cast<int>(deg * 100.0f);
 }
 
 int read_speed(int servo_id)
 {
+    // The driver boards do not report speed.
     if (servo_id < 1 || servo_id > 12) return -1;
-    return ReadSpeed(servo_id);
+    return -1;
 }
 
 int read_load(int servo_id)
 {
+    // Closest equivalent the boards report is present motor current.
     if (servo_id < 1 || servo_id > 12) return -1;
-    return ReadLoad(servo_id);
+    return static_cast<int>(driver_board_present_current(servo_id));
 }
 
 int read_voltage(int servo_id)
 {
+    // Not reported by the AT32 boards.
     if (servo_id < 1 || servo_id > 12) return -1;
-    return ReadVoltage(servo_id);
+    return -1;
 }
 
 int read_temperature(int servo_id)
 {
-    if (servo_id < 1 || servo_id > 12) return -1;
-    return ReadTemper(servo_id);
+    const float c = read_temperature_c(servo_id);
+    if (std::isnan(c)) return -1;
+    return static_cast<int>(c);
+}
+
+float read_temperature_c(int servo_id)
+{
+    if (servo_id < 1 || servo_id > 12) return NAN;
+    const float c = driver_board_present_temperature(servo_id);
+    return (c > DB_TEMP_INVALID) ? c : NAN;
 }
 
 int read_moving(int servo_id)
 {
+    // Not reported directly. Infer it from the error against the goal: more
+    // than ~2 raw counts (~0.53°) off target counts as still moving.
+    //
+    // FRAME BUG, FIXED: this used to compare driver_board_present_position()
+    // (AT32 frame) straight against s_goal_pos[] (gait frame). The two run in
+    // opposite directions, so `now - goal` was really `1024 - 2*goal`, which
+    // is within 2 counts only when goal is ~511. Every pose away from centre
+    // therefore read as "still moving" forever, and any skill polling this to
+    // sequence its motions hung. Convert the goal into the measured frame
+    // first — see the frame note in robot.h.
     if (servo_id < 1 || servo_id > 12) return -1;
-    return ReadMove(servo_id);
+    const int now  = static_cast<int>(driver_board_present_position(servo_id));
+    const int goal = gait_raw_to_at32_raw(static_cast<int>(s_goal_pos[servo_id]));
+    return (std::abs(now - goal) > 2) ? 1 : 0;
 }
 
 int read_current(int servo_id)
 {
     if (servo_id < 1 || servo_id > 12) return -1;
-    return ReadCurrent(servo_id);
+    return static_cast<int>(driver_board_present_current(servo_id));
 }
 
 int ping_servo(int servo_id)
 {
-    return Ping(static_cast<uint8_t>(servo_id));
+    if (servo_id < 1 || servo_id > 12) return -1;
+    float v;
+    return driver_board_get_param(servo_id, DB_PARAM_KP_POSITION, &v) ? 1 : -1;
+}
+
+// ── Servo Studio ─────────────────────────────────────────────
+
+void set_studio_mode(bool on)
+{
+    if (on) {
+        if (s_bus_owner == BUS_STUDIO) return;
+        // The console outranks a skill: a human at the keyboard takes the bus.
+        if (s_bus_owner == BUS_SKILL) {
+            ESP_LOGW(TAG, "Studio mode taking the bus from a running skill");
+        }
+        s_bus_owner   = BUS_STUDIO;
+        s_studio_mode = true;
+        // Let the gait task finish the tick it is in before the caller starts
+        // issuing config frames. A tick is ~5 ms; 50 ms is generous.
+        vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGI(TAG, "Studio mode ON — gait parked, servos holding pose");
+    } else {
+        if (s_bus_owner != BUS_STUDIO) return;
+        s_bus_owner   = BUS_FREE;
+        s_studio_mode = false;
+        ESP_LOGI(TAG, "Studio mode OFF — gait resumed");
+    }
+}
+
+bool studio_mode()
+{
+    return s_bus_owner == BUS_STUDIO;
+}
+
+// ── Low-level servo bus lock (WASM skills) ──────────
+
+bool servo_lock()
+{
+    if (s_bus_owner == BUS_SKILL) return true;      // already ours
+    if (s_bus_owner == BUS_STUDIO) {
+        ESP_LOGW(TAG, "servo_lock refused — Servo Studio holds the bus");
+        return false;
+    }
+    s_bus_owner   = BUS_SKILL;
+    s_studio_mode = true;
+    vTaskDelay(pdMS_TO_TICKS(50));   // let the in-flight gait tick finish
+    ESP_LOGI(TAG, "Servo bus locked by skill — gait parked");
+    return true;
+}
+
+void servo_unlock()
+{
+    if (s_bus_owner != BUS_SKILL) return;
+    s_bus_owner   = BUS_FREE;
+    s_studio_mode = false;
+    ESP_LOGI(TAG, "Servo bus released by skill — gait resumed");
+}
+
+bool servo_locked()
+{
+    // "Somebody holds the bus" — Studio OR a skill. Do NOT use this to
+    // authorise a skill's servo writes; use servo_owned_by_skill() for that.
+    return s_bus_owner != BUS_FREE;
+}
+
+bool servo_owned_by_skill()
+{
+    // "THIS skill holds the bus", which is the question every low-level servo
+    // host function actually needs to ask.
+    //
+    // They all used to call servo_locked(), which is also true while Servo
+    // Studio holds the bus. So a skill that never called servo_lock() could
+    // drive all twelve joints for as long as someone happened to have Studio
+    // open in a browser — and its SPI traffic interleaved with Studio's
+    // config request/reply pairs, which is precisely the hazard the ownership
+    // model exists to prevent. The per-frame mutex in driver_board.c keeps
+    // individual frames intact but cannot stop two owners taking turns.
+    //
+    // This is also the correct behaviour when Studio preempts a running skill
+    // (set_studio_mode takes the bus from under it): the skill's subsequent
+    // calls now fail with "bus not locked" instead of quietly succeeding.
+    return s_bus_owner == BUS_SKILL;
+}
+
+void release_skill_bus_lock()
+{
+    if (s_bus_owner == BUS_SKILL) {
+        ESP_LOGW(TAG, "Skill ended while holding the servo bus — releasing");
+        servo_unlock();
+    }
 }
 
 // ── Low-level servo control ──────────────────────────────────
 
 void set_servo_angle(int servo_id, float deg)
 {
-    // Convert degrees to raw pulse for this 0–180° servo:
-    // 0° → 0, 180° → 1023, centre (90°) → 511.
-    // `deg` is RELATIVE to centre, so 1° = 1023/180 ≈ 5.683 raw steps.
-    // (The reference minipupperesp robot uses 0–270° servos and the
-    //  scale deg/0.263 there; this is the same formula for 180°.)
+    // Convert degrees to a raw setpoint for the 0–270° driver boards:
+    // 0° → 0, 270° → 1023, centre (135°) → 511.
+    // `deg` is RELATIVE to centre, so 1° = 1023/270 ≈ 3.789 raw steps.
+    // driver_board_sync_write() rescales this to the AT32's deci-degrees.
     int sig = 511 + static_cast<int>(deg * SERVO_DEG_TO_RAW);
     if (sig < 0)   sig = 0;
     if (sig > 1023) sig = 1023;
@@ -607,21 +777,25 @@ void set_all_servo_speed(uint16_t speed)
 
 void flush()
 {
-    // Ensure at least 5 ms between bus accesses
+    // Studio mode owns the bus — hold the last pose rather than fight it.
+    if (s_studio_mode) return;
+
+    // Ensure at least 5 ms between bus accesses
     static int64_t last_us = 0;
     while (esp_timer_get_time() - last_us < 5000) {
         vTaskDelay(1);
     }
     last_us = esp_timer_get_time();
 
-    uint16_t pos[12], spd[12], tim[12];
+    // The driver boards take a position plus a CURRENT CAP and have no speed
+    // field, so s_goal_speed is deliberately not sent — see set_servo_speed().
+    uint16_t pos[12], cur[12];
     for (int i = 0; i < 12; ++i) {
         pos[i] = s_goal_pos[i + 1];
-        spd[i] = s_goal_speed[i + 1];
-        tim[i] = 0;
+        cur[i] = SERVO_CURRENT_MAX_MA;
     }
-    SyncWritePos(const_cast<uint8_t *>(s_sync_ids), 12, pos, tim, spd);
-    ESP_LOGD(TAG, "flush: SyncWritePos sent");
+    driver_board_sync_write(pos, cur);
+    ESP_LOGD(TAG, "flush: sync_write sent to 4 driver boards");
 }
 
 // ── Per‑leg IK ───────────────────────────────────────────────

@@ -3,7 +3,7 @@
   import Controller from "./Controller.svelte";
   import ControllerLandscape from "./ControllerLandscape.svelte";
   import ActionIcon from "./ActionIcon.svelte";
-  import FileViewer from "./FileViewer.svelte";
+  import SkillsView from "./SkillsView.svelte";
   import UploadView from "./UploadView.svelte";
   import Calibration from "./Calibration.svelte";
   import WiFiSetup from "./WiFiSetup.svelte";
@@ -14,7 +14,7 @@
   import AddActionView from "./AddActionView.svelte";
   import ChatView from "./chat/ChatView.svelte";
   import SkillsMarketplace from "./SkillsMarketplace.svelte";
-  import SkillsManagement from "./SkillsManagement.svelte";
+  import ServoStudio from "./ServoStudio.svelte";
 
   const YELLOW = colors.mpx.primary;
 
@@ -88,10 +88,10 @@
   let showAllAdjust = $state(false);
   let selectedAdjust = $state(0);
   let showCalibration = $state(false);
+  let showStudio = $state(false);
   let showWiFi = $state(false);
   let showAPConfig = $state(false);
   let showMarketplace = $state(false);
-  let showSkillManagement = $state(false);
   let adjustDraggingId = $state(null);
   let adjustDragBarEl = $state(null);
 
@@ -227,9 +227,13 @@
     { id: "headellipse",label: "Head Circle", emoji: "🔄", color: "#AD5FBF",              category: "gait" },
   ];
 
+  // The second tab used to be the raw file browser, which is where every
+  // skill pushed with `mpx-cli deploy` ended up looking like a stray blob.
+  // It is now the Skills screen; the file browser lives inside it as a
+  // segment, so nothing was lost.
   const tabs = [
     { id: "home",    label: "Home",     icon: "home" },
-    { id: "files",   label: "Files",    icon: "files" },
+    { id: "skills",  label: "Skills",   icon: "skills" },
     { id: "chat",    label: "Chat",    icon: "chat" },
     { id: "settings", label: "Settings", icon: "settings" },
   ];
@@ -825,7 +829,7 @@
         <div class="content-spacer"></div>
       </div>
       </div>
-    {:else if activeTab === "files"}
+    {:else if activeTab === "skills"}
       {#if activeView === "upload"}
         <!-- ═══ Upload View ═══ -->
         <div class="upload-page">
@@ -834,7 +838,7 @@
           </div>
         </div>
       {:else}
-        <FileViewer onNavigate={(view) => { if (view === "upload") activeView = "upload"; }} />
+        <SkillsView onNavigate={(view) => { if (view === "upload") activeView = "upload"; }} />
       {/if}
     {:else if activeTab === "chat"}
       <ChatView navigate={(to) => { if (to === "home") activeTab = "home"; }} />
@@ -845,10 +849,10 @@
         <APModeConfig onNavigate={() => showAPConfig = false} {network} />
       {:else if showCalibration}
         <Calibration onBack={() => showCalibration = false} />
+      {:else if showStudio}
+        <ServoStudio onBack={() => showStudio = false} />
       {:else if showMarketplace}
         <SkillsMarketplace onNavigate={() => showMarketplace = false} />
-      {:else if showSkillManagement}
-        <SkillsManagement onNavigate={() => showSkillManagement = false} />
       {:else}
         <div class="settings-page" style="--yellow: {YELLOW}">
           <header class="settings-header" style="background: {YELLOW}">
@@ -904,6 +908,24 @@
                 <polyline points="9 18 15 12 9 6"/>
               </svg>
             </button>
+            <button class="settings-item" onclick={() => showStudio = true}>
+              <div class="settings-item-icon">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/>
+                  <line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/>
+                  <line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/>
+                  <line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/>
+                  <line x1="17" y1="16" x2="23" y2="16"/>
+                </svg>
+              </div>
+              <div class="settings-item-content">
+                <span class="settings-item-label">Servo Studio</span>
+                <span class="settings-item-desc">Tune Kp / Kd gains on the driver boards</span>
+              </div>
+              <svg class="settings-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="9 18 15 12 9 6"/>
+              </svg>
+            </button>
             <button class="settings-item" onclick={() => showMarketplace = true}>
               <div class="settings-item-icon">
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -920,24 +942,11 @@
                 <polyline points="9 18 15 12 9 6"/>
               </svg>
             </button>
-            <button class="settings-item" onclick={() => showSkillManagement = true}>
-              <div class="settings-item-icon">
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                  <line x1="3" y1="9" x2="21" y2="9"/>
-                  <line x1="9" y1="21" x2="9" y2="9"/>
-                  <path d="M14 15l3 3"/>
-                  <path d="M14 18l3-3"/>
-                </svg>
-              </div>
-              <div class="settings-item-content">
-                <span class="settings-item-label">Skill Management</span>
-                <span class="settings-item-desc">Manage installed skills on MPX</span>
-              </div>
-              <svg class="settings-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="9 18 15 12 9 6"/>
-              </svg>
-            </button>
+            <!-- "Skill Management" used to live here. It listed only
+                 marketplace skills, while skills pushed from mpx-cli were
+                 invisible to it — two half-lists on two screens. Both are now
+                 on the Skills tab, so this entry would only be a second way
+                 into a screen that is already one tap away. -->
           </div>
         </div>
       {/if}
@@ -969,10 +978,10 @@
               <path d="M22.4249 22.8274C21.8618 23.1916 21.7785 23.4752 21.505 23.9986H28.7414C28.3722 23.4853 28.1508 23.2153 27.5762 22.8274C27.1631 22.5485 26.9247 22.3715 26.4111 22.2184C25.5855 21.9724 24.6274 22.036 23.774 22.2184C23.1242 22.3573 22.9399 22.4943 22.4249 22.8274Z" fill="#FFE605" stroke="#FFE605"/>
             </svg>
 
-          {:else if tab.id === "files"}
-            <!-- Folder icon -->
+          {:else if tab.id === "skills"}
+            <!-- Lightning bolt — a skill is something that runs, not a folder -->
             <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
             </svg>
           {:else if tab.id === "chat"}
             <!-- Chat bubble -->

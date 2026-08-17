@@ -1,4 +1,5 @@
 #include "wasm/wasm_sandbox.h"
+#include "robot/robot.h"
 #include "wasm/wasm_decrypt.h"
 
 #include <atomic>
@@ -183,6 +184,11 @@ static void *wasm_load_run_thread(void *arg)
 	s_running = true;
 	bool exec_ok = wasm_runtime_call_wasm(exec_env, func, 0, argv);
 	s_running = false;
+
+	// A skill that took the servo bus must not keep it. This runs whether the
+	// skill returned cleanly, trapped, or was killed by the watchdog — otherwise
+	// one crashed skill leaves the gait parked until the robot is rebooted.
+	robot::release_skill_bus_lock();
 
 	wasm_runtime_destroy_exec_env(exec_env);
 

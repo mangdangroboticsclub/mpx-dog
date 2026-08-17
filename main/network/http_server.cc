@@ -3,8 +3,11 @@
 #include "network/marketplace_proxy.h"
 #include "network/wifi_ap.h"
 #include "network/wifi_sta.h"
+#include "network/www_assets.h"
+#include "util/log_ring.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <cerrno>
@@ -15,6 +18,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,6 +26,7 @@
 
 #include "fs/littlefs_manager.h"
 #include "lua/lua_vm.h"
+#include "robot/driver_board.h"
 #include "sdkconfig.h"
 #include "robot/robot.h"
 #include "wasm/wasm_sandbox.h"
@@ -82,27 +87,38 @@ static std::string url_decode(const std::string &src)
     return out;
 }
 
-/* ── Build a full filesystem path from a URI ────────────────── */
-std::string uri_to_path(const char *uri)
+/* ── Map a request URI to an embedded asset name ─────────────── */
+std::string uri_to_asset(const char *uri)
 {
     // Default to index.html for root
     if (std::strcmp(uri, "/") == 0) {
-        return std::string(WWW_ROOT) + "/index.html";
+        return "/index.html";
+    }
+
+    // Servo Studio lives at a bare /studio
+    if (std::strcmp(uri, "/studio") == 0) {
+        return "/studio.html";
     }
 
     // Map favicon.ico to the design-appropriate SVG icon
     if (std::strcmp(uri, "/favicon.ico") == 0) {
 #ifdef CONFIG_PWA_DESIGN_REDESIGN
-        return std::string(WWW_ROOT) + "/md.svg";
+        return "/md.svg";
 #else
-        return std::string(WWW_ROOT) + "/icon.svg";
+        return "/icon.svg";
 #endif
     }
 
-    std::string path = std::string(WWW_ROOT) + uri;
+    std::string path(uri);
 
-    // Strip trailing slash
-    if (path.size() > 0 && path.back() == '/') {
+    // req->uri carries the query string too — "/m.js?v=3" must still resolve.
+    const std::size_t q = path.find('?');
+    if (q != std::string::npos) {
+        path.resize(q);
+    }
+
+    // Directory request → its index
+    if (!path.empty() && path.back() == '/') {
         path += "index.html";
     }
 
@@ -119,85 +135,71 @@ bool accepts_gzip(httpd_req_t *req)
     return std::strstr(buf, "gzip") != nullptr;
 }
 
-/* ── Send a file from the filesystem ────────────────────────── */
-esp_err_t send_file(httpd_req_t *req, const char *fs_path,
-                           const char *mime, bool is_gzipped)
+/* ── ETag for an embedded asset ──────────────────────────────
+ *
+ * The last 8 bytes of a gzip stream are [CRC32 of the uncompressed data]
+ * followed by [uncompressed size], both little-endian. That CRC32 is already a
+ * strong content hash, so we get a correct ETag for free — no hashing of the
+ * payload at request time.
+ */
+static void make_etag(const uint8_t *data, std::size_t len,
+                      char *out, std::size_t out_len)
 {
-    if (!req || !fs_path || !mime) {
-        return ESP_ERR_INVALID_ARG;
+    uint32_t crc = 0;
+    if (len >= 8) {
+        std::memcpy(&crc, data + len - 8, sizeof(crc));
     }
-
-    FILE *f = std::fopen(fs_path, "rb");
-    if (!f) {
-        return ESP_FAIL;
-    }
-
-    // Get file size
-    struct stat st;
-    if (stat(fs_path, &st) != 0) {
-        std::fclose(f);
-        return ESP_FAIL;
-    }
-
-    // Set Content-Type
-    if (httpd_resp_set_type(req, mime) != ESP_OK) {
-        std::fclose(f);
-        return ESP_FAIL;
-    }
-
-    // Set Content-Encoding if serving a gzipped file
-    if (is_gzipped) {
-        if (httpd_resp_set_hdr(req, "Content-Encoding", "gzip") != ESP_OK) {
-            std::fclose(f);
-            return ESP_FAIL;
-        }
-    }
-
-    // Set Cache-Control for static assets
-    if (httpd_resp_set_hdr(req, "Cache-Control",
-                           "public, max-age=31536000, immutable") != ESP_OK) {
-        std::fclose(f);
-        return ESP_FAIL;
-    }
-
-    // Stream the file in chunks (small buffer to save stack)
-    constexpr size_t CHUNK_SIZE = 512;
-    char buf[CHUNK_SIZE];
-    size_t remaining = static_cast<size_t>(st.st_size);
-
-    while (remaining > 0) {
-        const size_t to_read = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
-        const size_t read_bytes = std::fread(buf, 1, to_read, f);
-
-        if (read_bytes == 0) break;
-
-        if (httpd_resp_send_chunk(req, buf, read_bytes) != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to send chunk (connection closed?)");
-            std::fclose(f);
-            return ESP_FAIL;
-        }
-        remaining -= read_bytes;
-    }
-
-    std::fclose(f);
-
-    // Terminate chunked response
-    httpd_resp_send_chunk(req, nullptr, 0);
-    return ESP_OK;
+    std::snprintf(out, out_len, "\"%08x-%x\"",
+                  static_cast<unsigned>(crc), static_cast<unsigned>(len));
 }
 
-/* ── Try to open and serve a file, return ESP_OK on success ─── */
-static bool try_serve(httpd_req_t *req, const std::string &path,
-                      const char *mime, bool is_gzipped)
+/* ── Serve an asset out of the memory-mapped firmware image ────
+ *
+ * Assets are embedded pre-gzipped only (see main/CMakeLists.txt), so `data`
+ * points straight into mapped flash: nothing is read into RAM, no file handle
+ * is opened, and no LittleFS cache is allocated. lwip's own TCP send window is
+ * the only buffer involved.
+ */
+static bool send_embedded(httpd_req_t *req, const char *name)
 {
-    FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    std::fclose(f);
+    std::size_t len = 0;
+    const uint8_t *data = embedded_asset(name, &len);
+    if (!data || len == 0) {
+        return false;
+    }
 
-    return send_file(req, path.c_str(), mime, is_gzipped) == ESP_OK;
+    char etag[32];
+    make_etag(data, len, etag, sizeof(etag));
+
+    // Revalidate rather than cache-forever: asset names are not content-hashed,
+    // so a firmware update must be able to invalidate them. The 304 path costs
+    // one small response instead of re-sending the whole payload.
+    char inm[64] = {};
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", inm, sizeof(inm)) == ESP_OK &&
+        std::strcmp(inm, etag) == 0) {
+        httpd_resp_set_status(req, "304 Not Modified");
+        httpd_resp_set_hdr(req, "ETag", etag);
+        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+        return httpd_resp_send(req, "", 0) == ESP_OK;
+    }
+
+    if (httpd_resp_set_type(req, get_mime_type(name)) != ESP_OK) return false;
+    if (httpd_resp_set_hdr(req, "Content-Encoding", "gzip") != ESP_OK) return false;
+    if (httpd_resp_set_hdr(req, "Cache-Control", "no-cache") != ESP_OK) return false;
+    if (httpd_resp_set_hdr(req, "ETag", etag) != ESP_OK) return false;
+
+    if (!accepts_gzip(req)) {
+        // Every browser advertises gzip. A client that does not (raw curl,
+        // a minimal HTTP library) gets the compressed bytes anyway, because
+        // there is no uncompressed copy on the device any more.
+        ESP_LOGW(TAG, "Client did not advertise gzip for %s - sending compressed", name);
+    }
+
+    return httpd_resp_send(req, reinterpret_cast<const char *>(data),
+                           static_cast<ssize_t>(len)) == ESP_OK;
 }
 
-/* ── Static asset handler (with gzip support) ───────────────── */
+/* ── Static asset handler ───────────────────────────────────── */
 esp_err_t static_handler(httpd_req_t *req)
 {
     // Reject API/WebSocket paths
@@ -205,26 +207,20 @@ esp_err_t static_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    const std::string fs_path = uri_to_path(req->uri);
-    const std::string mime = get_mime_type(fs_path.c_str());
-    const bool gzip = accepts_gzip(req);
+    const std::string name = uri_to_asset(req->uri);
 
-    // Try gzipped first, then uncompressed
-    if ((gzip && try_serve(req, fs_path + ".gz", mime.c_str(), true)) ||
-        try_serve(req, fs_path, mime.c_str(), false)) {
+    if (send_embedded(req, name.c_str())) {
         return ESP_OK;
     }
 
-    // Fallback: serve index.html for SPA routing
-    const std::string fallback = std::string(WWW_ROOT) + "/index.html";
-    if ((gzip && try_serve(req, fallback + ".gz", "text/html; charset=utf-8", true)) ||
-        try_serve(req, fallback, "text/html; charset=utf-8", false)) {
+    // Unknown path → index.html, so client-side SPA routes resolve.
+    if (send_embedded(req, "/index.html")) {
         return ESP_OK;
     }
 
     // Nothing found — send a minimal manual response and return OK
     // (returning ESP_FAIL triggers a cleanup crash in ESP-IDF's httpd)
-    ESP_LOGW(TAG, "File not found, sending 404: %s", req->uri);
+    ESP_LOGW(TAG, "No embedded asset for %s, sending 404", req->uri);
     const char *body = "404 Not Found";
     httpd_resp_set_status(req, "404 Not Found");
     httpd_resp_set_type(req, "text/plain");
@@ -314,6 +310,43 @@ static esp_err_t api_skills_list(httpd_req_t *req)
  */
 static volatile bool s_skill_running = false;
 
+/* ── Last-run bookkeeping ─────────────────────────────────────────
+ * Because the run is async, POST /v1/skills/run can only ever answer
+ * "started" — the outcome arrives up to 60 s later and used to exist
+ * nowhere but the serial log. The web UI showed an alert saying "started"
+ * whether the skill worked or trapped on its first instruction.
+ *
+ * These few variables are what GET /v1/skills/status reports, so the UI can
+ * show a real running indicator and then the actual result. Only the skill
+ * task writes them and only httpd reads them, one skill at a time, so no
+ * lock is needed — but the reader must not see a half-updated name, hence
+ * the name is assigned before `running` flips and never while it is true.
+ */
+/* Defined further down with the filesystem handlers; the status endpoint
+ * below needs it first. */
+static std::string json_escape(const std::string &s);
+
+static std::string s_skill_current;        /* name of the running skill */
+static std::string s_skill_last_name;      /* name of the previous run  */
+static int         s_skill_last_result = -1;   /* SandboxResult, -1 = none yet */
+static int64_t     s_skill_started_us  = 0;
+static int64_t     s_skill_last_ms     = 0;    /* how long the last run took */
+
+/* Human-readable form of wasm::SandboxResult, for the status endpoint. */
+static const char *skill_result_text(int r)
+{
+    switch (static_cast<wasm::SandboxResult>(r)) {
+        case wasm::SandboxResult::Success:           return "ok";
+        case wasm::SandboxResult::LoadFailed:        return "load failed — not a valid .wasm";
+        case wasm::SandboxResult::InstantiateFailed: return "instantiate failed — check imports";
+        case wasm::SandboxResult::FunctionNotFound:  return "no on_start export";
+        case wasm::SandboxResult::ExecutionFailed:   return "trapped during execution";
+        case wasm::SandboxResult::Timeout:           return "timed out (60 s)";
+        case wasm::SandboxResult::NotInitialized:    return "sandbox not initialised";
+        default:                                     return "unknown";
+    }
+}
+
 struct SkillRunArgs { std::string path; std::string name; };
 
 static void skill_run_task(void *arg)
@@ -323,9 +356,223 @@ static void skill_run_task(void *arg)
     auto result = wasm::load_and_run(a->path.c_str(), "on_start", 60000);
     ESP_LOGI(TAG, "Skill '%s' completed with result=%d",
              a->name.c_str(), static_cast<int>(result));
+
+    /* Publish the outcome before clearing `running`, so a poll that sees
+     * running=false is guaranteed to already see the matching result. */
+    s_skill_last_name   = a->name;
+    s_skill_last_result = static_cast<int>(result);
+    s_skill_last_ms     = (esp_timer_get_time() - s_skill_started_us) / 1000;
+    s_skill_current.clear();
+
     delete a;
     s_skill_running = false;
     vTaskDelete(nullptr);
+}
+
+/* ── Installed-skill manifest ─────────────────────────────────────
+ *
+ * Which marketplace skill owns which file on this robot used to be recorded
+ * ONLY in the browser's localStorage, and recovered by regex-scraping the Lua
+ * deploy script for file_write("...") calls. That had three consequences, all
+ * of which happened: install from your phone and your laptop offered to
+ * install again; uninstall from a second device deleted nothing because its
+ * localStorage was empty, while the UI reported success; and clearing site
+ * data orphaned every installed file permanently, with no way to find them.
+ *
+ * The robot owns its own filesystem, so the robot keeps the record. Flat
+ * JSON, parsed with the same strstr helpers as the rest of this file — no
+ * parser to add, and hand-editable if it ever needs rescuing.
+ */
+/* Defined further down, next to the handlers they belong with. The installed
+ * manifest has to sit above api_skills_upload (which records provenance into
+ * it) but below nothing in particular, so it lands above these three. */
+static char *read_body(httpd_req_t *req);
+static std::string json_get_str(const char *body, const char *key);
+static bool skill_filename_ok(const std::string &name);
+
+static constexpr const char *INSTALLED_PATH = "/installed.json";
+
+static std::string installed_read()
+{
+    auto bytes = fs::read_file(INSTALLED_PATH);
+    if (bytes.empty()) return "{\"skills\":[]}";
+    return std::string(bytes.begin(), bytes.end());
+}
+
+/* Rewrites the manifest with `skill_id` removed, then optionally re-added.
+ * A whole-file rewrite rather than an in-place edit: the file is a few hundred
+ * bytes, LittleFS has no atomic rename here, and correctness beats cleverness
+ * at this size. */
+static bool installed_write(const std::string &skill_id,
+                            const std::string &file,
+                            const std::string &version,
+                            const std::string &title,
+                            bool remove_only)
+{
+    const std::string current = installed_read();
+    std::string out = "{\"skills\":[";
+    bool first = true;
+
+    // Copy every entry except the one we are replacing or removing.
+    std::size_t pos = 0;
+    const std::string key = "{\"skill_id\":\"";
+    while ((pos = current.find(key, pos)) != std::string::npos) {
+        const std::size_t start = pos;
+        const std::size_t end = current.find('}', start);
+        if (end == std::string::npos) break;
+        const std::string entry = current.substr(start, end - start + 1);
+        pos = end + 1;
+
+        const std::size_t id_start = key.size();
+        const std::size_t id_end = entry.find('"', id_start);
+        if (id_end == std::string::npos) continue;
+        if (entry.substr(id_start, id_end - id_start) == skill_id) continue;
+
+        if (!first) out += ",";
+        out += entry;
+        first = false;
+    }
+
+    if (!remove_only) {
+        if (!first) out += ",";
+        out += "{\"skill_id\":\"" + json_escape(skill_id) + "\"";
+        out += ",\"file\":\"" + json_escape(file) + "\"";
+        out += ",\"version\":\"" + json_escape(version) + "\"";
+        out += ",\"title\":\"" + json_escape(title) + "\"}";
+    }
+
+    out += "]}";
+    return fs::write_file(INSTALLED_PATH, out.data(), out.size());
+}
+
+/* GET /v1/skills/installed — what is on this robot and where it came from. */
+static esp_err_t api_skills_installed(httpd_req_t *req)
+{
+    const std::string body = installed_read();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body.c_str(), body.size());
+    return ESP_OK;
+}
+
+/* POST /v1/skills/uninstall {"skill_id":"..."} — delete the file AND the entry.
+ *
+ * Doing both is the point. The old flow could remove an entitlement without
+ * removing the file (leaving a refunded skill runnable) or remove files
+ * without clearing the record (leaving a phantom install).
+ */
+static esp_err_t api_skills_uninstall(httpd_req_t *req)
+{
+    char *body = read_body(req);
+    if (!body) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"empty or oversized body\"}", -1);
+        return ESP_OK;
+    }
+    const std::string skill_id = json_get_str(body, "skill_id");
+    free(body);
+
+    if (skill_id.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing skill_id\"}", -1);
+        return ESP_OK;
+    }
+
+    // Find the file this skill installed, so uninstall is not guesswork.
+    const std::string current = installed_read();
+    const std::string needle = "{\"skill_id\":\"" + skill_id + "\"";
+    std::string file;
+    const std::size_t at = current.find(needle);
+    if (at != std::string::npos) {
+        const std::size_t fk = current.find("\"file\":\"", at);
+        if (fk != std::string::npos) {
+            const std::size_t fs_ = fk + 8;
+            const std::size_t fe = current.find('"', fs_);
+            if (fe != std::string::npos) file = current.substr(fs_, fe - fs_);
+        }
+    }
+
+    bool deleted = false;
+    if (!file.empty() && skill_filename_ok(file)) {
+        deleted = fs::delete_file(("/" + file).c_str());
+    }
+    installed_write(skill_id, "", "", "", /*remove_only=*/true);
+
+    std::string resp = "{\"ok\":true,\"file\":\"" + json_escape(file)
+                     + "\",\"deleted\":" + (deleted ? "true" : "false") + "}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp.c_str(), resp.size());
+    return ESP_OK;
+}
+
+/* GET /v1/logs?since=<seq>&max=<n> — the robot's own log, over HTTP.
+ *
+ * Polled rather than streamed. httpd runs with max_open_sockets = 5 and
+ * lru_purge_enable, so a permanently-held log socket would be a fifth of the
+ * budget and a candidate for eviction — it could get itself, or the chat
+ * socket, dropped. Polling costs nothing between requests.
+ *
+ * `since` is the sequence number from the previous response's "next", so a
+ * client never re-reads a line. Omit it (or pass 0) for everything held.
+ */
+static esp_err_t api_logs(httpd_req_t *req)
+{
+    uint32_t since = 0;
+    std::size_t max_lines = 200;
+
+    char query[96];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[24];
+        if (httpd_query_key_value(query, "since", val, sizeof(val)) == ESP_OK) {
+            since = static_cast<uint32_t>(std::strtoul(val, nullptr, 10));
+        }
+        if (httpd_query_key_value(query, "max", val, sizeof(val)) == ESP_OK) {
+            const long m = std::strtol(val, nullptr, 10);
+            // Bounded because the whole response is built in RAM.
+            if (m > 0 && m < 500) max_lines = static_cast<std::size_t>(m);
+        }
+    }
+
+    uint32_t next = since;
+    std::string lines = util::log_ring_json(since, max_lines, next);
+
+    std::string resp = "{\"next\":" + std::to_string(next)
+                     + ",\"lines\":" + lines + "}";
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp.c_str(), resp.size());
+    return ESP_OK;
+}
+
+/* GET /v1/skills/status — is a skill running, and how did the last one go? */
+static esp_err_t api_skills_status(httpd_req_t *req)
+{
+    bool running = s_skill_running;
+
+    std::string json = "{\"running\":";
+    json += running ? "true" : "false";
+
+    if (running) {
+        json += ",\"name\":\"" + json_escape(s_skill_current) + "\"";
+        json += ",\"elapsed_ms\":" +
+                std::to_string((esp_timer_get_time() - s_skill_started_us) / 1000);
+    }
+
+    if (s_skill_last_result >= 0) {
+        json += ",\"last\":{\"name\":\"" + json_escape(s_skill_last_name) + "\"";
+        json += ",\"result\":" + std::to_string(s_skill_last_result);
+        json += ",\"ok\":";
+        json += (s_skill_last_result ==
+                 static_cast<int>(wasm::SandboxResult::Success)) ? "true" : "false";
+        json += ",\"message\":\"" +
+                json_escape(skill_result_text(s_skill_last_result)) + "\"";
+        json += ",\"duration_ms\":" + std::to_string(s_skill_last_ms) + "}";
+    }
+
+    json += "}";
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json.c_str(), json.size());
+    return ESP_OK;
 }
 
 /* POST /v1/skills/run — execute a .wasm skill via WAMR (async) */
@@ -362,7 +609,12 @@ static esp_err_t api_skills_run(httpd_req_t *req)
     }
 
     // ── Launch the skill on its own task and return immediately ──
-    s_skill_running = true;
+    // Set the name and start time BEFORE flipping `running`, so the first
+    // status poll — which can land microseconds later — never sees
+    // running=true with a stale or empty name.
+    s_skill_current    = skill_name;
+    s_skill_started_us = esp_timer_get_time();
+    s_skill_running    = true;
     auto *args = new SkillRunArgs{ path, skill_name };
     // No core affinity: the scheduler keeps httpd (core 0) responsive while the
     // skill yields during its robot_delay_ms calls.  8 KB task stack is enough;
@@ -371,6 +623,7 @@ static esp_err_t api_skills_run(httpd_req_t *req)
                                      args, 4, nullptr);
     if (created != pdPASS) {
         s_skill_running = false;
+        s_skill_current.clear();
         delete args;
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_set_type(req, "application/json");
@@ -572,6 +825,44 @@ static esp_err_t api_fs_delete(httpd_req_t *req)
 }
 
 /* POST /v1/skills/upload — upload a .wasm file (raw body, name in query) */
+/* Validate an uploaded skill's filename.
+ *
+ * This used to be a raw substring scrape with no checks at all: no
+ * url_decode, no ".." rejection, no "/" rejection, no extension check, no
+ * length cap — and the result went straight into fopen("/fs/" + name, "wb").
+ * `?name=../../foo` was a write anywhere the VFS would follow, and
+ * `?name=www/index.html.gz` would overwrite the web UI's own assets.
+ *
+ * A skill filename is a bare leaf name ending in .wasm or .mpxe. Nothing else
+ * is legitimate, so accept nothing else.
+ */
+static bool skill_filename_ok(const std::string &name)
+{
+    if (name.empty() || name.size() > 64) return false;
+
+    // No path structure of any kind: no separators, no traversal, no leading
+    // dot (which would also cover "..", "." and hidden files).
+    if (name.find('/')  != std::string::npos) return false;
+    if (name.find('\\') != std::string::npos) return false;
+    if (name.find("..") != std::string::npos) return false;
+    if (name[0] == '.') return false;
+
+    // Conservative charset — anything outside it is far likelier to be an
+    // attack or an encoding bug than a filename someone meant to type.
+    for (char c : name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                     || (c >= '0' && c <= '9')
+                     || c == '.' || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+
+    // Must be a skill. wasm_sandbox already enforces this at run time; there
+    // is no reason to let anything else onto the filesystem in the first place.
+    const bool is_wasm = name.size() > 5 && name.compare(name.size() - 5, 5, ".wasm") == 0;
+    const bool is_mpxe = name.size() > 5 && name.compare(name.size() - 5, 5, ".mpxe") == 0;
+    return is_wasm || is_mpxe;
+}
+
 static esp_err_t api_skills_upload(httpd_req_t *req)
 {
     // Extract filename from query string: /v1/skills/upload?name=foo.wasm
@@ -585,6 +876,38 @@ static esp_err_t api_skills_upload(httpd_req_t *req)
             filename = "";
             while (*nval && *nval != '&') filename += *nval++;
         }
+    }
+
+    // Decode BEFORE validating, or "%2e%2e%2f" walks straight past the checks.
+    filename = url_decode(filename);
+
+    // Optional provenance: &skill_id=&version=&title=. Absent for a plain
+    // `mpx-cli deploy` of your own build, present when `mpx-cli install` or the
+    // PWA puts a marketplace skill here — which is what lets the robot, rather
+    // than a browser's localStorage, know what it is carrying.
+    std::string skill_id, version, title;
+    if (query) {
+        auto param = [&](const char *key) -> std::string {
+            std::string needle = std::string(key) + "=";
+            const char *v = std::strstr(query + 1, needle.c_str());
+            if (!v) return "";
+            v += needle.size();
+            std::string out;
+            while (*v && *v != '&') out += *v++;
+            return url_decode(out);
+        };
+        skill_id = param("skill_id");
+        version  = param("version");
+        title    = param("title");
+    }
+
+    if (!skill_filename_ok(filename)) {
+        ESP_LOGW(TAG, "Rejected skill upload with unsafe name: '%s'", filename.c_str());
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"invalid filename — expected a "
+                             "bare name ending in .wasm or .mpxe\"}", -1);
+        return ESP_OK;
     }
 
     // Read the raw binary body
@@ -616,6 +939,10 @@ static esp_err_t api_skills_upload(httpd_req_t *req)
     std::string fs_path = "/" + filename;
     if (fs::write_file(fs_path.c_str(), data, total_read)) {
         ESP_LOGI(TAG, "Uploaded %s (%zu bytes)", filename.c_str(), total_read);
+        if (!skill_id.empty()) {
+            installed_write(skill_id, filename, version, title, /*remove_only=*/false);
+            ESP_LOGI(TAG, "Recorded install: %s -> %s", skill_id.c_str(), filename.c_str());
+        }
         std::string resp = "{\"ok\":true,\"path\":\"" + filename + "\"}";
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp.c_str(), resp.size());
@@ -1200,13 +1527,30 @@ static esp_err_t api_wifi_forget(httpd_req_t *req)
  * Read the full request body into a heap-allocated buffer.
  * Caller must free() the returned pointer. Returns NULL on failure.
  */
+// Largest request body any handler will buffer. Same as the skill upload cap.
+static constexpr int MAX_REQUEST_BODY = 256 * 1024;
+
 static char *read_body(httpd_req_t *req)
 {
     int content_len = req->content_len;
     if (content_len <= 0) return nullptr;
 
+    // Bounded. This used to malloc whatever Content-Length claimed, so a
+    // single request could ask for hundreds of KB of contiguous ESP32 heap and
+    // drain it out from under the WASM sandbox and the TLS buffers. The cap
+    // matches the skill upload limit, which is the largest legitimate body any
+    // of these handlers receives.
+    if (content_len > MAX_REQUEST_BODY) {
+        ESP_LOGW(TAG, "Request body too large: %d bytes (max %d)",
+                 content_len, MAX_REQUEST_BODY);
+        return nullptr;
+    }
+
     char *buf = (char *)malloc(content_len + 1);
-    if (!buf) return nullptr;
+    if (!buf) {
+        ESP_LOGE(TAG, "Out of memory reading a %d byte body", content_len);
+        return nullptr;
+    }
 
     int total = 0;
     while (total < content_len) {
@@ -1434,6 +1778,315 @@ static esp_err_t api_lua_delete(httpd_req_t *req)
     return ESP_OK;
 }
 
+
+/* ═══════════════════════════════════════════════════════════════
+ *  MangDang Servo Studio API   (/v1/studio/...)
+ *
+ *  Thin JSON wrapper over robot/driver_board.h, ported from the /api/... routes
+ *  of the mpxesp test firmware. Two rules carried over from there, both of
+ *  which are about who owns the SPI bus:
+ *
+ *   - Every PARAMETER operation requires studio mode. A config exchange is a
+ *     request/reply pair; gait traffic in between loses the reply and leaves a
+ *     config frame pending that the next feedback decode misreads.
+ *   - Read-only telemetry (status, temps) deliberately does NOT require it —
+ *     the AT32 puts position, current and NTC temperature in every feedback
+ *     frame, so while the gait runs those are already fresh and free.
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int studio_qint(httpd_req_t *r, const char *key, int def)
+{
+    char q[128], v[24];
+    if (httpd_req_get_url_query_str(r, q, sizeof q) == ESP_OK &&
+        httpd_query_key_value(q, key, v, sizeof v) == ESP_OK) {
+        return atoi(v);
+    }
+    return def;
+}
+
+static float studio_qfloat(httpd_req_t *r, const char *key, float def)
+{
+    char q[128], v[24];
+    if (httpd_req_get_url_query_str(r, q, sizeof q) == ESP_OK &&
+        httpd_query_key_value(q, key, v, sizeof v) == ESP_OK) {
+        return strtof(v, nullptr);
+    }
+    return def;
+}
+
+static esp_err_t studio_json(httpd_req_t *r, const char *s)
+{
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, s, HTTPD_RESP_USE_STRLEN);
+}
+
+#define STUDIO_NEED_MODE(r)                                                   \
+    do {                                                                      \
+        if (!robot::studio_mode())                                            \
+            return studio_json((r), R"({"ok":false,"err":"studio mode off"})"); \
+    } while (0)
+
+#define STUDIO_NEED_ID(r, id)                                                 \
+    do {                                                                      \
+        if ((id) < 1 || (id) > 12)                                            \
+            return studio_json((r), R"({"ok":false,"err":"bad id"})");        \
+    } while (0)
+
+/* GET /v1/studio/mode[?on=0|1] — read or set studio mode. */
+static esp_err_t studio_mode_handler(httpd_req_t *req)
+{
+    const int on = studio_qint(req, "on", -1);
+    if (on == 0 || on == 1) {
+        robot::set_studio_mode(on == 1);
+    }
+    char b[64];
+    std::snprintf(b, sizeof b, R"({"ok":true,"studio":%s})",
+                  robot::studio_mode() ? "true" : "false");
+    return studio_json(req, b);
+}
+
+/* GET /v1/studio/status — all 12 servos: position, current, temperature.
+ * Works with the gait running; that is the point of it. */
+static esp_err_t studio_status_handler(httpd_req_t *req)
+{
+    // Parked gait means a stale cache — replay each board's last frame so the
+    // numbers on screen are live. This is safe: an idle servo stays idle.
+    if (robot::studio_mode()) {
+        for (int bd = 0; bd < 4; ++bd) driver_board_poll_board(bd);
+    }
+
+    char b[768];
+    int n = std::snprintf(b, sizeof b, R"({"ok":true,"studio":%s,"servos":[)",
+                          robot::studio_mode() ? "true" : "false");
+    for (int id = 1; id <= 12; ++id) {
+        const uint16_t scs = driver_board_present_position(id);
+        const float    deg = static_cast<float>(scs) * 270.0f / 1024.0f;
+        const float    t   = driver_board_present_temperature(id);
+        n += std::snprintf(b + n, sizeof b - n,
+                           R"(%s{"id":%d,"scs":%u,"deg":%.1f,"ma":%d,"c":)",
+                           id == 1 ? "" : ",", id, scs, deg,
+                           driver_board_present_current(id));
+        if (t > DB_TEMP_INVALID) n += std::snprintf(b + n, sizeof b - n, "%.1f}", t);
+        else                     n += std::snprintf(b + n, sizeof b - n, "null}");
+    }
+    std::snprintf(b + n, sizeof b - n, "]}");
+    return studio_json(req, b);
+}
+
+/* GET /v1/studio/scan — which channels answer a parameter read. */
+static esp_err_t studio_scan_handler(httpd_req_t *req)
+{
+    STUDIO_NEED_MODE(req);
+    char b[128];
+    int n = std::snprintf(b, sizeof b, R"({"ok":true,"found":[)");
+    bool first = true;
+    for (int id = 1; id <= 12; ++id) {
+        float v;
+        if (driver_board_get_param(id, DB_PARAM_KP_POSITION, &v)) {
+            n += std::snprintf(b + n, sizeof b - n, "%s%d", first ? "" : ",", id);
+            first = false;
+        }
+    }
+    std::snprintf(b + n, sizeof b - n, "]}");
+    return studio_json(req, b);
+}
+
+/* GET /v1/studio/dump?id=N — every config parameter of one servo. */
+static esp_err_t studio_dump_handler(httpd_req_t *req)
+{
+    const int id = studio_qint(req, "id", 0);
+    STUDIO_NEED_MODE(req);
+    STUDIO_NEED_ID(req, id);
+
+    char b[640];
+    int n = std::snprintf(b, sizeof b, R"({"ok":true,"id":%d,"params":[)", id);
+    for (int p = 0; p < DB_PARAM_COUNT; ++p) {
+        float v;
+        const char *name = driver_board_param_name(p);
+        if (driver_board_get_param(id, p, &v)) {
+            n += std::snprintf(b + n, sizeof b - n, R"(%s{"p":%d,"n":"%s","v":%g})",
+                               p ? "," : "", p, name ? name : "", v);
+        } else {
+            n += std::snprintf(b + n, sizeof b - n, R"(%s{"p":%d,"n":"%s","v":null})",
+                               p ? "," : "", p, name ? name : "");
+        }
+    }
+    std::snprintf(b + n, sizeof b - n, "]}");
+    return studio_json(req, b);
+}
+
+/* GET /v1/studio/set?id=N&p=P&v=V — write one parameter to RAM, read it back. */
+static esp_err_t studio_set_handler(httpd_req_t *req)
+{
+    const int   id = studio_qint(req, "id", 0);
+    const int   p  = studio_qint(req, "p", -1);
+    const float v  = studio_qfloat(req, "v", 0);
+    STUDIO_NEED_MODE(req);
+    STUDIO_NEED_ID(req, id);
+    if (p < 0 || p >= DB_PARAM_COUNT) {
+        return studio_json(req, R"({"ok":false,"err":"bad param"})");
+    }
+
+    float rb = 0;
+    if (driver_board_set_param(id, p, v) && driver_board_get_param(id, p, &rb)) {
+        char b[96];
+        std::snprintf(b, sizeof b, R"({"ok":true,"p":%d,"v":%g})", p, rb);
+        return studio_json(req, b);
+    }
+    return studio_json(req, R"({"ok":false,"err":"no reply"})");
+}
+
+/* GET /v1/studio/setall?p=P&v=V[&save=1] — one parameter to all 12 servos. */
+static esp_err_t studio_setall_handler(httpd_req_t *req)
+{
+    const int   p    = studio_qint(req, "p", -1);
+    const int   save = studio_qint(req, "save", 0);
+    const float v    = studio_qfloat(req, "v", 0);
+    STUDIO_NEED_MODE(req);
+    if (p < 0 || p >= DB_PARAM_COUNT) {
+        return studio_json(req, R"({"ok":false,"err":"bad param"})");
+    }
+
+    char fail[64];
+    int fn = 0, n = 0;
+    fail[0] = '\0';
+    for (int id = 1; id <= 12; ++id) {
+        float rb = 0;
+        if (driver_board_set_param(id, p, v) && driver_board_get_param(id, p, &rb)) {
+            n++;
+        } else {
+            fn += std::snprintf(fail + fn, sizeof fail - fn, "%s%d", fn ? "," : "", id);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));   // give the AT32 time between writes
+    }
+    const bool saved = (save && n) ? driver_board_save_config(-1) : false;
+
+    char b[192];
+    std::snprintf(b, sizeof b,
+                  R"({"ok":%s,"p":%d,"v":%g,"n":%d,"fail":[%s],"saved":%s})",
+                  n ? "true" : "false", p, v, n, fail, saved ? "true" : "false");
+    return studio_json(req, b);
+}
+
+/* GET /v1/studio/live?id=N — the AT32's live control-loop values. */
+static esp_err_t studio_live_handler(httpd_req_t *req)
+{
+    const int id = studio_qint(req, "id", 0);
+    STUDIO_NEED_MODE(req);
+    STUDIO_NEED_ID(req, id);
+
+    float lv[DB_LIVE_COUNT];
+    bool ok = true;
+    // Everything below DB_LIVE_TEMPERATURE_C is required; temperature is
+    // optional so a board on pre-NTC AT32 firmware degrades to "no temp"
+    // instead of dropping the whole trace to the reduced path.
+    for (int i = 0; i < DB_LIVE_TEMPERATURE_C && ok; ++i) {
+        ok = driver_board_get_live(id, i, &lv[i]);
+    }
+
+    char b[640];
+    if (ok) {
+        float t;
+        bool have_t = driver_board_get_live(id, DB_LIVE_TEMPERATURE_C, &t);
+        if (!have_t || t <= DB_TEMP_INVALID) {
+            t = driver_board_present_temperature(id);
+            have_t = (t > DB_TEMP_INVALID);
+        }
+        int n = std::snprintf(b, sizeof b,
+            R"({"ok":true,"full":true,"pos_adc":%g,"cur_adc":%g,)"
+            R"("set_deg":%g,"now_deg":%g,"err_deg":%g,)"
+            R"("cap_ma":%g,"set_ma":%g,"now_ma":%g,"err_ma":%g,)"
+            R"("duty":%g,"mode":%d,"loop":%lu)",
+            lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC],
+            lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
+            lv[DB_LIVE_ERROR_POS_DEG],
+            lv[DB_LIVE_MAX_CURRENT_MA], lv[DB_LIVE_SETPOINT_CUR_MA],
+            lv[DB_LIVE_PRESENT_CUR_MA], lv[DB_LIVE_ERROR_CUR_MA],
+            lv[DB_LIVE_PWM_DUTY], static_cast<int>(lv[DB_LIVE_MODE]),
+            static_cast<unsigned long>(lv[DB_LIVE_LOOP_COUNTER]));
+        if (have_t) n += std::snprintf(b + n, sizeof b - n, R"(,"temp_c":%.1f)", t);
+        std::snprintf(b + n, sizeof b - n, "}");
+    } else if (driver_board_poll(id)) {
+        const float t = driver_board_present_temperature(id);
+        int n = std::snprintf(b, sizeof b,
+            R"({"ok":true,"full":false,"now_deg":%g,"now_ma":%d)",
+            static_cast<float>(driver_board_present_position(id)) * 270.0f / 1024.0f,
+            driver_board_present_current(id));
+        if (t > DB_TEMP_INVALID) n += std::snprintf(b + n, sizeof b - n, R"(,"temp_c":%.1f)", t);
+        std::snprintf(b + n, sizeof b - n, "}");
+    } else {
+        std::snprintf(b, sizeof b, R"({"ok":false,"err":"spi"})");
+    }
+    return studio_json(req, b);
+}
+
+/* GET /v1/studio/temps — NTC temperature of all 12. No studio mode needed. */
+static esp_err_t studio_temps_handler(httpd_req_t *req)
+{
+    if (robot::studio_mode()) {
+        for (int bd = 0; bd < 4; ++bd) driver_board_poll_board(bd);
+    }
+    char b[512];
+    int n = std::snprintf(b, sizeof b, R"({"ok":true,"studio":%s,"temps":[)",
+                          robot::studio_mode() ? "true" : "false");
+    for (int id = 1; id <= 12; ++id) {
+        const float t = driver_board_present_temperature(id);
+        if (t > DB_TEMP_INVALID) {
+            n += std::snprintf(b + n, sizeof b - n, R"(%s{"id":%d,"c":%.1f})",
+                               id == 1 ? "" : ",", id, t);
+        } else {
+            n += std::snprintf(b + n, sizeof b - n, R"(%s{"id":%d,"c":null})",
+                               id == 1 ? "" : ",", id);
+        }
+    }
+    std::snprintf(b + n, sizeof b - n, "]}");
+    return studio_json(req, b);
+}
+
+/* GET /v1/studio/save?id=N — commit board config to AT32 flash (0 = all). */
+static esp_err_t studio_save_handler(httpd_req_t *req)
+{
+    const int id = studio_qint(req, "id", 0);
+    STUDIO_NEED_MODE(req);
+    const int board = (id >= 1 && id <= 12) ? (id - 1) / 3 : -1;
+    return studio_json(req, driver_board_save_config(board)
+                              ? R"({"ok":true})"
+                              : R"({"ok":false,"err":"save failed"})");
+}
+
+/* GET /v1/studio/restore?id=N — factory defaults, RAM only (0 = all). */
+static esp_err_t studio_restore_handler(httpd_req_t *req)
+{
+    const int id = studio_qint(req, "id", 0);
+    STUDIO_NEED_MODE(req);
+    const int board = (id >= 1 && id <= 12) ? (id - 1) / 3 : -1;
+    return studio_json(req, driver_board_factory_restore(board)
+                              ? R"({"ok":true})"
+                              : R"({"ok":false,"err":"restore failed"})");
+}
+
+/* GET /v1/studio/direct?id=N&m=0|1|2&deg=..&cur=..
+ * m: 0 idle (motor off), 1 position hold, 2 torque. deg is the RAW AT32 angle
+ * 0..270 with 135 = centre — the same units as the AT32's own CLI. */
+static esp_err_t studio_direct_handler(httpd_req_t *req)
+{
+    const int   id  = studio_qint(req, "id", 0);
+    const int   m   = studio_qint(req, "m", 0);
+    const float deg = studio_qfloat(req, "deg", 135.0f);
+    const float cur = studio_qfloat(req, "cur", 130.0f);
+    STUDIO_NEED_MODE(req);
+    STUDIO_NEED_ID(req, id);
+
+    const uint16_t mode = (m == 1) ? DB_MODE_POSITION
+                        : (m == 2) ? DB_MODE_TORQUE
+                                   : DB_MODE_IDLE;
+    return studio_json(req, driver_board_direct(id, mode, deg,
+                                                static_cast<int16_t>(cur))
+                              ? R"({"ok":true})"
+                              : R"({"ok":false,"err":"spi"})");
+}
+
 /* ── Helper to register an API handler ─────────────────────── */
 static void register_api(httpd_handle_t server, const char *method_str,
                          const char *uri, httpd_method_t method,
@@ -1581,7 +2234,16 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
 
     // ── Read request body if present ──────────────────────────
     std::string body;
-    if (req->content_len > 0 && req->content_len < 4096) {
+    // Previously an over-size body was silently DROPPED and the request
+    // forwarded with no body at all, so the gateway rejected it and the user
+    // saw an upstream error for a request that never left intact.
+    if (req->content_len >= 4096) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"request body too large for the proxy\"}", -1);
+        return ESP_OK;
+    }
+    if (req->content_len > 0) {
         char *buf = static_cast<char *>(std::malloc(req->content_len + 1));
         if (buf) {
             int total = 0;
@@ -1619,7 +2281,9 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
 
     // ── Forward to Gateway ────────────────────────────────────
     bool ok = false;
-    std::string resp_body = gateway_request(method_str, target_path.c_str(), body, ok);
+    int upstream_status = 0;
+    std::string resp_body = gateway_request(method_str, target_path.c_str(),
+                                            body, ok, &upstream_status);
 
     ESP_LOGI(TAG, "Marketplace proxy [socketfix-v14]: %s %s → %s (ok=%d, body=%zu bytes)",
              method_str, uri, target_path.c_str(), ok, resp_body.size());
@@ -1630,16 +2294,24 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
     }
 
     if (!ok) {
-        // Gateway returned an error or is unreachable
-        if (resp_body.empty()) {
+        // Pass the gateway's own status through. Collapsing everything to 502
+        // meant "you do not own this skill" (403) and "no such skill" (404)
+        // both surfaced in the UI as "Failed to ...: 502", which reads as a
+        // broken robot rather than as the answer it actually is. 502 is now
+        // reserved for what it means: we could not reach the gateway.
+        if (resp_body.empty() || upstream_status == 0) {
             ESP_LOGW(TAG, "Gateway unreachable for %s", target_path.c_str());
             httpd_resp_set_status(req, "502 Bad Gateway");
-            httpd_resp_send(req, "gateway unreachable", -1);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, "{\"error\":\"gateway unreachable\"}", -1);
         } else {
-            ESP_LOGW(TAG, "Gateway error response: %.*s",
+            ESP_LOGW(TAG, "Gateway %d for %s: %.*s", upstream_status,
+                     target_path.c_str(),
                      (int)std::min(resp_body.size(), size_t(256)),
                      resp_body.c_str());
-            httpd_resp_set_status(req, "502 Bad Gateway");
+            char line[32];
+            std::snprintf(line, sizeof(line), "%d Upstream", upstream_status);
+            httpd_resp_set_status(req, line);
             httpd_resp_set_type(req, "application/json");
             httpd_resp_send(req, resp_body.c_str(), resp_body.size());
         }
@@ -1719,7 +2391,7 @@ bool start_http_server()
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 48;
+    config.max_uri_handlers = 64;   // +11 Servo Studio routes, +2 studio page
     // LWIP has CONFIG_LWIP_MAX_SOCKETS (16) total.  HTTPD also reserves 3
     // internal sockets on top of max_open_sockets.  At 5, HTTPD uses at most
     // 5+3=8, GUARANTEEING ~8 sockets stay free for OUTBOUND use (upstream cloud
@@ -1774,6 +2446,8 @@ bool start_http_server()
     register_static("/manifest.json");
     register_static("/sw.js");
     register_static("/favicon.ico");
+    register_static("/studio");
+    register_static("/studio.html");
 #ifdef CONFIG_PWA_DESIGN_REDESIGN
     register_static("/md.svg");
     register_static("/eye-open.svg");
@@ -1794,6 +2468,19 @@ bool start_http_server()
     };
     httpd_register_uri_handler(s_server, &ws_uri);
 
+    // ── MangDang Servo Studio ──
+    register_api(s_server, "GET", "/v1/studio/mode",    HTTP_GET, studio_mode_handler);
+    register_api(s_server, "GET", "/v1/studio/status",  HTTP_GET, studio_status_handler);
+    register_api(s_server, "GET", "/v1/studio/scan",    HTTP_GET, studio_scan_handler);
+    register_api(s_server, "GET", "/v1/studio/dump",    HTTP_GET, studio_dump_handler);
+    register_api(s_server, "GET", "/v1/studio/set",     HTTP_GET, studio_set_handler);
+    register_api(s_server, "GET", "/v1/studio/setall",  HTTP_GET, studio_setall_handler);
+    register_api(s_server, "GET", "/v1/studio/live",    HTTP_GET, studio_live_handler);
+    register_api(s_server, "GET", "/v1/studio/temps",   HTTP_GET, studio_temps_handler);
+    register_api(s_server, "GET", "/v1/studio/save",    HTTP_GET, studio_save_handler);
+    register_api(s_server, "GET", "/v1/studio/restore", HTTP_GET, studio_restore_handler);
+    register_api(s_server, "GET", "/v1/studio/direct",  HTTP_GET, studio_direct_handler);
+
     // ── Register Chat WebSocket endpoint ──
     httpd_uri_t chat_ws_uri = {
         .uri       = "/v1/chat/ui",
@@ -1809,6 +2496,10 @@ bool start_http_server()
     // ── Register REST API endpoints ──
     register_api(s_server, "GET",  "/v1/skills/list",   HTTP_GET,  api_skills_list);
     register_api(s_server, "POST", "/v1/skills/run",    HTTP_POST, api_skills_run);
+    register_api(s_server, "GET",  "/v1/skills/status", HTTP_GET,  api_skills_status);
+    register_api(s_server, "GET",  "/v1/logs",          HTTP_GET,  api_logs);
+    register_api(s_server, "GET",  "/v1/skills/installed", HTTP_GET,  api_skills_installed);
+    register_api(s_server, "POST", "/v1/skills/uninstall",  HTTP_POST, api_skills_uninstall);
     register_api(s_server, "GET",  "/v1/fs/list",       HTTP_GET,  api_fs_list);
     register_api(s_server, "GET",  "/v1/fs/info",       HTTP_GET,  api_fs_info);
     register_api(s_server, "GET",  "/v1/fs/read",       HTTP_GET,  api_fs_read);
