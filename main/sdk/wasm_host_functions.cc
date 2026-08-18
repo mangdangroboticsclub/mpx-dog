@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "wasm_export.h"
@@ -14,6 +15,8 @@ extern "C" {
 #include "robot/driver_board.h"
 }
 #include "wasm/wasm_sandbox.h"
+#include "skills/movement.h"
+#include "util/trace_ring.h"
 
 static const char *TAG = "wasm_sdk";
 
@@ -80,6 +83,7 @@ int32_t host_robot_gait(wasm_exec_env_t exec_env,
 {
 	// Check for watchdog cancellation
 	if (wasm::was_cancelled()) {
+	if (!control_allows(MPX_CTRL_GAIT)) return MPX_ERR_BUSY;
 		return MPX_ERR_CANCELLED;
 	}
 
@@ -94,62 +98,26 @@ int32_t host_robot_gait(wasm_exec_env_t exec_env,
 
 	ESP_LOGI(TAG, "robot_gait: \"%s\"", name);
 
-	// Map string to GaitCmd
-	robot::GaitCmd cmd = robot::GaitCmd::None;
-
-	if      (std::strcmp(name, "none")     == 0) cmd = robot::GaitCmd::None;
-	else if (std::strcmp(name, "init")     == 0) cmd = robot::GaitCmd::Init;
-	else if (std::strcmp(name, "step")     == 0) cmd = robot::GaitCmd::Step;
-	else if (std::strcmp(name, "roll")     == 0) cmd = robot::GaitCmd::Roll;
-	else if (std::strcmp(name, "pitch")    == 0) cmd = robot::GaitCmd::Pitch;
-	else if (std::strcmp(name, "stretch")  == 0) cmd = robot::GaitCmd::Stretch;
-	else if (std::strcmp(name, "advance")  == 0) cmd = robot::GaitCmd::Advance;
-	else if (std::strcmp(name, "back")     == 0) cmd = robot::GaitCmd::Back;
-	else if (std::strcmp(name, "left")     == 0) cmd = robot::GaitCmd::Left;
-	else if (std::strcmp(name, "right")    == 0) cmd = robot::GaitCmd::Right;
-	else if (std::strcmp(name, "turnL")    == 0) cmd = robot::GaitCmd::TurnL;
-	else if (std::strcmp(name, "turnR")    == 0) cmd = robot::GaitCmd::TurnR;
-	else if (std::strcmp(name, "twerk")    == 0) cmd = robot::GaitCmd::Twerk;
-	else if (std::strcmp(name, "jump")     == 0) cmd = robot::GaitCmd::Jump;
-	else if (std::strcmp(name, "jumpfwd")  == 0) cmd = robot::GaitCmd::JumpFwd;
-	else if (std::strcmp(name, "testspeed")== 0) cmd = robot::GaitCmd::TestSpeed;
-	else if (std::strcmp(name, "lookup")   == 0) cmd = robot::GaitCmd::LookUp;
-	else if (std::strcmp(name, "lookdown") == 0) cmd = robot::GaitCmd::LookDown;
-	else if (std::strcmp(name, "lookleft") == 0) cmd = robot::GaitCmd::LookLeft;
-	else if (std::strcmp(name, "lookright")== 0) cmd = robot::GaitCmd::LookRight;
-	else if (std::strcmp(name, "lookul")   == 0) cmd = robot::GaitCmd::LookUpperLeft;
-	else if (std::strcmp(name, "lookur")   == 0) cmd = robot::GaitCmd::LookUpperRight;
-	else if (std::strcmp(name, "lookll")   == 0) cmd = robot::GaitCmd::LookLowerLeft;
-	else if (std::strcmp(name, "looklr")   == 0) cmd = robot::GaitCmd::LookLowerRight;
-	else if (std::strcmp(name, "flegL")    == 0) cmd = robot::GaitCmd::ForelegLiftL;
-	else if (std::strcmp(name, "flegR")    == 0) cmd = robot::GaitCmd::ForelegLiftR;
-	else if (std::strcmp(name, "blegL")    == 0) cmd = robot::GaitCmd::BacklegLiftL;
-	else if (std::strcmp(name, "blegR")    == 0) cmd = robot::GaitCmd::BacklegLiftR;
-	else if (std::strcmp(name, "heightup") == 0) cmd = robot::GaitCmd::HeightUp;
-	else if (std::strcmp(name, "heightdown")==0) cmd = robot::GaitCmd::HeightDown;
-	else if (std::strcmp(name, "balance")  == 0) cmd = robot::GaitCmd::Balance;
-	else if (std::strcmp(name, "bowback")  == 0) cmd = robot::GaitCmd::BowBack;
-	else if (std::strcmp(name, "bodycycle")== 0) cmd = robot::GaitCmd::BodyCycle;
-	else if (std::strcmp(name, "headellipse")==0) cmd = robot::GaitCmd::HeadEllipse;
-	else if (std::strcmp(name, "moveLF")   == 0) cmd = robot::GaitCmd::MoveLeftFront;
-	else if (std::strcmp(name, "moveRF")   == 0) cmd = robot::GaitCmd::MoveRightFront;
-	else if (std::strcmp(name, "moveLB")   == 0) cmd = robot::GaitCmd::MoveLeftBack;
-	else if (std::strcmp(name, "moveRB")   == 0) cmd = robot::GaitCmd::MoveRightBack;
-	else if (std::strcmp(name, "stanford") == 0) cmd = robot::GaitCmd::StanfordWalk;
-	else if (std::strcmp(name, "frontkick")== 0) cmd = robot::GaitCmd::FrontKick;
-	else if (std::strcmp(name, "wiggle")   == 0) cmd = robot::GaitCmd::Wiggle;
-	else if (std::strcmp(name, "buttshrug")== 0) cmd = robot::GaitCmd::ButtShrug;
-	else if (std::strcmp(name, "wiggleL")  == 0) cmd = robot::GaitCmd::WiggleLeft;
-	else if (std::strcmp(name, "wiggleR")  == 0) cmd = robot::GaitCmd::WiggleRight;
-	else if (std::strcmp(name, "buttshrugL")==0) cmd = robot::GaitCmd::ButtShrugLeft;
-	else if (std::strcmp(name, "buttshrugR")==0) cmd = robot::GaitCmd::ButtShrugRight;
-	else {
-		ESP_LOGW(TAG, "robot_gait: unknown gait \"%s\"", name);
-		return -1;
+	// One table, in robot.cc. This chain used to be a second copy of it.
+	//
+	// Routing through skills::movement means a skill saying mpx_gait("x") sees
+	// the same name space the web UI does -- including movements provided by
+	// other skills, which are refused here rather than silently doing nothing.
+	const skills::MovementResult r = skills::run(name, /*from_skill=*/true);
+	switch (r) {
+		case skills::MovementResult::Started:
+			return MPX_OK;
+		case skills::MovementResult::NotPermitted:
+			ESP_LOGW(TAG, "robot_gait(\"%s\"): provided by another skill; "
+			              "only one skill runs at a time", name);
+			return MPX_ERR_STATE;
+		case skills::MovementResult::Busy:
+			return MPX_ERR_STATE;
+		case skills::MovementResult::Unknown:
+		default:
+			ESP_LOGW(TAG, "robot_gait: unknown movement \"%s\"", name);
+			return MPX_ERR_ARG;
 	}
-
-	robot::send_gait_cmd(cmd);
-	return 0;
 }
 
 int32_t host_robot_get_mode(wasm_exec_env_t exec_env)
@@ -164,6 +132,7 @@ int32_t host_robot_set_body_pose(wasm_exec_env_t exec_env,
                                  float yaw_deg)
 {
 	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!control_allows(MPX_CTRL_GAIT)) return MPX_ERR_BUSY;
 
 	robot::set_body_attitude(roll_deg, pitch_deg, yaw_deg);
 	ESP_LOGI(TAG, "robot_set_body_pose: roll=%.1f pitch=%.1f yaw=%.1f",
@@ -253,6 +222,7 @@ int32_t host_robot_get_tilt(wasm_exec_env_t exec_env)
 int32_t host_robot_set_servo_angle(wasm_exec_env_t exec_env,
 								   int32_t id, int32_t centideg)
 {
+	if (!control_allows(MPX_CTRL_JOINTS)) return MPX_ERR_BUSY;
 	if (id < 1 || id > 12) {
 		ESP_LOGW(TAG, "set_servo_angle: invalid id %" PRId32, id);
 		return -1;
@@ -461,6 +431,7 @@ int32_t host_robot_ik_fr(wasm_exec_env_t exec_env,
 						 float x, float th0, float z)
 {
 	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!control_allows(MPX_CTRL_FEET)) return MPX_ERR_BUSY;
 	ESP_LOGD(TAG, "ik_fr: x=%.1f th0=%.1f z=%.1f", x, th0, z);
 	robot::front_right_ik(x, th0, z);
 	return 0;
@@ -470,6 +441,7 @@ int32_t host_robot_ik_fl(wasm_exec_env_t exec_env,
 						 float x, float th0, float z)
 {
 	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!control_allows(MPX_CTRL_FEET)) return MPX_ERR_BUSY;
 	ESP_LOGD(TAG, "ik_fl: x=%.1f th0=%.1f z=%.1f", x, th0, z);
 	robot::front_left_ik(x, th0, z);
 	return 0;
@@ -479,6 +451,7 @@ int32_t host_robot_ik_rr(wasm_exec_env_t exec_env,
 						 float x, float th0, float z)
 {
 	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!control_allows(MPX_CTRL_FEET)) return MPX_ERR_BUSY;
 	ESP_LOGD(TAG, "ik_rr: x=%.1f th0=%.1f z=%.1f", x, th0, z);
 	robot::rear_right_ik(x, th0, z);
 	return 0;
@@ -488,6 +461,7 @@ int32_t host_robot_ik_rl(wasm_exec_env_t exec_env,
 						 float x, float th0, float z)
 {
 	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!control_allows(MPX_CTRL_FEET)) return MPX_ERR_BUSY;
 	ESP_LOGD(TAG, "ik_rl: x=%.1f th0=%.1f z=%.1f", x, th0, z);
 	robot::rear_left_ik(x, th0, z);
 	return 0;
@@ -632,9 +606,25 @@ int32_t host_servo_is_locked(wasm_exec_env_t exec_env)
  */
 static inline bool param_is_read_only(int32_t param)
 {
+	/* Calibration, not control gains. Each of these changes what every angle
+	 * command MEANS afterwards -- including the built-in gaits' -- and
+	 * servo_save_config() can burn the mistake into the driver board's own
+	 * flash, where a reboot will not clear it.
+	 *
+	 * The two REVERSE_* slots are here for a stronger reason than the ADC
+	 * ones. They flip a direction, so a skill that writes one leaves a single
+	 * joint driving opposite to the other eleven. That is not a robot that
+	 * behaves oddly; it is a robot tearing at its own legs, and it survives
+	 * the skill that caused it with nothing on screen to explain why. No
+	 * downloaded skill has a legitimate reason to reverse a motor.
+	 *
+	 * All of them are still settable from Servo Studio, where a human is
+	 * watching the joint move. */
 	return param == DB_PARAM_MIN_POSITION_ADC
 		|| param == DB_PARAM_MAX_POSITION_ADC
-		|| param == DB_PARAM_RANGE_POSITION_DEG;
+		|| param == DB_PARAM_RANGE_POSITION_DEG
+		|| param == DB_PARAM_REVERSE_MOTOR
+		|| param == DB_PARAM_REVERSE_POSITION_SENSOR;
 }
 
 int32_t host_servo_set_gain(wasm_exec_env_t exec_env,
@@ -834,6 +824,271 @@ int32_t host_servo_scan(wasm_exec_env_t exec_env)
 		if (driver_board_get_param(id, DB_PARAM_KP_POSITION, &v)) mask |= (1 << (id - 1));
 	}
 	return mask;
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  ABI v3
+// ═══════════════════════════════════════════════════════════════
+
+// ── Control arbitration ────────────────────────────────────────
+//
+// Four things in this firmware can move a joint: the gait generator, the
+// built-in IK, a skill's direct joint writes, and the servo bus. In v2 they
+// all wrote the same goal buffer with no arbitration, so "what happens if I
+// call robot_ik_fr() while a gait is running" had an answer nobody could look
+// up — last writer wins, at 15 ms granularity.
+//
+// v3 does not change that default. It adds a claim: a skill that calls
+// mpx_control_take(MPX_CTRL_FEET) is telling the firmware it owns foot
+// placement, and any *other* domain's write is then refused with
+// MPX_ERR_BUSY instead of silently interleaving. A skill that never calls
+// take() sees byte-identical v2 behaviour.
+
+static int32_t s_control_owner = MPX_CTRL_NONE;
+
+void control_reset()
+{
+	s_control_owner = MPX_CTRL_NONE;
+}
+
+bool control_allows(int32_t domain)
+{
+	return s_control_owner == MPX_CTRL_NONE || s_control_owner == domain;
+}
+
+int32_t host_mpx_control_take(wasm_exec_env_t exec_env, int32_t domain)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (domain < MPX_CTRL_GAIT || domain > MPX_CTRL_BUS) return MPX_ERR_ARG;
+	if (s_control_owner != MPX_CTRL_NONE && s_control_owner != domain) {
+		ESP_LOGW(TAG, "control_take(%" PRId32 ") refused; %" PRId32 " holds it",
+				 domain, s_control_owner);
+		return MPX_ERR_BUSY;
+	}
+	s_control_owner = domain;
+	return MPX_OK;
+}
+
+int32_t host_mpx_control_release(wasm_exec_env_t exec_env)
+{
+	(void)exec_env;
+	s_control_owner = MPX_CTRL_NONE;
+	return MPX_OK;
+}
+
+int32_t host_mpx_control_owner(wasm_exec_env_t exec_env)
+{
+	(void)exec_env;
+	return s_control_owner;
+}
+
+// ── Clock ──────────────────────────────────────────────────────
+//
+// v2 had no time source at all: robot_delay_ms was the only timing primitive,
+// so a skill could not measure a frame, hold a rate, or run for a wall-clock
+// duration. Everything time-shaped had to be counted in frames and hoped for.
+
+int32_t host_mpx_millis(wasm_exec_env_t exec_env)
+{
+	(void)exec_env;
+	return static_cast<int32_t>(wasm::skill_millis());
+}
+
+// Absolute-deadline sleep. Sleeping to a deadline instead of for a duration is
+// what stops per-frame overhead accumulating into drift: 600 frames of
+// "delay(16)" run long by however much 600 frames of host calls cost, but 600
+// frames of sleep_until(start + n*16) do not.
+int32_t host_mpx_sleep_until(wasm_exec_env_t exec_env, int32_t t_ms)
+{
+	(void)exec_env;
+	for (;;) {
+		if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+		const int32_t now = static_cast<int32_t>(wasm::skill_millis());
+		const int32_t remaining = t_ms - now;
+		if (remaining <= 0) return MPX_OK;
+		// Wake at least every 50 ms so cancellation is honoured promptly.
+		const int32_t slice = remaining > 50 ? 50 : remaining;
+		vTaskDelay(pdMS_TO_TICKS(slice));
+	}
+}
+
+// ── Continuous drive ───────────────────────────────────────────
+//
+// robot::joy_input() is what the phone UI's thumbsticks call. It was never in
+// the ABI, so a skill could pick one of 46 discrete gaits but could not ask
+// for "forward at a third of speed while turning gently" — the one thing the
+// hardware was already doing for the web client.
+
+int32_t host_mpx_drive(wasm_exec_env_t exec_env, float fwd, float strafe, float turn)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!control_allows(MPX_CTRL_GAIT)) return MPX_ERR_BUSY;
+
+	auto clamp1 = [](float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); };
+	robot::joy_input(clamp1(fwd), clamp1(strafe), clamp1(turn));
+	return MPX_OK;
+}
+
+int32_t host_mpx_drive_stop(wasm_exec_env_t exec_env)
+{
+	(void)exec_env;
+	robot::joy_input(0.0f, 0.0f, 0.0f);
+	return MPX_OK;
+}
+
+int32_t host_mpx_set_walk_speed(wasm_exec_env_t exec_env, int32_t mm_s)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	robot::Config cfg = robot::get_config();
+	cfg.sg_speed = static_cast<int>(mm_s);
+	robot::set_config(cfg);          // set_config() already clamps to 10..200
+	return MPX_OK;
+}
+
+int32_t host_mpx_get_walk_speed(wasm_exec_env_t exec_env)
+{
+	(void)exec_env;
+	return static_cast<int32_t>(robot::get_config().sg_speed);
+}
+
+// ── Foot placement ─────────────────────────────────────────────
+//
+// One call instead of four differently-named ones, so a leg index can be a
+// loop variable. Same maths as robot_ik_*; this is purely about the shape of
+// the call site.
+
+int32_t host_mpx_foot(wasm_exec_env_t exec_env, int32_t leg, float x, float th0, float z)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (!control_allows(MPX_CTRL_FEET)) return MPX_ERR_BUSY;
+
+	switch (leg) {
+	case MPX_LEG_FR: robot::front_right_ik(x, th0, z); return MPX_OK;
+	case MPX_LEG_FL: robot::front_left_ik (x, th0, z); return MPX_OK;
+	case MPX_LEG_RR: robot::rear_right_ik (x, th0, z); return MPX_OK;
+	case MPX_LEG_RL: robot::rear_left_ik  (x, th0, z); return MPX_OK;
+	default:         return MPX_ERR_ARG;
+	}
+}
+
+// ── Capabilities that existed in robot.h but not in the ABI ────
+
+int32_t host_mpx_set_all_servo_speed(wasm_exec_env_t exec_env, int32_t speed)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (speed < 0 || speed > 2047) return MPX_ERR_ARG;
+	robot::set_all_servo_speed(static_cast<uint16_t>(speed));
+	return MPX_OK;
+}
+
+int32_t host_mpx_reset_offsets(wasm_exec_env_t exec_env)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	robot::reset_offsets();
+	return MPX_OK;
+}
+
+// Returns degrees Celsius, or -1.0f on a bad id. robot_read_temperature()
+// already existed but truncated to a whole degree, which is too coarse to
+// watch a joint heat up over a long routine.
+float host_mpx_read_temperature_c(wasm_exec_env_t exec_env, int32_t id)
+{
+	(void)exec_env;
+	if (id < 1 || id > 12) return -1.0f;
+	return robot::read_temperature_c(static_cast<int>(id));
+}
+
+// ── Skill parameters ───────────────────────────────────────────
+//
+// on_start() takes no arguments, so "the same wave, but three times and
+// faster" meant an edit and a recompile, and the web UI had no way to offer a
+// knob. Parameters are supplied per run (POST /v1/skills/run) and read here by
+// name, with a fallback the skill chooses — so a skill run with no parameters
+// at all still behaves exactly as it was written.
+
+float host_mpx_param_f(wasm_exec_env_t exec_env, int32_t name_ptr, float fallback)
+{
+	(void)exec_env;
+	if (name_ptr == 0) return fallback;
+	const char *name = reinterpret_cast<const char *>(static_cast<uintptr_t>(name_ptr));
+	float out = 0.0f;
+	return wasm::param_get(name, &out) ? out : fallback;
+}
+
+int32_t host_mpx_param_i(wasm_exec_env_t exec_env, int32_t name_ptr, int32_t fallback)
+{
+	(void)exec_env;
+	if (name_ptr == 0) return fallback;
+	const char *name = reinterpret_cast<const char *>(static_cast<uintptr_t>(name_ptr));
+	float out = 0.0f;
+	return wasm::param_get(name, &out) ? static_cast<int32_t>(out) : fallback;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  v4 — overlay, tick, trace
+// ═══════════════════════════════════════════════════════════════
+
+int32_t host_mpx_overlay(wasm_exec_env_t exec_env, int32_t id, float deg)
+{
+	(void)exec_env;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (id < 1 || id > 12) return MPX_ERR_ARG;
+
+	// Deliberately NOT gated on control arbitration. The point of an overlay is
+	// to ride on top of something else that owns the joints — usually the gait
+	// generator. Refusing it unless the caller holds the joints would refuse it
+	// in exactly the case it exists for. The clamp in robot::set_overlay() is
+	// what makes that safe.
+	robot::set_overlay(static_cast<int>(id), deg);
+	return MPX_OK;
+}
+
+float host_mpx_overlay_get(wasm_exec_env_t exec_env, int32_t id)
+{
+	(void)exec_env;
+	if (id < 1 || id > 12) return 0.0f;
+	return robot::get_overlay(static_cast<int>(id));
+}
+
+int32_t host_mpx_overlay_clear(wasm_exec_env_t exec_env)
+{
+	(void)exec_env;
+	robot::clear_overlay();
+	return MPX_OK;
+}
+
+int32_t host_mpx_tick_every(wasm_exec_env_t exec_env, int32_t period_ms)
+{
+	(void)exec_env;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	if (period_ms < 0) return MPX_ERR_ARG;
+	wasm::tick_every(static_cast<int>(period_ms));
+	return MPX_OK;
+}
+
+int32_t host_mpx_tick_stop(wasm_exec_env_t exec_env)
+{
+	(void)exec_env;
+	wasm::tick_stop();
+	return MPX_OK;
+}
+
+int32_t host_mpx_trace(wasm_exec_env_t exec_env, int32_t name_ptr, float value)
+{
+	(void)exec_env;
+	// No was_cancelled() check here: the trace emitted on the way out of a
+	// dying skill is often the one that explains why it died.
+	if (name_ptr == 0) return MPX_ERR_ARG;
+
+	// "$" in the signature means WAMR has already bounds-checked and converted
+	// the pointer, so this is a native pointer into the sandbox's memory.
+	const char *name = reinterpret_cast<const char *>(
+		static_cast<uintptr_t>(name_ptr));
+	if (!name) return MPX_ERR_ARG;
+
+	util::trace_ring_put(name, value, wasm::skill_millis());
+	return MPX_OK;
 }
 
 }  // namespace sdk

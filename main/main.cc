@@ -6,6 +6,9 @@
 
 #include "fs/littlefs_manager.h"
 #include "lua/lua_vm.h"
+#include "skills/autorun.h"
+#include "skills/events.h"
+#include "skills/registry.h"
 #include "network/chat_ws.h"
 #include "network/http_server.h"
 #include "network/wifi_ap.h"
@@ -94,6 +97,18 @@ extern "C" void app_main(void)
 		ESP_LOGE(TAG, "WAMR sandbox init failed");
 		return;
 	}
+
+	// ── Skill registry, triggers and autorun ──────────────────
+	//
+	// Ordering matters and is not arbitrary: the registry reads the .wasm
+	// files, so it needs LittleFS; autorun_boot() starts a skill, so it needs
+	// the sandbox and the robot HAL; and both come AFTER the HTTP server, so
+	// that if an autorun skill misbehaves the web UI is already up and the
+	// user can uninstall it. That last one is the difference between a bad
+	// skill and a brick.
+	skills::rescan();
+	skills::events_start();
+	skills::autorun_boot();
 
 	// ── Lua scripting VM ──────────────────────────────────────
 	if (lua_init() != ESP_OK) {

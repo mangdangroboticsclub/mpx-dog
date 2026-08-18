@@ -234,6 +234,24 @@ bool init();
  */
 void send_gait_cmd(GaitCmd cmd);
 
+/* ── The one gait name table ──────────────────────────────────────────────
+ *
+ * This mapping existed in three hand-maintained copies -- the SDK's host
+ * function, the HTTP handler, and the logging switch in gait_task() -- which
+ * is three chances for a name to mean different things depending on who asked.
+ * They now all come here.
+ */
+
+/** Look a wire name up. False if there is no such gait. */
+bool gait_from_name(const char *name, GaitCmd &out);
+
+/** The wire name for a gait, or "none". */
+const char *gait_to_name(GaitCmd cmd);
+
+/** How many named gaits there are, and the i-th name. For listing them. */
+int         gait_name_count();
+const char *gait_name_at(int index);
+
 /**
  * @brief Return the currently active gait command.
  */
@@ -505,6 +523,37 @@ void set_all_servo_speed(uint16_t speed);
  *        (one SPI frame per board, 12 servos total).
  */
 void flush();
+
+/* ── Overlay: add to whatever is already driving the joints ────────────────
+ *
+ * The four control layers replace one another. A skill that wants "the
+ * built-in walk, but with the tail wiggling" has, until now, had to
+ * reimplement the walk -- there was no way to add to a frame the gait
+ * generator produced. That is a large share of the reasons people fork this
+ * firmware instead of writing a skill.
+ *
+ * The overlay is a per-joint offset in degrees, applied in flush() to the
+ * outgoing frame only. It never touches s_goal_pos, so it does not
+ * accumulate, and whatever owns the joints -- gait generator, IK, or a skill
+ * -- keeps owning them.
+ *
+ * Deliberately clamped hard. An overlay is a garnish, not a control path: a
+ * skill that wants authority over a joint should take it properly. The clamp
+ * is what makes it safe to apply on top of a running gait without the two
+ * combining into something that tips the robot over.
+ *
+ * Cleared when a skill ends, however it ends.
+ */
+constexpr float SERVO_OVERLAY_MAX_DEG = 20.0f;
+
+/** Set one joint's overlay, in degrees. Clamped to +/-SERVO_OVERLAY_MAX_DEG. */
+void set_overlay(int servo_id, float deg);
+
+/** Read one joint's overlay back, in degrees. 0 for an invalid id. */
+float get_overlay(int servo_id);
+
+/** Drop every overlay. Called by the sandbox when a skill ends. */
+void clear_overlay();
 
 // ── Per‑leg IK helpers ───────────────────────────────────────
 

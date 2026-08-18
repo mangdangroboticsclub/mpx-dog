@@ -242,6 +242,29 @@ const char *driver_board_param_name(int param_id);
 int driver_board_param_id(const char *name);
 
 /* servo = 1..12 (global id). Return true on success. */
+/* ── The SPI2 bus lock ────────────────────────────────────────────────────
+ *
+ * SPI2 is shared: four AT32 driver boards and the IMU, same three pins, their
+ * own CS lines. ESP-IDF serialises individual transactions, which is enough
+ * for anything that talks in single transfers.
+ *
+ * A config request is NOT a single transfer. It is a request followed by a NOP
+ * that clocks the reply back out, and the two must not be separated — split
+ * them and the reply is left pending in the AT32's tx buffer, where the next
+ * decode reads it as garbage (a 31.03 degC reply becomes 1540.8 degC).
+ *
+ * driver_board.c already held its own mutex across each whole operation, which
+ * protects driver-board callers from each other. It does NOT protect them from
+ * the IMU task, which shares the bus, knows nothing about that mutex, and
+ * transacts every 50 ms. That is a wide enough window to land inside almost
+ * every config request, and it is why Servo Studio could not write a parameter
+ * here while the same driver code works in a firmware that has no IMU.
+ *
+ * Any other task using SPI2 must take this around its transfers.
+ */
+void driver_board_bus_lock(void);
+void driver_board_bus_unlock(void);
+
 bool driver_board_set_param(int servo, int param_id, float value);
 bool driver_board_get_param(int servo, int param_id, float *out);
 

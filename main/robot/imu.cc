@@ -1,4 +1,5 @@
 #include "robot/imu.h"
+#include "robot/driver_board.h"   /* shared SPI2 bus lock */
 
 #include <cstring>
 #include <cmath>
@@ -120,7 +121,17 @@ static bool configure_imu()
 static bool read_6dof(robot::ImuData &out)
 {
     uint8_t raw[12] = {};
-    if (spi_read_burst(REG_OUT_XL_XL, raw, sizeof(raw)) != ESP_OK) {
+
+    // SPI2 is shared with the four AT32 driver boards. Their config requests
+    // are a request/NOP PAIR that must not be split, and this task fires every
+    // 50 ms — wide enough to land inside almost every one of them. Taking the
+    // driver board's own bus lock is what keeps the two off each other; see
+    // the note above driver_board_bus_lock().
+    driver_board_bus_lock();
+    const esp_err_t rc = spi_read_burst(REG_OUT_XL_XL, raw, sizeof(raw));
+    driver_board_bus_unlock();
+
+    if (rc != ESP_OK) {
         return false;
     }
 

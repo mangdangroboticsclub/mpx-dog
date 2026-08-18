@@ -30,7 +30,20 @@ namespace sdk {
  * Better to spend that now than after the marketplace fills with binaries
  * nobody can recompile.
  */
-constexpr int32_t MPX_ABI_VERSION = 2;
+/* v4 adds three capabilities that previously required patching firmware:
+ *
+ *   on_tick   a skill can run inside the control loop instead of being a
+ *             script that plays once (mpx_tick_every / mpx_tick_stop)
+ *   overlay   a skill can add to a frame the gait generator produced,
+ *             instead of having to replace it (mpx_overlay*)
+ *   trace     a skill can emit named numbers, not just text (mpx_trace)
+ *
+ * Purely additive: every v3 symbol keeps its name, signature and meaning, so
+ * a v3 module runs unchanged. The version still moves because a v4 module
+ * will not run on v3 firmware, and finding that out as a trap on the first
+ * host call is exactly what the version check exists to prevent.
+ */
+constexpr int32_t MPX_ABI_VERSION = 4;
 
 /* Every host function returns one of these, or a value >= 0 where it is
  * documented to return data. Before v2 there were four incompatible
@@ -44,6 +57,7 @@ enum : int32_t {
 	MPX_ERR_READONLY   = -4,   /**< Calibration parameter; read-only.       */
 	MPX_ERR_CANCELLED  = -5,   /**< The skill was stopped mid-call.         */
 	MPX_ERR_STATE      = -6,   /**< Right call, wrong time.                 */
+	MPX_ERR_BUSY       = -7,   /**< Another control domain holds the joints. */
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -340,6 +354,90 @@ int32_t host_servo_direct(wasm_exec_env_t exec_env, int32_t id, int32_t mode,
 						  float q_deg, float tau_ma);
 int32_t host_servo_scan(wasm_exec_env_t exec_env);
 
+/* ── v4: overlay, tick, trace ────────────────────────────────────────────── */
+
+/** Wasm-side: int mpx_overlay(int joint, float deg); sig "(if)i".
+ *  A clamped per-joint offset added to the outgoing frame, on top of whatever
+ *  is driving the joints. */
+int32_t host_mpx_overlay(wasm_exec_env_t exec_env, int32_t id, float deg);
+
+/** Wasm-side: float mpx_overlay_get(int joint); sig "(i)f". */
+float   host_mpx_overlay_get(wasm_exec_env_t exec_env, int32_t id);
+
+/** Wasm-side: int mpx_overlay_clear(void); sig "()i". */
+int32_t host_mpx_overlay_clear(wasm_exec_env_t exec_env);
+
+/** Wasm-side: int mpx_tick_every(int period_ms); sig "(i)i".
+ *  Asks for on_tick(dt_ms) every period_ms once on_start() returns. */
+int32_t host_mpx_tick_every(wasm_exec_env_t exec_env, int32_t period_ms);
+
+/** Wasm-side: int mpx_tick_stop(void); sig "()i". */
+int32_t host_mpx_tick_stop(wasm_exec_env_t exec_env);
+
+/** Wasm-side: int mpx_trace(const char *name, float value); sig "($f)i". */
+int32_t host_mpx_trace(wasm_exec_env_t exec_env, int32_t name_ptr, float value);
+
+
+// ═══════════════════════════════════════════════════════════════
+//  ABI v3 additions
+//
+//  v3 is additive over v2 in behaviour: every v2 symbol keeps its name,
+//  signature and semantics. What v3 adds is (a) the capabilities the board
+//  always had but a skill could not reach, and (b) the arbitration that makes
+//  the control layers composable instead of merely coexistent.
+//
+//  Control arbitration is OPT-IN. Until a skill calls mpx_control_take(),
+//  s_control_owner is MPX_CTRL_NONE and every write path behaves exactly as it
+//  did in v2. A skill that takes a domain gets MPX_ERR_BUSY instead of a silent
+//  fight, which is the whole point.
+// ═══════════════════════════════════════════════════════════════
+
+enum : int32_t {
+	MPX_CTRL_NONE   = 0,   /**< Nobody has claimed the joints (v2 behaviour). */
+	MPX_CTRL_GAIT   = 1,   /**< The gait generator drives; you steer it.      */
+	MPX_CTRL_FEET   = 2,   /**< You place feet; firmware solves the legs.     */
+	MPX_CTRL_JOINTS = 3,   /**< You write joint angles directly.              */
+	MPX_CTRL_BUS    = 4,   /**< You own the servo bus (implies servo_lock).   */
+};
+
+/** Legs, for mpx_foot(). Matches the robot_ik_* ordering. */
+enum : int32_t {
+	MPX_LEG_FR = 0, MPX_LEG_FL = 1, MPX_LEG_RR = 2, MPX_LEG_RL = 3,
+};
+
+/* Control arbitration ------------------------------------------------------ */
+int32_t host_mpx_control_take(wasm_exec_env_t exec_env, int32_t domain);
+int32_t host_mpx_control_release(wasm_exec_env_t exec_env);
+int32_t host_mpx_control_owner(wasm_exec_env_t exec_env);
+
+/** True when `domain` may write right now. Used by the v2 write paths. */
+bool control_allows(int32_t domain);
+
+/** Reset arbitration to MPX_CTRL_NONE. Called by the sandbox per skill run. */
+void control_reset();
+
+/* Clock -------------------------------------------------------------------- */
+int32_t host_mpx_millis(wasm_exec_env_t exec_env);
+int32_t host_mpx_sleep_until(wasm_exec_env_t exec_env, int32_t t_ms);
+
+/* Continuous drive — the analog path the web UI already uses ---------------- */
+int32_t host_mpx_drive(wasm_exec_env_t exec_env, float fwd, float strafe, float turn);
+int32_t host_mpx_drive_stop(wasm_exec_env_t exec_env);
+int32_t host_mpx_set_walk_speed(wasm_exec_env_t exec_env, int32_t mm_s);
+int32_t host_mpx_get_walk_speed(wasm_exec_env_t exec_env);
+
+/* Foot placement in one call ------------------------------------------------ */
+int32_t host_mpx_foot(wasm_exec_env_t exec_env, int32_t leg, float x, float th0, float z);
+
+/* Capabilities that existed in robot.h but not in the ABI ------------------- */
+int32_t host_mpx_set_all_servo_speed(wasm_exec_env_t exec_env, int32_t speed);
+int32_t host_mpx_reset_offsets(wasm_exec_env_t exec_env);
+float   host_mpx_read_temperature_c(wasm_exec_env_t exec_env, int32_t id);
+
+/* Skill parameters — set per run, so one skill covers many variations ------- */
+float   host_mpx_param_f(wasm_exec_env_t exec_env, int32_t name_ptr, float fallback);
+int32_t host_mpx_param_i(wasm_exec_env_t exec_env, int32_t name_ptr, int32_t fallback);
+
 static NativeSymbol NATIVE_SYMBOLS[] = {
 	// ABI
 	{ "mpx_abi_version",        (void *)host_mpx_abi_version,        "()i",  nullptr },
@@ -408,6 +506,39 @@ static NativeSymbol NATIVE_SYMBOLS[] = {
 	{ "servo_direct",         (void *)host_servo_direct,         "(iiff)i", nullptr },
 	{ "servo_scan",           (void *)host_servo_scan,           "()i",     nullptr },
 
+	// ── ABI v3 ──────────────────────────────────────────────────────────────
+	// Control arbitration (opt-in; no effect until a skill calls take())
+	{ "mpx_control_take",     (void *)host_mpx_control_take,     "(i)i",    nullptr },
+	{ "mpx_control_release",  (void *)host_mpx_control_release,  "()i",     nullptr },
+	{ "mpx_control_owner",    (void *)host_mpx_control_owner,    "()i",     nullptr },
+	// Clock
+	{ "mpx_millis",           (void *)host_mpx_millis,           "()i",     nullptr },
+	{ "mpx_sleep_until",      (void *)host_mpx_sleep_until,      "(i)i",    nullptr },
+	// Continuous drive
+	{ "mpx_drive",            (void *)host_mpx_drive,            "(fff)i",  nullptr },
+	{ "mpx_drive_stop",       (void *)host_mpx_drive_stop,       "()i",     nullptr },
+	{ "mpx_set_walk_speed",   (void *)host_mpx_set_walk_speed,   "(i)i",    nullptr },
+	{ "mpx_get_walk_speed",   (void *)host_mpx_get_walk_speed,   "()i",     nullptr },
+	// Foot placement
+	{ "mpx_foot",             (void *)host_mpx_foot,             "(ifff)i", nullptr },
+	// Previously unreachable capabilities
+	{ "mpx_set_all_servo_speed",(void *)host_mpx_set_all_servo_speed,"(i)i",nullptr },
+	{ "mpx_reset_offsets",    (void *)host_mpx_reset_offsets,    "()i",     nullptr },
+	{ "mpx_read_temperature_c",(void *)host_mpx_read_temperature_c,"(i)f",  nullptr },
+	// Skill parameters
+	{ "mpx_param_f",          (void *)host_mpx_param_f,          "($f)f",   nullptr },
+	{ "mpx_param_i",          (void *)host_mpx_param_i,          "($i)i",   nullptr },
+
+	// ── ABI v4 ──────────────────────────────────────────────────────────────
+	// Composing with the gait rather than replacing it
+	{ "mpx_overlay",          (void *)host_mpx_overlay,          "(if)i",   nullptr },
+	{ "mpx_overlay_get",      (void *)host_mpx_overlay_get,      "(i)f",    nullptr },
+	{ "mpx_overlay_clear",    (void *)host_mpx_overlay_clear,    "()i",     nullptr },
+	// Running inside the control loop
+	{ "mpx_tick_every",       (void *)host_mpx_tick_every,       "(i)i",    nullptr },
+	{ "mpx_tick_stop",        (void *)host_mpx_tick_stop,        "()i",     nullptr },
+	// Being able to see what a control loop is doing
+	{ "mpx_trace",            (void *)host_mpx_trace,            "($f)i",   nullptr },
 };
 
 static constexpr uint32_t NUM_NATIVE_SYMBOLS =

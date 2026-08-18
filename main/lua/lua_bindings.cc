@@ -18,6 +18,12 @@
 
 #include <string.h>
 #include <stdio.h>
+/* std::memcmp / std::snprintf / std::malloc are used throughout this file;
+   name them from the C++ headers rather than relying on the C ones also
+   populating namespace std, which is implementation-defined. */
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <dirent.h>
 
 #include "esp_log.h"
@@ -720,9 +726,16 @@ static int l_fs_read(lua_State *L)
 }
 
 /**
- * fs.write(path, content) → bool
+ * fs.write(path, content) → bool [, reason]
  *
  * Requests user permission via action telemetry before writing.
+ *
+ * An MPXE payload is checked BEFORE it is stored. A skill whose GCM tag does
+ * not verify is not going to start working later — the bytes are wrong and
+ * every run fails identically — so writing it produces a robot that reports
+ * "✓ deployed" and then refuses to run the thing it just deployed, once per
+ * press, forever. Verifying here costs one decrypt at install time and turns
+ * that into a single honest failure at the moment of download.
  */
 static int l_fs_write(lua_State *L)
 {
@@ -735,12 +748,67 @@ static int l_fs_write(lua_State *L)
         return 1;
     }
 
-    // Build a description for the permission request
+    /* Detect by magic rather than by extension: the loader does the same, so
+       whatever this check accepts is exactly what will later be run. */
+    if (content_len >= 4 && std::memcmp(content, "MPXE", 4) == 0) {
+        size_t accepted = content_len;
+        const auto vr = wasm::verify_mpxe(
+            reinterpret_cast<const uint8_t *>(content), content_len, &accepted);
+        if (vr != wasm::DecryptResult::Success) {
+            const char *why = wasm::decrypt_result_name(vr);
+            ESP_LOGE(TAG, "fs.write: refusing to store '%s' (%zu B) — %s",
+                     path, content_len, why);
+            lua_pushboolean(L, 0);
+            lua_pushstring(L, why);
+            return 2;
+        }
+        if (accepted != content_len) {
+            /* The payload authenticated one byte short. Store the length that
+               verified, not the length that arrived, so the file on flash is
+               the publisher's blob and every later load is a clean first-try
+               decrypt rather than a failure plus a retry. */
+            ESP_LOGW(TAG, "fs.write: storing '%s' as %zu B, not the %zu B that "
+                          "arrived — the last byte is not part of the skill",
+                     path, accepted, content_len);
+            content_len = accepted;
+        }
+        ESP_LOGI(TAG, "fs.write: MPXE payload for '%s' verified (%zu B)",
+                 path, content_len);
+    }
+
+    /* What the person is actually being asked.
+     *
+     * "Write file '/gaits.mpxe' (26995 bytes)" is the truth stated in the
+     * robot's terms, not theirs: a path they did not choose and a byte count
+     * they cannot judge. Installing a skill and dropping a data file are
+     * different decisions and should not read identically. So say which one
+     * this is, name the file the way it will appear in the list, and give the
+     * size in a unit a person weighs things in. */
+    const bool is_skill = (content_len >= 4 &&
+                           std::memcmp(content, "MPXE", 4) == 0);
+    const char *leaf = std::strrchr(path, '/');
+    leaf = leaf ? leaf + 1 : path;
+
+    char size_txt[24];
+    if (content_len >= 1024) {
+        std::snprintf(size_txt, sizeof(size_txt), "%.1f KB", content_len / 1024.0);
+    } else {
+        std::snprintf(size_txt, sizeof(size_txt), "%zu bytes", content_len);
+    }
+
     char desc[256];
-    std::snprintf(desc, sizeof(desc), "Write file '%s' (%zu bytes)", path, content_len);
+    if (is_skill) {
+        std::snprintf(desc, sizeof(desc),
+                      "Install the skill \"%s\" (%s). Signature verified for "
+                      "this robot.", leaf, size_txt);
+    } else {
+        std::snprintf(desc, sizeof(desc), "Save the file \"%s\" (%s) to the "
+                                          "robot's storage", leaf, size_txt);
+    }
 
     // Request user permission (blocks until approved/denied, 60s timeout)
-    if (!network::request_permission("file_write", desc, 60000)) {
+    if (!network::request_permission(is_skill ? "skill_install" : "file_write",
+                                     desc, 60000)) {
         ESP_LOGW(TAG, "fs.write: user denied write to '%s'", path);
         lua_pushboolean(L, 0);
         return 1;
@@ -877,15 +945,38 @@ static int l_fs_info(lua_State *L)
  * ═══════════════════════════════════════════════════════════════ */
 
 /**
- * crypto.base64_decode(str) → string (raw bytes)
+ * crypto.base64_decode(str) → string (raw bytes), or nil + reason
  *
- * Decodes a standard base64-encoded string into raw bytes.
- * Supports both RFC 4648 base64 ('+', '/') with optional '=' padding
- * and unpadded base64 (no '=' chars).
+ * Decodes RFC 4648 base64 ('+', '/') or base64url ('-', '_'), with or
+ * without '=' padding. ASCII whitespace is ignored so a wrapped payload
+ * still decodes.
  *
- * This handles '=' padding correctly, so callers can use standard
- * base64 encoding without needing null-byte padding tricks.
+ * STRICT ON PURPOSE — and this is the whole point of the rewrite.
+ *
+ * This used to silently SKIP every character it did not recognise. That is
+ * fine for whitespace and ruinous for anything else: a payload that gained,
+ * lost or mangled a single character still "decoded", just to a string of the
+ * wrong length. It is exactly the wrong failure mode for a stream that ends
+ * up inside AES-GCM, where the tag is located by offset from the END of the
+ * blob. One extra byte moves the tag, gcm_auth_decrypt returns -18, and the
+ * error surfaces three layers later as "blob is corrupted or tampered" — a
+ * message that points at the crypto when the fault was in the transport.
+ *
+ * base64url used to be worse than a wrong length: '-' and '_' were skipped
+ * outright, so a base64url payload decoded to confident garbage. They are now
+ * decoded properly.
+ *
+ * A decoder that cannot tell you its input was malformed is not saving you
+ * anything. This one refuses, and says which byte and where.
  */
+static int b64_fail(lua_State *L, const char *why)
+{
+    ESP_LOGE(TAG, "base64_decode: %s", why);
+    lua_pushnil(L);
+    lua_pushstring(L, why);
+    return 2;
+}
+
 static int l_crypto_base64_decode(lua_State *L)
 {
     size_t in_len = 0;
@@ -917,77 +1008,132 @@ static int l_crypto_base64_decode(lua_State *L)
         0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
     };
 
-    // Count valid base64 characters (a-z, A-Z, 0-9, +, /)
-    // '=' is padding — excluded from valid count
-    size_t valid = 0;
+    // base64url aliases: '-' is 62 and '_' is 63. Skipping them, as this used
+    // to, decodes a base64url payload into confident garbage.
+    /* DEC has static storage duration, so it must NOT be captured — it is
+       simply in scope. Capturing it is a compile error. */
+    auto dec_of = [](unsigned char c) -> unsigned char {
+        if (c == '-') return 0x3E;
+        if (c == '_') return 0x3F;
+        return DEC[c];
+    };
+    auto is_space = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+    };
+
+    // ── Pass 1: validate, and count ─────────────────────────────
+    // Every byte must be alphabet, padding, or whitespace. Padding must come
+    // last. Anything else is a corrupt payload, and saying so here is the
+    // only place it can still be attributed to the transport.
+    size_t valid = 0, pad = 0;
     for (size_t i = 0; i < in_len; i++) {
-        unsigned char c = static_cast<unsigned char>(in[i]);
-        if (DEC[c] != 0xFF) {
-            valid++;
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+
+        if (is_space(c)) continue;
+
+        if (c == '=') { pad++; continue; }
+
+        if (dec_of(c) == 0xFF) {
+            char why[128];
+            std::snprintf(why, sizeof(why),
+                          "invalid byte 0x%02x ('%c') at offset %zu of %zu — "
+                          "payload is not base64",
+                          c, (c >= 32 && c < 127) ? c : '?', i, in_len);
+            return b64_fail(L, why);
         }
-        // '=' and other chars (whitespace, newlines) are silently skipped
+
+        if (pad) {
+            char why[128];
+            std::snprintf(why, sizeof(why),
+                          "data after '=' padding at offset %zu — payload is "
+                          "truncated or two payloads were concatenated", i);
+            return b64_fail(L, why);
+        }
+        valid++;
     }
 
-    if (valid == 0) {
+    if (valid == 0 && pad == 0) {
         lua_pushliteral(L, "");
         return 1;
     }
 
-    // Output size calculation:
-    //   Each complete group of 4 valid chars → 3 bytes.
-    //   Trailing partial group: 2 valid → 1 byte, 3 valid → 2 bytes.
-    //   '=' padding is already excluded from valid, so no extra
-    //   subtraction is needed — the partial-group logic handles it.
+    // A base64 group is 4 characters. 1 left over cannot exist: no number of
+    // bytes encodes to a single trailing character. If this fires, a character
+    // was added or lost in transit — which for an encrypted blob means the
+    // GCM tag would land at the wrong offset and fail with a message about
+    // corruption three layers away from the actual fault.
+    if (valid % 4 == 1) {
+        char why[160];
+        std::snprintf(why, sizeof(why),
+                      "%zu base64 characters is not a valid length "
+                      "(%zu %% 4 == 1) — one character was added or lost in "
+                      "transit", valid, valid);
+        return b64_fail(L, why);
+    }
+    if (pad > 2 || (pad && (valid + pad) % 4 != 0)) {
+        char why[160];
+        std::snprintf(why, sizeof(why),
+                      "bad padding: %zu data characters + %zu '=' is not a "
+                      "multiple of 4 — the payload did not arrive intact",
+                      valid, pad);
+        return b64_fail(L, why);
+    }
+
+    // Output size: each full group of 4 → 3 bytes; a trailing 2 → 1, 3 → 2.
     size_t out_len = (valid / 4) * 3;
-    size_t rem = valid % 4;
-    if (rem == 2) out_len += 1;
-    else if (rem == 3) out_len += 2;
-    // rem == 0 or 1: no partial output (1 valid char is invalid base64)
+    switch (valid % 4) {
+    case 2: out_len += 1; break;
+    case 3: out_len += 2; break;
+    default: break;
+    }
 
     // Allocate output buffer on heap (WASM files can be large)
     auto *out = static_cast<char *>(std::malloc(out_len + 1));
     if (!out) {
-        lua_pushnil(L);
-        return 1;
+        return b64_fail(L, "out of memory");
     }
 
-    // Decode
+    // ── Pass 2: decode ──────────────────────────────────────────
     size_t out_pos = 0;
     unsigned char buf[4];
     int buf_pos = 0;
 
     for (size_t i = 0; i < in_len; i++) {
-        unsigned char c = static_cast<unsigned char>(in[i]);
-        unsigned char val = DEC[c];
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c == '=' || is_space(c)) continue;
 
-        if (val == 0xFF) continue;  // skip whitespace, '=', and other non-base64 chars
-
-        buf[buf_pos++] = val;
+        buf[buf_pos++] = dec_of(c);
 
         if (buf_pos == 4) {
-            out[out_pos++] = (buf[0] << 2) | (buf[1] >> 4);
-            out[out_pos++] = (buf[1] << 4) | (buf[2] >> 2);
-            out[out_pos++] = (buf[2] << 6) | buf[3];
+            out[out_pos++] = static_cast<char>((buf[0] << 2) | (buf[1] >> 4));
+            out[out_pos++] = static_cast<char>((buf[1] << 4) | (buf[2] >> 2));
+            out[out_pos++] = static_cast<char>((buf[2] << 6) | buf[3]);
             buf_pos = 0;
         }
     }
 
     // Handle trailing partial group
     if (buf_pos >= 2) {
-        out[out_pos++] = (buf[0] << 2) | (buf[1] >> 4);
+        out[out_pos++] = static_cast<char>((buf[0] << 2) | (buf[1] >> 4));
     }
     if (buf_pos >= 3) {
-        out[out_pos++] = (buf[1] << 4) | (buf[2] >> 2);
+        out[out_pos++] = static_cast<char>((buf[1] << 4) | (buf[2] >> 2));
     }
 
-    // Sanity check: decoded bytes should match our size prediction
+    // Both figures now come from independent reasoning — pass 1 predicted from
+    // the validated character count, pass 2 counted what it wrote — so unlike
+    // the old check, disagreement here is real information.
     if (out_pos != out_len) {
-        ESP_LOGW(TAG, "base64_decode: size mismatch (expected=%zu, actual=%zu) — "
-                 "input may be malformed", out_len, out_pos);
+        std::free(out);
+        char why[128];
+        std::snprintf(why, sizeof(why),
+                      "internal: predicted %zu bytes, produced %zu",
+                      out_len, out_pos);
+        return b64_fail(L, why);
     }
 
     out[out_pos] = 0;
-    lua_pushlstring(L, out, out_pos);  // use actual decoded size, not prediction
+    lua_pushlstring(L, out, out_pos);
     std::free(out);
     return 1;
 }

@@ -326,20 +326,57 @@ static bool cfg_xfer(uint8_t board, uint16_t op, uint16_t servo_index,
 
 /* The AT32 loads its reply into the frame clocked out on the NEXT
  * transaction, so every request is a request/NOP transaction pair. */
+/* The reference firmware reads the reply once, 500 us after the request, and
+ * that is enough there. It is not enough here, and the difference is not this
+ * function: mangdang shares SPI2 with an IMU that the reference does not have,
+ * so a config request can be delayed by a transfer the reference never sees.
+ *
+ * Retrying costs nothing in the normal case -- the first attempt succeeds and
+ * returns. The loop is bounded and can never hang the bus.
+ *
+ * The param_id echo does double duty: it proves the reply belongs to THIS
+ * request, and it is how a stale reply to the PREVIOUS one gets skipped
+ * instead of being returned as the answer.
+ */
+#define CFG_REPLY_TRIES     6
+#define CFG_REPLY_GAP_US  600
+
 static bool cfg_request(uint8_t board, uint16_t op, uint16_t servo_index,
                         uint16_t param_id, float value, float *out)
 {
     SMS_host_t rx;
     if (!cfg_xfer(board, op, servo_index, param_id, value, NULL)) return false;
-    esp_rom_delay_us(500);                       /* let the AT32 IRQ run   */
-    if (!cfg_xfer(board, CFG_OP_NOP, 0, 0, 0, &rx)) return false;
-    if (rx.status != START_CONFIG) return false; /* not a config response  */
-    if (rx.s1.position != param_id) return false;/* echo mismatch          */
-    /* the AT32 packs the float across reserved1+reserved2 (res1/res2 here,
-     * adjacent in a packed struct), little endian */
-    if (out) memcpy(out, &rx.s1.res1, sizeof(float));
-    return true;
+
+    bool saw_frame = false;
+    for (int attempt = 0; attempt < CFG_REPLY_TRIES; attempt++) {
+        esp_rom_delay_us(CFG_REPLY_GAP_US);      /* let the AT32 IRQ run */
+        if (!cfg_xfer(board, CFG_OP_NOP, 0, 0, 0, &rx)) return false;
+
+        if (rx.status != START_CONFIG) continue; /* not a config reply yet */
+        saw_frame = true;
+        if (rx.s1.position != param_id) continue;/* stale reply; keep looking */
+
+        /* the AT32 packs the float across reserved1+reserved2 (res1/res2
+         * here, adjacent in a packed struct), little endian */
+        if (out) memcpy(out, &rx.s1.res1, sizeof(float));
+        return true;
+    }
+
+    /* Name which failure it was. They need different fixes, and one message
+     * covering both is why this took several attempts to find. */
+    ESP_LOGW(TAG, "cfg op %u param %u board %u: %s after %d tries",
+             (unsigned)op, (unsigned)param_id, (unsigned)board,
+             saw_frame ? "reply never echoed the parameter"
+                       : "board never sent a config reply",
+             CFG_REPLY_TRIES);
+    return false;
 }
+
+
+/* The same mutex driver_board.c uses internally, for the other SPI2 users.
+ * Exposed rather than duplicated: two locks guarding one bus is not a lock. */
+void driver_board_bus_lock(void)   { DB_LOCK(); }
+void driver_board_bus_unlock(void) { DB_UNLOCK(); }
 
 bool driver_board_set_param(int servo, int param_id, float value)
 {
@@ -380,6 +417,13 @@ bool driver_board_get_live(int servo, int live_id, float *out)
     return ok;
 }
 
+/* SAVE and RESTORE, for one board or all four.
+ *
+ * servo_index 0 and param_id 0 are placeholders: these ops address the board,
+ * not a servo. Identical to the reference firmware, which flashes reliably --
+ * an earlier guess here that the op needed repeating per servo index was
+ * wrong, and mpxesp is the evidence.
+ */
 static bool cfg_board_op(int board, uint16_t op)
 {
     DB_LOCK();

@@ -1,4 +1,5 @@
 #include "network/chat_ws.h"
+#include "skills/events.h"
 #include "network/crypto.h"
 #include "network/wifi_sta.h"
 
@@ -1392,6 +1393,15 @@ esp_err_t chat_send_handler(httpd_req_t *req)
         }
     }
 
+    // A skill can ask to be run by what someone says: "on": ["chat:dance"].
+    // Fired before the message goes anywhere else, so the robot reacts while
+    // the reply is still being composed. Matching is the first word,
+    // lowercased; a skill already running means the event is dropped, not
+    // queued — see skills/events.h.
+    if (!user_text.empty()) {
+        skills::fire_chat(user_text.c_str());
+    }
+
     if (user_text.empty()) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "application/json");
@@ -1579,8 +1589,17 @@ esp_err_t chat_ws_handler(httpd_req_t *req)
     httpd_ws_frame_t ws_pkt{};
     esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
     if (ret != ESP_OK) {
-        ESP_LOGI(TAG, "Chat WebSocket recv header failed: %s",
-                 esp_err_to_name(ret));
+        /* A client that vanished — tab closed, phone locked, out of range —
+         * lands here with INVALID_STATE, because the read after the TCP reset
+         * finds no valid frame header. That is how nearly every session ends,
+         * so it is DEBUG. Anything else is a genuinely unexpected failure and
+         * still prints. Either way the client slot is released. */
+        if (ret == ESP_ERR_INVALID_STATE) {
+            ESP_LOGD(TAG, "Chat WebSocket closed by peer");
+        } else {
+            ESP_LOGW(TAG, "Chat WebSocket recv header failed: %s",
+                     esp_err_to_name(ret));
+        }
         release_pwa_client(req);
         return ret;
     }
@@ -1888,6 +1907,32 @@ bool request_permission(const char *type,
 {
     if (!type || !description) return false;
     if (!s_perm_semaphore || !s_perm_mutex) return false;
+
+    /* ── Nobody to ask ────────────────────────────────────────────
+     * This used to broadcast into an empty room and then block the caller for
+     * the full timeout. With no PWA attached that is a minute of a wedged Lua
+     * worker per action, during which the deploy pipeline keeps queueing more
+     * _deploy_N.lua scripts behind it — so one download with the app closed
+     * looked like several half-finished ones.
+     *
+     * A permission prompt with no one to show it to is a denial, and it is a
+     * denial NOW. Says so by name rather than reporting a timeout, because
+     * "the app was not open" and "you took too long" call for different
+     * things from whoever reads the log. */
+    int listeners = 0;
+    if (s_pwa_mutex) {
+        xSemaphoreTake(s_pwa_mutex, portMAX_DELAY);
+        for (size_t i = 0; i < MAX_PWA_WS_CLIENTS; ++i) {
+            if (s_pwa_clients[i].fd >= 0) listeners++;
+        }
+        xSemaphoreGive(s_pwa_mutex);
+    }
+    if (listeners == 0) {
+        ESP_LOGW(TAG, "Permission '%s' auto-DENIED: no app connected to ask "
+                      "(%s). Open the robot's app and try again.",
+                 type, description);
+        return false;
+    }
 
     // Generate a unique action ID using a timestamp
     char action_id[64];

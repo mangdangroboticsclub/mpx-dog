@@ -1,0 +1,10 @@
+# Force LF line endings for shell scripts on all platforms
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Force LF for other Unix-format files
+*.wat text eol=lf
+*.wast text eol=lf
+
+# Keep text files auto-detected
+* text=auto

@@ -1,6 +1,12 @@
 #include "wasm/wasm_sandbox.h"
+#include "util/trace_ring.h"
 #include "robot/robot.h"
 #include "wasm/wasm_decrypt.h"
+
+// Forward-declared rather than including sdk/wasm_host_functions.h: that
+// header carries the NativeSymbol table itself, and this file needs one
+// function from it.
+namespace sdk { void control_reset(); }
 
 #include <atomic>
 #include <cinttypes>
@@ -11,6 +17,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "wasm_export.h"
@@ -30,6 +37,41 @@ static std::atomic<bool> s_cancelled{false};
 // this to avoid flushing neutral positions that would overwrite
 // the skill's servo commands.
 static std::atomic<bool> s_running{false};
+
+
+// ── Per-run clock ────────────────────────────────────────────
+// Set immediately before the entry point is called, so mpx_millis() reads 0
+// at the first instruction of on_start() rather than "microseconds since the
+// ESP32 booted", which a skill has no way to subtract.
+static std::atomic<int64_t> s_start_us{0};
+
+// Tick state. Both are per-run and reset before on_start(), so a skill that
+// never calls mpx_tick_every() behaves exactly as it did before on_tick
+// existed: on_start returns, the skill ends.
+static std::atomic<int>  s_tick_period_ms{0};
+static std::atomic<bool> s_tick_stop{false};
+
+// s_cancelled means "wind up now" and is set by BOTH the watchdog and a
+// cooperative stop. Only the watchdog calls wasm_runtime_terminate(), which
+// unwinds the instance and makes calling into it undefined -- so the two cases
+// must be told apart or a cleanly-stopped behaviour never gets its on_stop().
+// That distinction is this flag, and nothing else.
+static std::atomic<bool> s_hard_killed{false};
+
+// How many consecutive ticks may overrun their period before the loop gives
+// up. One overrun is a slow frame; three in a row is a skill that cannot keep
+// the rate it asked for, and quietly running it late forever is worse than
+// saying so and stopping.
+static constexpr int TICK_OVERRUN_LIMIT = 3;
+
+// ── Per-run parameters ───────────────────────────────────────
+// Sixteen is well past what a skill's UI can usefully show, and a fixed array
+// keeps this off the heap in a path that already runs under a watchdog.
+static constexpr int MAX_PARAMS = 16;
+static constexpr int MAX_PARAM_NAME = 24;
+struct ParamKV { char name[MAX_PARAM_NAME]; float value; };
+static ParamKV s_params[MAX_PARAMS];
+static int s_param_count = 0;
 
 // --- Resource budgets -------------------------------------------------------
 // The runtime heap: used by WAMR for internal data structures.
@@ -97,6 +139,95 @@ struct LoadRunArgs {
 	// WASM loop.
 	wasm_module_inst_t module_inst;
 };
+
+/**
+ * @brief Drive on_tick() until the skill stops, traps, or the watchdog fires.
+ *
+ * Runs on the WASM thread after on_start() has returned, on its own exec_env
+ * -- the same pattern on_stop already uses, and safe for the same reason:
+ * the calls are sequential, never concurrent, on one module instance.
+ */
+static void wasm_run_tick_loop(wasm_module_inst_t inst)
+{
+	const int period_ms = s_tick_period_ms.load();
+	if (period_ms <= 0 || s_cancelled.load()) return;
+
+	wasm_function_inst_t tick_fn =
+		wasm_runtime_lookup_function(inst, "on_tick", nullptr);
+	if (!tick_fn) {
+		// Asking to tick without exporting on_tick is a build mistake, not a
+		// runtime one: say so rather than silently ending the skill.
+		ESP_LOGW(TAG, "mpx_tick_every(%d) was called but the module exports no "
+		              "on_tick -- add MPX_EXPORT void on_tick(int dt_ms)", period_ms);
+		return;
+	}
+
+	wasm_exec_env_t env = wasm_runtime_create_exec_env(inst, DEFAULT_STACK_SIZE);
+	if (!env) {
+		ESP_LOGE(TAG, "on_tick: could not create exec env");
+		return;
+	}
+
+	ESP_LOGI(TAG, "on_tick: starting at %d ms", period_ms);
+
+	const int64_t period_us = static_cast<int64_t>(period_ms) * 1000;
+	int64_t next_us  = esp_timer_get_time() + period_us;
+	int64_t prev_us  = esp_timer_get_time();
+	int     overruns = 0;
+	uint32_t ticks   = 0;
+
+	s_running = true;
+	while (!s_cancelled.load() && !s_tick_stop.load()) {
+		// Sleep to the next boundary. Absolute rather than relative so the
+		// period does not drift by however long the last tick took.
+		int64_t now_us = esp_timer_get_time();
+		if (next_us > now_us) {
+			const int64_t wait_ms = (next_us - now_us) / 1000;
+			if (wait_ms > 0) vTaskDelay(pdMS_TO_TICKS(wait_ms));
+			else             vTaskDelay(1);
+		} else {
+			// Already late: yield once so a fast period cannot starve
+			// anything else on this core, then carry on.
+			vTaskDelay(1);
+		}
+		if (s_cancelled.load() || s_tick_stop.load()) break;
+
+		now_us = esp_timer_get_time();
+		uint32_t argv[1] = { static_cast<uint32_t>((now_us - prev_us) / 1000) };
+		prev_us = now_us;
+
+		const int64_t call_start = now_us;
+		if (!wasm_runtime_call_wasm(env, tick_fn, 1, argv)) {
+			const char *exc = wasm_runtime_get_exception(inst);
+			ESP_LOGE(TAG, "on_tick trapped after %" PRIu32 " ticks: %s",
+			         ticks, exc ? exc : "unknown");
+			wasm_runtime_clear_exception(inst);
+			break;
+		}
+		++ticks;
+
+		const int64_t took_us = esp_timer_get_time() - call_start;
+		if (took_us > period_us) {
+			if (++overruns >= TICK_OVERRUN_LIMIT) {
+				ESP_LOGW(TAG, "on_tick overran %d ms %d times in a row "
+				              "(last %lld ms); stopping the tick loop",
+				         period_ms, overruns, (long long)(took_us / 1000));
+				break;
+			}
+		} else if (overruns) {
+			overruns = 0;
+		}
+
+		next_us += period_us;
+		// If we fell far behind, resynchronise instead of trying to catch up
+		// by running a burst of back-to-back ticks.
+		if (next_us < esp_timer_get_time()) next_us = esp_timer_get_time() + period_us;
+	}
+	s_running = false;
+
+	ESP_LOGI(TAG, "on_tick: stopped after %" PRIu32 " ticks", ticks);
+	wasm_runtime_destroy_exec_env(env);
+}
 
 /**
  * @brief Run the full wasm lifecycle in a pthread.
@@ -181,14 +312,85 @@ static void *wasm_load_run_thread(void *arg)
 
 	uint32_t argv[1] = {0};
 
+	// Per-run state. Arbitration starts unclaimed so a skill that never calls
+	// mpx_control_take() sees exactly the v2 write behaviour, and the clock
+	// starts here so mpx_millis() is 0 on the first instruction of on_start().
+	sdk::control_reset();
+	s_tick_period_ms = 0;
+	s_tick_stop      = false;
+	s_hard_killed    = false;
+	util::trace_ring_reset();
+	s_start_us = esp_timer_get_time();
+
 	s_running = true;
 	bool exec_ok = wasm_runtime_call_wasm(exec_env, func, 0, argv);
 	s_running = false;
+
+	// ── on_tick ─────────────────────────────────────────────────────────────
+	// Only after a clean on_start. A skill that trapped on the way in has no
+	// business being handed the joints every 20 ms.
+	if (exec_ok && !s_cancelled.load()) {
+		wasm_run_tick_loop(inst);
+	}
+
+	// ── on_stop ─────────────────────────────────────────────────────────────
+	// Optional export, called with why the skill ended:
+	//   0 = returned normally   1 = trapped   2 = watchdog
+	//
+	// It runs only when the instance is still callable, which means NOT after a
+	// hard watchdog terminate — wasm_runtime_terminate() has already unwound
+	// that instance and calling into it is undefined. A skill that must park
+	// deliberately has to finish before the timeout; one that hits the timeout
+	// gets the firmware's safe stop below instead, which halts motion rather
+	// than guessing at a pose.
+	//
+	// on_stop shares the run's remaining time budget. It is not a second 60 s.
+	{
+		// NOT s_cancelled: a behaviour asked to stop is cancelled but its
+		// instance is intact, and parking the robot is exactly what it needs
+		// to do on the way out.
+		const bool hard_killed = s_hard_killed.load();
+		if (!hard_killed) {
+			if (!exec_ok) wasm_runtime_clear_exception(inst);
+			wasm_function_inst_t stop_fn =
+				wasm_runtime_lookup_function(inst, "on_stop", nullptr);
+			if (stop_fn) {
+				wasm_exec_env_t stop_env =
+					wasm_runtime_create_exec_env(inst, DEFAULT_STACK_SIZE);
+				if (stop_env) {
+					// 0 returned normally · 1 trapped · 3 asked to stop
+					uint32_t sargv[1] = { !exec_ok       ? 1u
+					                    : s_cancelled.load() ? 3u
+					                                         : 0u };
+					ESP_LOGI(TAG, "calling on_stop(%" PRIu32 ")", sargv[0]);
+					s_running = true;
+					if (!wasm_runtime_call_wasm(stop_env, stop_fn, 1, sargv)) {
+						ESP_LOGW(TAG, "on_stop trapped; ignoring");
+						wasm_runtime_clear_exception(inst);
+					}
+					s_running = false;
+					wasm_runtime_destroy_exec_env(stop_env);
+				}
+			}
+		} else {
+			// Watchdog path: stop moving. Deliberately GaitCmd::None and not
+			// Init — halting is unambiguously safe, whereas standing up is
+			// itself a motion and could be the last thing a tipped-over robot
+			// should attempt.
+			ESP_LOGW(TAG, "skill killed by watchdog; halting gait");
+			robot::send_gait_cmd(robot::GaitCmd::None);
+		}
+	}
+	wasm::set_params(nullptr);   // parameters never leak into the next run
 
 	// A skill that took the servo bus must not keep it. This runs whether the
 	// skill returned cleanly, trapped, or was killed by the watchdog — otherwise
 	// one crashed skill leaves the gait parked until the robot is rebooted.
 	robot::release_skill_bus_lock();
+
+	// An overlay outliving its skill would silently bias every later movement,
+	// including the built-in gaits, with nothing on screen to explain it.
+	robot::clear_overlay();
 
 	wasm_runtime_destroy_exec_env(exec_env);
 
@@ -398,6 +600,10 @@ SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
 	}
 
 	// Wait with polling timeout (ESP-IDF lacks timedjoin/tryjoin)
+	// timeout_ms == 0 is a BEHAVIOUR: no total time limit. That is safe only
+	// because the tick loop bounds each individual on_tick() call and stops
+	// after repeated overruns, and because request_stop() can always end it.
+	// A one-shot skill keeps its watchdog.
 	if (timeout_ms > 0) {
 		const int poll_ms = 10;
 		int elapsed = 0;
@@ -409,7 +615,8 @@ SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
 			ESP_LOGW(TAG, "WASM execution exceeded %" PRIu32 " ms watchdog — "
 					 "signalling cooperative cancellation", timeout_ms);
 
-			s_cancelled = true;
+			s_cancelled   = true;
+			s_hard_killed = true;
 
 			if (args.module_inst != nullptr) {
 				ESP_LOGW(TAG, "Calling wasm_runtime_terminate()");
@@ -421,7 +628,8 @@ SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
 			}
 
 			pthread_join(thread, nullptr);
-			s_cancelled = false;
+			s_cancelled   = false;
+			s_hard_killed = false;
 			return SandboxResult::Timeout;
 		}
 	} else {
@@ -431,8 +639,96 @@ SandboxResult load_and_run_bytes(const uint8_t *wasm_bytes,
 	}
 
 	pthread_join(thread, nullptr);
-	s_cancelled = false;
+	s_cancelled   = false;
+	s_hard_killed = false;
 	return args.result;
+}
+
+
+std::uint32_t skill_millis()
+{
+	const int64_t start = s_start_us.load();
+	if (start == 0) return 0;
+	const int64_t now = esp_timer_get_time();
+	return static_cast<std::uint32_t>((now - start) / 1000);
+}
+
+void tick_every(int period_ms)
+{
+	if (period_ms <= 0) { s_tick_period_ms = 0; return; }
+	// The floor is one FreeRTOS tick; below that the loop would busy-wait
+	// against the scheduler rather than run faster. The ceiling keeps a
+	// mistyped period from looking like a hang.
+	if (period_ms < 10)   period_ms = 10;
+	if (period_ms > 1000) period_ms = 1000;
+	s_tick_period_ms = period_ms;
+}
+
+void tick_stop()
+{
+	s_tick_stop = true;
+}
+
+void request_stop()
+{
+	// Both flags: s_tick_stop ends the loop at the end of this tick, and
+	// s_cancelled makes any long host call the skill is inside (a delay, a bus
+	// read) return promptly instead of running to completion first.
+	s_tick_stop  = true;
+	s_cancelled  = true;
+}
+
+bool stopping()
+{
+	return s_cancelled.load() || s_tick_stop.load();
+}
+
+int tick_period()
+{
+	return s_tick_period_ms.load();
+}
+
+void set_params(const char *kv)
+{
+	s_param_count = 0;
+	if (!kv || !*kv) return;
+
+	const char *p = kv;
+	while (*p && s_param_count < MAX_PARAMS) {
+		while (*p == ' ' || *p == ',' || *p == ';') ++p;
+		if (!*p) break;
+
+		const char *name_start = p;
+		while (*p && *p != '=' && *p != ',' && *p != ';') ++p;
+		if (*p != '=') {                       // malformed pair; skip it
+			while (*p && *p != ',' && *p != ';') ++p;
+			continue;
+		}
+		int n = static_cast<int>(p - name_start);
+		if (n > MAX_PARAM_NAME - 1) n = MAX_PARAM_NAME - 1;
+		++p;                                    // step over '='
+
+		ParamKV &slot = s_params[s_param_count];
+		std::memcpy(slot.name, name_start, static_cast<std::size_t>(n));
+		slot.name[n] = '\0';
+		slot.value = std::strtof(p, nullptr);
+		++s_param_count;
+
+		while (*p && *p != ',' && *p != ';') ++p;
+	}
+	ESP_LOGI(TAG, "skill parameters: %d", s_param_count);
+}
+
+bool param_get(const char *name, float *out)
+{
+	if (!name || !out) return false;
+	for (int i = 0; i < s_param_count; ++i) {
+		if (std::strcmp(s_params[i].name, name) == 0) {
+			*out = s_params[i].value;
+			return true;
+		}
+	}
+	return false;
 }
 
 bool was_cancelled()

@@ -20,6 +20,12 @@ set(sources
     "lua/lua_vm.cc"
     "lua/lua_bindings.cc"
     "util/log_ring.cc"
+    "util/trace_ring.cc"
+    "skills/registry.cc"
+    "skills/runner.cc"
+    "skills/movement.cc"
+    "skills/events.cc"
+    "skills/autorun.cc"
 )
 
 # ── PWA assets ───────────────────────────────────────────────
@@ -65,7 +71,7 @@ set(studio_assets
 # ── Register component ───────────────────────────────────────
 idf_component_register(
     SRCS        ${sources}
-    INCLUDE_DIRS "." "fs" "wasm" "sdk" "network" "robot" "lua"
+    INCLUDE_DIRS "." "fs" "wasm" "sdk" "network" "robot" "lua" "skills" "util"
     EMBED_FILES
         ${common_assets}
         ${design_assets}

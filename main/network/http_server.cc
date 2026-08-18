@@ -26,6 +26,11 @@
 
 #include "fs/littlefs_manager.h"
 #include "lua/lua_vm.h"
+#include "util/trace_ring.h"
+#include "skills/runner.h"
+#include "skills/autorun.h"
+#include "skills/registry.h"
+#include "skills/movement.h"
 #include "robot/driver_board.h"
 #include "sdkconfig.h"
 #include "robot/robot.h"
@@ -308,7 +313,6 @@ static esp_err_t api_skills_list(httpd_req_t *req)
  * dance).  Instead we launch the skill on its own FreeRTOS task and return
  * immediately, so httpd stays responsive while the skill runs.
  */
-static volatile bool s_skill_running = false;
 
 /* ── Last-run bookkeeping ─────────────────────────────────────────
  * Because the run is async, POST /v1/skills/run can only ever answer
@@ -326,11 +330,6 @@ static volatile bool s_skill_running = false;
  * below needs it first. */
 static std::string json_escape(const std::string &s);
 
-static std::string s_skill_current;        /* name of the running skill */
-static std::string s_skill_last_name;      /* name of the previous run  */
-static int         s_skill_last_result = -1;   /* SandboxResult, -1 = none yet */
-static int64_t     s_skill_started_us  = 0;
-static int64_t     s_skill_last_ms     = 0;    /* how long the last run took */
 
 /* Human-readable form of wasm::SandboxResult, for the status endpoint. */
 static const char *skill_result_text(int r)
@@ -347,27 +346,7 @@ static const char *skill_result_text(int r)
     }
 }
 
-struct SkillRunArgs { std::string path; std::string name; };
 
-static void skill_run_task(void *arg)
-{
-    SkillRunArgs *a = static_cast<SkillRunArgs *>(arg);
-    ESP_LOGI(TAG, "Running skill (async): %s", a->path.c_str());
-    auto result = wasm::load_and_run(a->path.c_str(), "on_start", 60000);
-    ESP_LOGI(TAG, "Skill '%s' completed with result=%d",
-             a->name.c_str(), static_cast<int>(result));
-
-    /* Publish the outcome before clearing `running`, so a poll that sees
-     * running=false is guaranteed to already see the matching result. */
-    s_skill_last_name   = a->name;
-    s_skill_last_result = static_cast<int>(result);
-    s_skill_last_ms     = (esp_timer_get_time() - s_skill_started_us) / 1000;
-    s_skill_current.clear();
-
-    delete a;
-    s_skill_running = false;
-    vTaskDelete(nullptr);
-}
 
 /* ── Installed-skill manifest ─────────────────────────────────────
  *
@@ -460,6 +439,64 @@ static esp_err_t api_skills_installed(httpd_req_t *req)
  * removing the file (leaving a refunded skill runnable) or remove files
  * without clearing the record (leaving a phantom install).
  */
+/* POST /v1/skills/record {"skill_id","file","title","version"}
+ *
+ * Records where a file on this robot came from.
+ *
+ * installed.json is what makes a skill more than a filename: the title shown
+ * in the list, the "from the marketplace" badge, and — critically — the
+ * lookup that lets uninstall find and delete the right file. Until now only
+ * /v1/skills/upload wrote it, which is the mpx-cli path. A marketplace
+ * download travels gateway -> Lua -> fs.write and touched nothing, so the
+ * robot ended up holding a skill it could not name, could not show as owned,
+ * and could not remove. The recurring "installed.json not found" in the log
+ * was that gap announcing itself.
+ *
+ * The deploy pipeline is the gateway's, not ours, so the app closes the loop
+ * instead: it can see which file appeared and already knows the title.
+ */
+static esp_err_t api_skills_record(httpd_req_t *req)
+{
+    char *body = read_body(req);
+    if (!body) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, R"({"ok":false,"error":"empty or oversized body"})", -1);
+        return ESP_OK;
+    }
+    const std::string skill_id = json_get_str(body, "skill_id");
+    const std::string file     = json_get_str(body, "file");
+    const std::string title    = json_get_str(body, "title");
+    const std::string version  = json_get_str(body, "version");
+    free(body);
+
+    if (skill_id.empty() || file.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, R"({"ok":false,"error":"need skill_id and file"})", -1);
+        return ESP_OK;
+    }
+    /* Same guard uninstall relies on: a recorded name is a name this robot
+       will later delete, so it must not be able to escape the root. */
+    if (!skill_filename_ok(file)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, R"({"ok":false,"error":"bad file name"})", -1);
+        return ESP_OK;
+    }
+
+    const bool ok = installed_write(skill_id, file, version, title,
+                                    /*remove_only=*/false);
+    if (ok) {
+        skills::rescan();
+        ESP_LOGI(TAG, "Recorded install: %s -> %s (%s)",
+                 skill_id.c_str(), file.c_str(),
+                 title.empty() ? "untitled" : title.c_str());
+    }
+
+    std::string resp = std::string(R"({"ok":)") + (ok ? "true" : "false") + "}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp.c_str(), resp.size());
+    return ESP_OK;
+}
+
 static esp_err_t api_skills_uninstall(httpd_req_t *req)
 {
     char *body = read_body(req);
@@ -496,6 +533,7 @@ static esp_err_t api_skills_uninstall(httpd_req_t *req)
         deleted = fs::delete_file(("/" + file).c_str());
     }
     installed_write(skill_id, "", "", "", /*remove_only=*/true);
+            skills::rescan();
 
     std::string resp = "{\"ok\":true,\"file\":\"" + json_escape(file)
                      + "\",\"deleted\":" + (deleted ? "true" : "false") + "}";
@@ -514,6 +552,91 @@ static esp_err_t api_skills_uninstall(httpd_req_t *req)
  * `since` is the sequence number from the previous response's "next", so a
  * client never re-reads a line. Omit it (or pass 0) for everything held.
  */
+/* GET /v1/robot/movements — every movement, built-in and skill-provided.
+ *
+ * The web UI's movement list used to be a hardcoded copy of the firmware's
+ * gait enum. Now it asks, so a skill that declares `"provides_gait"` shows up
+ * on the phone next to `advance` without anyone editing the PWA.
+ */
+static esp_err_t api_movements(httpd_req_t *req)
+{
+    const std::string body = skills::list_json();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body.c_str(), body.size());
+    return ESP_OK;
+}
+
+/* GET /v1/skills/registry — what each installed skill declares about itself. */
+static esp_err_t api_skills_registry(httpd_req_t *req)
+{
+    std::string body = skills::to_json();
+    // Trailing so a client can show "safe mode" without a second request.
+    body.insert(body.size() - 1, std::string(",\"safe_mode\":")
+                + (skills::safe_mode() ? "true" : "false"));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body.c_str(), body.size());
+    return ESP_OK;
+}
+
+/* POST /v1/skills/stop — ask the running skill to finish.
+ *
+ * Cooperative, so on_stop() still runs and the skill can park the robot. This
+ * is the only way to end a behaviour, which by definition has no watchdog.
+ */
+static esp_err_t api_skills_stop(httpd_req_t *req)
+{
+    const bool was = skills::running();
+    skills::stop();
+    httpd_resp_set_type(req, "application/json");
+    const std::string resp = std::string("{\"ok\":true,\"was_running\":")
+                           + (was ? "true" : "false") + "}";
+    httpd_resp_send(req, resp.c_str(), resp.size());
+    return ESP_OK;
+}
+
+/* POST /v1/skills/safe-mode/clear — let autorun try again after it tripped. */
+static esp_err_t api_safe_mode_clear(httpd_req_t *req)
+{
+    skills::clear_safe_mode();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", -1);
+    return ESP_OK;
+}
+
+/* GET /v1/trace — named numbers emitted by the running skill.
+ *
+ * Same shape and the same reasoning as /v1/logs: sequence-numbered, polled,
+ * bounded. A skill calls mpx_trace("knee_err", v); `mpx-cli trace` reads it
+ * here and plots it. Read-only, so it is not behind the write token.
+ */
+static esp_err_t api_trace(httpd_req_t *req)
+{
+    uint32_t since = 0;
+    std::size_t max_samples = 200;
+
+    char query[96];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[24];
+        if (httpd_query_key_value(query, "since", val, sizeof(val)) == ESP_OK) {
+            since = static_cast<uint32_t>(std::strtoul(val, nullptr, 10));
+        }
+        if (httpd_query_key_value(query, "max", val, sizeof(val)) == ESP_OK) {
+            const long m = std::strtol(val, nullptr, 10);
+            if (m > 0 && m < 500) max_samples = static_cast<std::size_t>(m);
+        }
+    }
+
+    uint32_t next = since;
+    std::string samples = util::trace_ring_json(since, max_samples, next);
+
+    std::string resp = "{\"next\":" + std::to_string(next)
+                     + ",\"samples\":" + samples + "}";
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp.c_str(), resp.size());
+    return ESP_OK;
+}
+
 static esp_err_t api_logs(httpd_req_t *req)
 {
     uint32_t since = 0;
@@ -546,26 +669,32 @@ static esp_err_t api_logs(httpd_req_t *req)
 /* GET /v1/skills/status — is a skill running, and how did the last one go? */
 static esp_err_t api_skills_status(httpd_req_t *req)
 {
-    bool running = s_skill_running;
+    // Sourced from skills::runner, which is now the only place that knows
+    // whether something is running. There used to be a second set of flags
+    // here; with boot, events and movement dispatch all able to start a skill,
+    // two answers to "is one running" is one too many.
+    const bool running = skills::running();
 
     std::string json = "{\"running\":";
     json += running ? "true" : "false";
 
     if (running) {
-        json += ",\"name\":\"" + json_escape(s_skill_current) + "\"";
-        json += ",\"elapsed_ms\":" +
-                std::to_string((esp_timer_get_time() - s_skill_started_us) / 1000);
+        json += ",\"name\":\"" + json_escape(skills::current()) + "\"";
+        json += ",\"elapsed_ms\":" + std::to_string(skills::running_ms());
+        json += ",\"mode\":\"";
+        json += (skills::current_mode() == skills::Mode::Behaviour ? "behaviour"
+                                                                   : "oneshot");
+        json += "\",\"started_by\":\"" + json_escape(skills::started_by()) + "\"";
     }
 
-    if (s_skill_last_result >= 0) {
-        json += ",\"last\":{\"name\":\"" + json_escape(s_skill_last_name) + "\"";
-        json += ",\"result\":" + std::to_string(s_skill_last_result);
+    if (!skills::last_name().empty()) {
+        const int r = skills::last_result();
+        json += ",\"last\":{\"name\":\"" + json_escape(skills::last_name()) + "\"";
+        json += ",\"result\":" + std::to_string(r);
         json += ",\"ok\":";
-        json += (s_skill_last_result ==
-                 static_cast<int>(wasm::SandboxResult::Success)) ? "true" : "false";
-        json += ",\"message\":\"" +
-                json_escape(skill_result_text(s_skill_last_result)) + "\"";
-        json += ",\"duration_ms\":" + std::to_string(s_skill_last_ms) + "}";
+        json += (r == static_cast<int>(wasm::SandboxResult::Success)) ? "true" : "false";
+        json += ",\"message\":\"" + json_escape(skill_result_text(r)) + "\"";
+        json += ",\"duration_ms\":" + std::to_string(skills::last_ms()) + "}";
     }
 
     json += "}";
@@ -578,7 +707,11 @@ static esp_err_t api_skills_status(httpd_req_t *req)
 /* POST /v1/skills/run — execute a .wasm skill via WAMR (async) */
 static esp_err_t api_skills_run(httpd_req_t *req)
 {
-    char buf[256] = {};
+    /* 256 -> 768: the body now optionally carries a "params" string alongside
+     * "skill". Everything past the first 768 bytes is dropped rather than
+     * failing the request, which matches how this handler already treats a
+     * body it cannot fully parse. */
+    char buf[768] = {};
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) {
         httpd_resp_set_status(req, "400 Bad Request");
@@ -600,38 +733,39 @@ static esp_err_t api_skills_run(httpd_req_t *req)
 
     std::string path = "/" + skill_name;
 
+    /* Optional: "params":"speed=0.4;repeats=3" — a flat name=value list rather
+     * than nested JSON, because this handler hand-parses its body and a
+     * parameter list does not justify pulling in a parser. Absent parameters
+     * mean every mpx_param_*() call falls back to the skill's own default, so
+     * an unparameterised run behaves exactly as it did before. */
+    std::string skill_params;
+    {
+        const char *pkey = "\"params\":\"";
+        const char *pval = std::strstr(buf, pkey);
+        if (pval) {
+            pval += std::strlen(pkey);
+            while (*pval && *pval != '"') skill_params += *pval++;
+        }
+    }
+
     // ── Reject if a skill is already running (single WASM instance) ──
-    if (s_skill_running) {
+    // The registry knows whether this skill declared itself a behaviour, which
+    // decides whether it gets a watchdog. A skill built before the manifest
+    // section existed simply is not in the registry, and runs one-shot.
+    const skills::Entry *entry = skills::by_slug(skill_name.c_str());
+    const skills::Mode mode = (entry && entry->behaviour) ? skills::Mode::Behaviour
+                                                          : skills::Mode::OneShot;
+
+    if (!skills::start(path.c_str(), skill_name.c_str(), skill_params.c_str(),
+                       mode, "api")) {
         httpd_resp_set_status(req, "409 Conflict");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"output\":\"a skill is already running\"}", -1);
         return ESP_OK;
     }
 
-    // ── Launch the skill on its own task and return immediately ──
-    // Set the name and start time BEFORE flipping `running`, so the first
-    // status poll — which can land microseconds later — never sees
-    // running=true with a stale or empty name.
-    s_skill_current    = skill_name;
-    s_skill_started_us = esp_timer_get_time();
-    s_skill_running    = true;
-    auto *args = new SkillRunArgs{ path, skill_name };
-    // No core affinity: the scheduler keeps httpd (core 0) responsive while the
-    // skill yields during its robot_delay_ms calls.  8 KB task stack is enough;
-    // the WASM operand stack is allocated separately inside load_and_run.
-    BaseType_t created = xTaskCreate(skill_run_task, "skill_run", 8192,
-                                     args, 4, nullptr);
-    if (created != pdPASS) {
-        s_skill_running = false;
-        s_skill_current.clear();
-        delete args;
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"output\":\"failed to start skill task\"}", -1);
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "Skill '%s' started (async)", skill_name.c_str());
+    ESP_LOGI(TAG, "Skill '%s' started (%s)", skill_name.c_str(),
+             mode == skills::Mode::Behaviour ? "behaviour" : "one-shot");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"output\":\"started\"}", -1);
     return ESP_OK;
@@ -941,6 +1075,7 @@ static esp_err_t api_skills_upload(httpd_req_t *req)
         ESP_LOGI(TAG, "Uploaded %s (%zu bytes)", filename.c_str(), total_read);
         if (!skill_id.empty()) {
             installed_write(skill_id, filename, version, title, /*remove_only=*/false);
+            skills::rescan();
             ESP_LOGI(TAG, "Recorded install: %s -> %s", skill_id.c_str(), filename.c_str());
         }
         std::string resp = "{\"ok\":true,\"path\":\"" + filename + "\"}";
@@ -1026,111 +1161,8 @@ static float json_get_float(const char *body, const char *key, float def)
 }
 
 /* ── Gait name → GaitCmd mapping ──────────────────────────── */
-static robot::GaitCmd gait_name_to_cmd(const std::string &name)
-{
-    if (name == "init")     return robot::GaitCmd::Init;
-    if (name == "step")     return robot::GaitCmd::Step;
-    if (name == "roll")     return robot::GaitCmd::Roll;
-    if (name == "pitch")    return robot::GaitCmd::Pitch;
-    if (name == "stretch")  return robot::GaitCmd::Stretch;
-    if (name == "advance")  return robot::GaitCmd::Advance;
-    if (name == "back")     return robot::GaitCmd::Back;
-    if (name == "left")     return robot::GaitCmd::Left;
-    if (name == "right")    return robot::GaitCmd::Right;
-    if (name == "turnL")    return robot::GaitCmd::TurnL;
-    if (name == "turnR")    return robot::GaitCmd::TurnR;
-    if (name == "twerk")    return robot::GaitCmd::Twerk;
-    if (name == "jump")     return robot::GaitCmd::Jump;
-    if (name == "jumpfwd")  return robot::GaitCmd::JumpFwd;
-    if (name == "testspeed") return robot::GaitCmd::TestSpeed;
-    if (name == "lookup")    return robot::GaitCmd::LookUp;
-    if (name == "lookdown")  return robot::GaitCmd::LookDown;
-    if (name == "lookleft")  return robot::GaitCmd::LookLeft;
-    if (name == "lookright") return robot::GaitCmd::LookRight;
-    if (name == "lookul")    return robot::GaitCmd::LookUpperLeft;
-    if (name == "lookur")    return robot::GaitCmd::LookUpperRight;
-    if (name == "lookll")    return robot::GaitCmd::LookLowerLeft;
-    if (name == "looklr")    return robot::GaitCmd::LookLowerRight;
-    if (name == "flegL")     return robot::GaitCmd::ForelegLiftL;
-    if (name == "flegR")     return robot::GaitCmd::ForelegLiftR;
-    if (name == "blegL")     return robot::GaitCmd::BacklegLiftL;
-    if (name == "blegR")     return robot::GaitCmd::BacklegLiftR;
-    if (name == "heightup")  return robot::GaitCmd::HeightUp;
-    if (name == "heightdown")return robot::GaitCmd::HeightDown;
-    if (name == "balance")   return robot::GaitCmd::Balance;
-    if (name == "bowback")   return robot::GaitCmd::BowBack;
-    if (name == "bodycycle") return robot::GaitCmd::BodyCycle;
-    if (name == "headellipse")return robot::GaitCmd::HeadEllipse;
-    if (name == "moveLF")    return robot::GaitCmd::MoveLeftFront;
-    if (name == "moveRF")    return robot::GaitCmd::MoveRightFront;
-    if (name == "moveLB")    return robot::GaitCmd::MoveLeftBack;
-    if (name == "moveRB")    return robot::GaitCmd::MoveRightBack;
-    if (name == "stanford")  return robot::GaitCmd::StanfordWalk;
-    if (name == "frontkick") return robot::GaitCmd::FrontKick;
-    if (name == "wiggle")    return robot::GaitCmd::Wiggle;
-    if (name == "buttshrug") return robot::GaitCmd::ButtShrug;
-    if (name == "wiggleL")   return robot::GaitCmd::WiggleLeft;
-    if (name == "wiggleR")   return robot::GaitCmd::WiggleRight;
-    if (name == "buttshrugL")return robot::GaitCmd::ButtShrugLeft;
-    if (name == "buttshrugR")return robot::GaitCmd::ButtShrugRight;
-    if (name == "none")     return robot::GaitCmd::None;
-    return robot::GaitCmd::None;
-}
 
 /* ── GaitCmd → name string ─────────────────────────────────── */
-static const char *gait_cmd_to_name(robot::GaitCmd cmd)
-{
-    switch (cmd) {
-        case robot::GaitCmd::None:      return "none";
-        case robot::GaitCmd::Init:      return "init";
-        case robot::GaitCmd::Step:      return "step";
-        case robot::GaitCmd::Roll:      return "roll";
-        case robot::GaitCmd::Pitch:     return "pitch";
-        case robot::GaitCmd::Stretch:   return "stretch";
-        case robot::GaitCmd::Advance:   return "advance";
-        case robot::GaitCmd::Back:      return "back";
-        case robot::GaitCmd::Left:      return "left";
-        case robot::GaitCmd::Right:     return "right";
-        case robot::GaitCmd::TurnL:     return "turnL";
-        case robot::GaitCmd::TurnR:     return "turnR";
-        case robot::GaitCmd::Twerk:     return "twerk";
-        case robot::GaitCmd::Jump:      return "jump";
-        case robot::GaitCmd::JumpFwd:   return "jumpfwd";
-        case robot::GaitCmd::TestSpeed: return "testspeed";
-        case robot::GaitCmd::LookUp:         return "lookup";
-        case robot::GaitCmd::LookDown:       return "lookdown";
-        case robot::GaitCmd::LookLeft:       return "lookleft";
-        case robot::GaitCmd::LookRight:      return "lookright";
-        case robot::GaitCmd::LookUpperLeft:  return "lookul";
-        case robot::GaitCmd::LookUpperRight: return "lookur";
-        case robot::GaitCmd::LookLowerLeft:  return "lookll";
-        case robot::GaitCmd::LookLowerRight: return "looklr";
-        case robot::GaitCmd::ForelegLiftL:   return "flegL";
-        case robot::GaitCmd::ForelegLiftR:   return "flegR";
-        case robot::GaitCmd::BacklegLiftL:   return "blegL";
-        case robot::GaitCmd::BacklegLiftR:   return "blegR";
-        case robot::GaitCmd::HeightUp:       return "heightup";
-        case robot::GaitCmd::HeightDown:     return "heightdown";
-        case robot::GaitCmd::Balance:        return "balance";
-        case robot::GaitCmd::BowBack:        return "bowback";
-        case robot::GaitCmd::BodyCycle:      return "bodycycle";
-        case robot::GaitCmd::HeadEllipse:    return "headellipse";
-        case robot::GaitCmd::MoveLeftFront:  return "moveLF";
-        case robot::GaitCmd::MoveRightFront: return "moveRF";
-        case robot::GaitCmd::MoveLeftBack:   return "moveLB";
-        case robot::GaitCmd::MoveRightBack:  return "moveRB";
-        case robot::GaitCmd::StanfordWalk:   return "stanford";
-        case robot::GaitCmd::FrontKick:      return "frontkick";
-        case robot::GaitCmd::Wiggle:         return "wiggle";
-        case robot::GaitCmd::ButtShrug:      return "buttshrug";
-        case robot::GaitCmd::WiggleLeft:     return "wiggleL";
-        case robot::GaitCmd::WiggleRight:    return "wiggleR";
-        case robot::GaitCmd::ButtShrugLeft:  return "buttshrugL";
-        case robot::GaitCmd::ButtShrugRight: return "buttshrugR";
-        case robot::GaitCmd::BodyAttitude:   return "attitude";
-    }
-    return "unknown";
-}
 
 /* POST /v1/robot/gait — set gait mode */
 static esp_err_t api_robot_gait(httpd_req_t *req)
@@ -1151,14 +1183,21 @@ static esp_err_t api_robot_gait(httpd_req_t *req)
         return ESP_OK;
     }
 
-    robot::GaitCmd cmd = gait_name_to_cmd(mode);
-
     ESP_LOGI(TAG, "POST /v1/robot/gait  mode=%s", mode.c_str());
 
-    robot::send_gait_cmd(cmd);
+    // Built-in gait or skill-provided movement — the caller does not need to
+    // know which, and the web UI lists them together.
+    const skills::MovementResult r = skills::run(mode.c_str(), /*from_skill=*/false);
 
-    char resp[128];
-    std::snprintf(resp, sizeof(resp), R"({"ok":true,"mode":"%s"})", gait_cmd_to_name(cmd));
+    char resp[192];
+    if (r == skills::MovementResult::Started) {
+        std::snprintf(resp, sizeof(resp), R"({"ok":true,"mode":"%s"})", mode.c_str());
+    } else {
+        httpd_resp_set_status(req,
+            r == skills::MovementResult::Unknown ? "404 Not Found" : "409 Conflict");
+        std::snprintf(resp, sizeof(resp), R"({"ok":false,"mode":"%s","error":"%s"})",
+                      mode.c_str(), skills::result_text(r));
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, -1);
@@ -1198,14 +1237,14 @@ static esp_err_t api_robot_status(httpd_req_t *req)
     robot::GaitCmd cmd = robot::current_gait_cmd();
     robot::Config cfg = robot::get_config();
 
-    ESP_LOGI(TAG, "GET  /v1/robot/status  mode=%s", gait_cmd_to_name(cmd));
+    ESP_LOGI(TAG, "GET  /v1/robot/status  mode=%s", robot::gait_to_name(cmd));
 
     char resp[512];
     int n = std::snprintf(resp, sizeof(resp),
         R"({"mode":"%s")"
         R"(,"config":{"period":%d,"height":%d,"up_height":%d,"stride":%d,"tilt":%d,"sg_speed":%d})"
         R"(,"offsets":[)",
-        gait_cmd_to_name(cmd),
+        robot::gait_to_name(cmd),
         cfg.period, cfg.height, cfg.up_height, cfg.stride, cfg.tilt, cfg.sg_speed);
 
     for (int i = 1; i <= 12; ++i) {
@@ -1667,11 +1706,22 @@ static esp_err_t api_lua_run(httpd_req_t *req)
  */
 static esp_err_t api_lua_list(httpd_req_t *req)
 {
+    /* BARE NAMES, no leading slash — the same shape /v1/skills/list returns.
+     *
+     * fs::list_files() prefixes every entry with '/', and /v1/skills/list
+     * strips it while this one did not. The app has one idea of what a name
+     * looks like, so the mismatch broke two things at once: the filter that
+     * hides the deploy pipeline's throwaway "_deploy_N.lua" scripts never
+     * matched "/_deploy_N.lua", so the machinery showed up in Skills as if it
+     * were the skill you downloaded; and delete built "/lua/" + name, which
+     * came out as "/lua//_deploy_N.lua" and matched nothing. */
     auto files = fs::list_files("/lua");
     std::string json = R"({"ok":true,"files":[)";
     for (size_t i = 0; i < files.size(); i++) {
         if (i > 0) json += ",";
-        json += "\"" + json_escape(files[i]) + "\"";
+        std::string name = files[i];
+        if (!name.empty() && name[0] == '/') name.erase(0, 1);
+        json += "\"" + json_escape(name) + "\"";
     }
     json += "]}";
     httpd_resp_set_type(req, "application/json");
@@ -2087,6 +2137,34 @@ static esp_err_t studio_direct_handler(httpd_req_t *req)
                               : R"({"ok":false,"err":"spi"})");
 }
 
+/* ── Handler registration, with the failure made loud ────────────
+ *
+ * Every registration here used to discard httpd_register_uri_handler()'s
+ * return value. When the handler table filled up, the routes registered LAST
+ * simply did not exist, and the only evidence was one ESP_LOGW from deep
+ * inside esp_http_server at boot. The last block in this file is the
+ * marketplace proxy, so subscribing to a skill sent a POST the robot answered
+ * with 405 — "Method '3' not allowed" — while GET on the same URI worked,
+ * because GET happened to take the final free slot. It read like a broken
+ * marketplace. It was an off-by-three in a table size.
+ *
+ * A route that failed to register is not a warning, it is a missing feature.
+ * Count them and say so by name.
+ */
+static int s_uri_reg_failed = 0;
+
+static bool register_uri(httpd_handle_t server, const httpd_uri_t *h,
+                         const char *method_str)
+{
+    const esp_err_t rc = httpd_register_uri_handler(server, h);
+    if (rc == ESP_OK) return true;
+
+    s_uri_reg_failed++;
+    ESP_LOGE(TAG, "  UNREGISTERED: %s %s (%s) — this endpoint will 404/405",
+             method_str, h->uri, esp_err_to_name(rc));
+    return false;
+}
+
 /* ── Helper to register an API handler ─────────────────────── */
 static void register_api(httpd_handle_t server, const char *method_str,
                          const char *uri, httpd_method_t method,
@@ -2101,8 +2179,9 @@ static void register_api(httpd_handle_t server, const char *method_str,
         .handle_ws_control_frames = false,
         .supported_subprotocol = nullptr,
     };
-    httpd_register_uri_handler(server, &h);
-    ESP_LOGI(TAG, "  API: %s %s", method_str, uri);
+    if (register_uri(server, &h, method_str)) {
+        ESP_LOGI(TAG, "  API: %s %s", method_str, uri);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2374,9 +2453,21 @@ static void socket_reaper_task(void *)
                 reaped++;
             }
         }
+        /* Reclaiming sockets after a browser leaves is this task doing its
+         * job, not a fault — a warning on every tab close trained the eye to
+         * skip exactly the line worth reading. Routine cleanup is INFO; a
+         * sweep big enough to have been close to exhausting the pool is still
+         * a warning, because that one is worth noticing. */
         if (reaped || zombies) {
-            ESP_LOGW(TAG, "socket_reaper: reclaimed %d dead + %d zombie socket(s)",
-                     reaped, zombies);
+            const int total = reaped + zombies;
+            if (total >= CONFIG_LWIP_MAX_SOCKETS / 2) {
+                ESP_LOGW(TAG, "socket_reaper: reclaimed %d dead + %d zombie "
+                              "socket(s) — pool was under pressure",
+                         reaped, zombies);
+            } else {
+                ESP_LOGI(TAG, "socket_reaper: reclaimed %d dead + %d zombie socket(s)",
+                         reaped, zombies);
+            }
         }
     }
 }
@@ -2390,8 +2481,41 @@ bool start_http_server()
         return true;
     }
 
+    /* ── Quieten the two components that shout when a browser goes away ──
+     *
+     * Closing a tab, locking a phone, or walking out of Wi-Fi range sends a
+     * TCP RST. errno 104 is ECONNRESET, and esp_http_server logs one
+     * "httpd_sock_err: error in recv : 104" per socket — a browser holds
+     * several, so one closed tab produces a screenful. httpd_ws adds
+     * "WS frame is not properly masked" for the same reason: the read after
+     * the reset returns garbage where a masked frame header should be.
+     *
+     * None of that is a fault. It is the normal end of every session, and it
+     * buries the lines that do mean something. Both tags stay at ERROR, so a
+     * real failure inside the server still reaches the console — and the
+     * socket reaper below reports what was actually reclaimed, which is the
+     * signal these warnings were standing in for.
+     *
+     * Set before httpd_start() so the very first disconnect is already quiet.
+     */
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_ws",   ESP_LOG_ERROR);
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 64;   // +11 Servo Studio routes, +2 studio page
+    /* HOW MANY ROUTES THIS FILE ACTUALLY REGISTERS — count it, do not guess.
+     * At the time of writing: 12 static files, 2 WebSockets, 11 Servo Studio,
+     * 37 REST, 1 gateway config, 4 marketplace methods = 67. It sat at 64,
+     * so the last three registrations — the marketplace POST, PATCH and
+     * DELETE — silently did not happen, and installing a skill answered 405
+     * while browsing the marketplace worked.
+     *
+     * The headroom matters more than the exact number: every new endpoint
+     * pushes the tail of this function off the end, and the tail is whatever
+     * was added most recently. register_uri() now logs any that do not fit,
+     * so this can never fail quietly again — but leave room so it does not
+     * have to. A slot is one pointer plus a small struct; 80 costs well under
+     * a kilobyte. */
+    config.max_uri_handlers = 80;
     // LWIP has CONFIG_LWIP_MAX_SOCKETS (16) total.  HTTPD also reserves 3
     // internal sockets on top of max_open_sockets.  At 5, HTTPD uses at most
     // 5+3=8, GUARANTEEING ~8 sockets stay free for OUTBOUND use (upstream cloud
@@ -2410,6 +2534,8 @@ bool start_http_server()
     config.recv_wait_timeout = 60;       // Allow idle WS up to 60 s between frames
     config.send_wait_timeout = 30;       // Allow slow sends (e.g. large replies)
     config.close_fn = pwa_release_fd;    // Clean up PWA client slots on session close
+
+    s_uri_reg_failed = 0;   // stop_http_server() + start again must recount
 
     if (httpd_start(&s_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server");
@@ -2435,7 +2561,7 @@ bool start_http_server()
             .handle_ws_control_frames = false,
             .supported_subprotocol = nullptr,
         };
-        httpd_register_uri_handler(s_server, &h);
+        register_uri(s_server, &h, "GET");
     };
 
     // ── Register handlers for each known static file ──
@@ -2466,7 +2592,7 @@ bool start_http_server()
         .handle_ws_control_frames = false,
         .supported_subprotocol = nullptr,
     };
-    httpd_register_uri_handler(s_server, &ws_uri);
+    register_uri(s_server, &ws_uri, "WS");
 
     // ── MangDang Servo Studio ──
     register_api(s_server, "GET", "/v1/studio/mode",    HTTP_GET, studio_mode_handler);
@@ -2491,15 +2617,21 @@ bool start_http_server()
         .handle_ws_control_frames = false,
         .supported_subprotocol = nullptr,
     };
-    httpd_register_uri_handler(s_server, &chat_ws_uri);
+    register_uri(s_server, &chat_ws_uri, "WS");
 
     // ── Register REST API endpoints ──
     register_api(s_server, "GET",  "/v1/skills/list",   HTTP_GET,  api_skills_list);
     register_api(s_server, "POST", "/v1/skills/run",    HTTP_POST, api_skills_run);
     register_api(s_server, "GET",  "/v1/skills/status", HTTP_GET,  api_skills_status);
     register_api(s_server, "GET",  "/v1/logs",          HTTP_GET,  api_logs);
+    register_api(s_server, "GET",  "/v1/trace",         HTTP_GET,  api_trace);
+    register_api(s_server, "GET",  "/v1/robot/movements", HTTP_GET,  api_movements);
+    register_api(s_server, "GET",  "/v1/skills/registry", HTTP_GET,  api_skills_registry);
+    register_api(s_server, "POST", "/v1/skills/stop",     HTTP_POST, api_skills_stop);
+    register_api(s_server, "POST", "/v1/skills/safe-mode/clear", HTTP_POST, api_safe_mode_clear);
     register_api(s_server, "GET",  "/v1/skills/installed", HTTP_GET,  api_skills_installed);
     register_api(s_server, "POST", "/v1/skills/uninstall",  HTTP_POST, api_skills_uninstall);
+    register_api(s_server, "POST", "/v1/skills/record",     HTTP_POST, api_skills_record);
     register_api(s_server, "GET",  "/v1/fs/list",       HTTP_GET,  api_fs_list);
     register_api(s_server, "GET",  "/v1/fs/info",       HTTP_GET,  api_fs_info);
     register_api(s_server, "GET",  "/v1/fs/read",       HTTP_GET,  api_fs_read);
@@ -2551,14 +2683,25 @@ bool start_http_server()
             .handle_ws_control_frames = false,
             .supported_subprotocol = nullptr,
         };
-        httpd_register_uri_handler(s_server, &h);
+        /* Four separate registrations because esp_http_server matches on one
+           method per entry. Installing or unsubscribing from a skill is the
+           POST and the DELETE, so losing those while keeping the GET is the
+           worst possible partial failure: the marketplace lists everything
+           and nothing you press does anything. */
+        register_uri(s_server, &h, "GET");
         h.method = HTTP_POST;
-        httpd_register_uri_handler(s_server, &h);
+        register_uri(s_server, &h, "POST");
         h.method = HTTP_PATCH;
-        httpd_register_uri_handler(s_server, &h);
+        register_uri(s_server, &h, "PATCH");
         h.method = HTTP_DELETE;
-        httpd_register_uri_handler(s_server, &h);
+        register_uri(s_server, &h, "DELETE");
         ESP_LOGI(TAG, "  API: GET|POST|PATCH|DELETE /v1/marketplace/* (proxied to gateway)");
+    }
+
+    if (s_uri_reg_failed) {
+        ESP_LOGE(TAG, "==== %d ROUTE(S) FAILED TO REGISTER — raise "
+                      "max_uri_handlers (currently %d) ====",
+                 s_uri_reg_failed, config.max_uri_handlers);
     }
 
     ESP_LOGI(TAG, "HTTP server running on port 80 (Core 0, Priority 6)");

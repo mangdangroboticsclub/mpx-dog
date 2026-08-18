@@ -48,8 +48,29 @@
   const cache = { wasm: null, lua: null, fs: null, installed: null, mkt: null };
   const hydrated = cache.wasm !== null;
 
-  // ── Which segment is showing ────────────────────────────────
-  let segment = $state("skills");   // "skills" | "files"
+  /* ── Which tab is showing ────────────────────────────────────
+   *
+   * Three, and the split is by WHAT YOU DO THERE rather than by what the
+   * thing technically is:
+   *
+   *   skills  what is on the robot and can be run right now
+   *   store   what you own from the marketplace, and whether it is downloaded
+   *   files   the raw filesystem, for when you need to see the actual bytes
+   *
+   * The same skill legitimately appears in two of them — owned in Store,
+   * present in Skills — and that is the point, not a duplication: those
+   * answer different questions ("did I buy it?" and "can I run it?"), and
+   * conflating them is what made a fresh download look like a stray file.
+   * Every tab carries one line saying what it holds, so nobody has to learn
+   * the rule from watching where things land.
+   */
+  let segment = $state("skills");   // "skills" | "store" | "files"
+
+  const TAB_BLURB = {
+    skills: "Everything installed on this robot. Tap Run to try one.",
+    store:  "Skills you own. Download one to put it on the robot.",
+    files:  "The robot's raw storage. You rarely need this.",
+  };
 
   // ── Local (on-robot) skills ─────────────────────────────────
   let wasmSkills = $state(cache.wasm ?? []);   // [{ name, size }]
@@ -137,7 +158,8 @@
       ]);
 
       if (!sr || !sr.ok) throw new Error("robot unreachable");
-      wasmSkills = await sr.json();
+      wasmSkills = (await sr.json()).map(
+        (s) => ({ ...s, name: String(s.name || "").replace(/^\/+/, "") }));
 
       if (lr && lr.ok) {
         const d = await lr.json();
@@ -145,6 +167,14 @@
         const names = Array.isArray(d) ? d : (d.files || d.f || []);
         luaSkills = names
           .map((n) => (typeof n === "string" ? { name: n } : n))
+          /* Normalise the leading slash before anything reads the name.
+             The firmware used to return "/foo.lua" here and "foo.lua" from
+             /v1/skills/list, and every consumer downstream — the _deploy_
+             filter, the delete path, the label — quietly assumed the second
+             form. Fixed in the firmware too, but stripping it here as well
+             means this screen behaves on a robot that has not been reflashed
+             yet, which is most of them at any given moment. */
+          .map((s) => ({ ...s, name: String(s.name || "").replace(/^\/+/, "") }))
           // The deploy pipeline writes throwaway /lua/_deploy_N.lua files;
           // they are machinery, not something anyone wants to run by hand.
           .filter((s) => s.name && !s.name.startsWith("_deploy_"));
@@ -331,7 +361,11 @@
         body: JSON.stringify({ path }),
       });
       if (!r.ok) runError = `Delete failed (HTTP ${r.status})`;
-      await fetchLocal();
+      /* Was fetchLocal(), which does not exist — so every delete ended in
+         "fetchLocal is not defined" and the list never refreshed, whether or
+         not the file actually went. refresh() is the right call anyway: a
+         delete changes the storage bar and the provenance badges too. */
+      await refresh();
     } catch (e) {
       runError = e.message || "Delete failed";
     }
@@ -358,18 +392,68 @@
     actionInFlight = null;
   }
 
+  /* Which file did this deploy actually put on the robot?
+   *
+   * The gateway writes the skill through a Lua script it generates, so the
+   * app never sees the filename and the robot never learns which marketplace
+   * skill the file belongs to. That missing link is why a download showed up
+   * as "gaits.mpxe" instead of its title, why the store never marked it as
+   * owned, and why Refund deleted nothing — uninstall looks the filename up
+   * in a record that was never written.
+   *
+   * Rather than parsing the gateway's script or asking it to change, compare
+   * the robot's own file list before and after. Whatever appeared is the
+   * skill. It needs no cooperation from anyone and cannot drift out of sync
+   * with what is actually on flash. */
+  async function currentSkillFiles() {
+    try {
+      const r = await get("/v1/skills/list", 8000);
+      if (!r.ok) return null;
+      const list = await r.json();
+      return new Set(list.map((s) => String(s.name || "").replace(/^\/+/, "")));
+    } catch { return null; }
+  }
+
   async function handleDeploy(skill) {
     actionInFlight = "deploy:" + skill.skill_id;
     try {
+      const before = await currentSkillFiles();
+
       const data = await deploySkill(skill.skill_id);
-      const allScripts = [];
       for (const s of data.skills || []) {
         for (const cmd of s.commands || []) {
-          allScripts.push(cmd.script);
           await enqueueLua(cmd.script);
         }
       }
-      // No client-side bookkeeping: ask the robot what it now has.
+
+      /* The scripts are queued, not finished — the robot runs them on its own
+         worker and one of them waits for you to approve the write. Poll for
+         the new file rather than guessing at a delay. */
+      let placed = null;
+      for (let i = 0; i < 30 && !placed; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const after = await currentSkillFiles();
+        if (!after || !before) break;
+        for (const name of after) if (!before.has(name)) { placed = name; break; }
+      }
+
+      if (placed) {
+        await fetch("/v1/skills/record", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            skill_id: skill.skill_id,
+            file: placed,
+            title: skill.title || skill.name || skill.skill_id,
+            version: skill.version || "",
+          }),
+        }).catch(() => { /* the skill still runs; only the label is lost */ });
+      } else {
+        runError = "Downloaded, but no new skill file appeared — the write "
+                 + "may not have been approved on this device.";
+      }
+
+      // No client-side bookkeeping beyond that: ask the robot what it now has.
       await refresh();
     } catch (e) {
       runError = e.message || "Download failed";
@@ -398,6 +482,18 @@
 
   // ── Derived ─────────────────────────────────────────────────
   let localCount = $derived(wasmSkills.length + luaSkills.length);
+  let storeCount = $derived(mktSkills.length);
+
+  /* The install record for a file, if the robot has one. This is what turns
+     "gaits.mpxe" into "01 · Layer 1" and puts a Store badge on it — and it is
+     exactly what was missing, because nothing wrote installed.json for a
+     marketplace download until now. */
+  function recordFor(filename) {
+    return installed.find((e) => e.file === filename) || null;
+  }
+  function displayTitle(filename) {
+    return recordFor(filename)?.title || prettyName(filename);
+  }
   let usedPct = $derived(
     fsInfo.total ? Math.min(100, (fsInfo.used / fsInfo.total) * 100) : 0
   );
@@ -422,7 +518,14 @@
         role="tab" aria-selected={segment === "skills"}
         onclick={() => (segment = "skills")}
       >
-        Skills{#if localCount}<span class="sv-seg-count">{localCount}</span>{/if}
+        On robot{#if localCount}<span class="sv-seg-count">{localCount}</span>{/if}
+      </button>
+      <button
+        class="sv-seg" class:sv-seg-on={segment === "store"}
+        role="tab" aria-selected={segment === "store"}
+        onclick={() => (segment = "store")}
+      >
+        Store{#if storeCount}<span class="sv-seg-count">{storeCount}</span>{/if}
       </button>
       <button
         class="sv-seg" class:sv-seg-on={segment === "files"}
@@ -432,6 +535,10 @@
         Files
       </button>
     </div>
+
+    <!-- One line per tab. Cheap, and it removes the guesswork about which of
+         the three a given thing lives in. -->
+    <p class="sv-blurb">{TAB_BLURB[segment]}</p>
   </header>
 
   {#if segment === "files"}
@@ -440,7 +547,7 @@
     <div class="sv-files-host">
       <FileViewer {onNavigate} embedded={true} />
     </div>
-  {:else}
+  {:else if segment === "skills"}
     <div class="sv-body">
       <!-- ═══ Running / last-result banner ═══ -->
       {#if running}
@@ -489,7 +596,7 @@
 
       <!-- ═══ On this robot ═══ -->
       <section class="sv-section">
-        <h3 class="sv-section-title">On this robot</h3>
+        <h3 class="sv-section-title">Ready to run</h3>
 
         {#if loading}
           <p class="sv-muted">Loading…</p>
@@ -501,12 +608,14 @@
           </div>
         {:else if localCount === 0}
           <div class="sv-empty">
-            <p class="sv-empty-title">No skills uploaded yet</p>
+            <p class="sv-empty-title">Nothing installed yet</p>
             <p class="sv-empty-desc">
-              Build one with the SDK and push it in a single command:
+              Two ways to fill this up. Open <strong>Store</strong> and download
+              something you own — or build your own with the SDK and push it in
+              one command:
             </p>
             <code class="sv-code">mpx-cli deploy</code>
-            <p class="sv-empty-desc sv-empty-or">or use the ＋ button to upload a .wasm by hand.</p>
+            <p class="sv-empty-desc sv-empty-or">The ＋ button uploads a .wasm by hand.</p>
           </div>
         {:else}
           <div class="sv-list">
@@ -516,12 +625,17 @@
                   <div class="sv-avatar" style="--badge: {skillTypeColor('wasm')}">{initialOf(s.name)}</div>
                   <div class="sv-card-id">
                     <div class="sv-card-title-row">
-                      <span class="sv-card-title">{prettyName(s.name)}</span>
+                      <span class="sv-card-title">{displayTitle(s.name)}</span>
                       <span class="sv-chip" style="--badge: {skillTypeColor('wasm')}">
                         {skillTypeLabel("wasm")}
                       </span>
+                      {#if recordFor(s.name)}
+                        <span class="sv-chip sv-chip-store">Store</span>
+                      {/if}
                     </div>
-                    <span class="sv-card-meta">{s.name} · {fmtSize(s.size)}</span>
+                    <span class="sv-card-meta">
+                      {s.name} · {fmtSize(s.size)}{#if recordFor(s.name)?.version} · v{recordFor(s.name).version}{/if}
+                    </span>
                   </div>
                 </div>
                 <div class="sv-card-actions">
@@ -573,18 +687,52 @@
         {/if}
       </section>
 
-      <!-- ═══ Marketplace ═══ -->
-      <!-- This one leaves the robot, so it lands well after the list above.
-           Saying so beats an empty gap that looks like "you own nothing". -->
+      <div class="sv-spacer"></div>
+    </div>
+
+    <!-- ═══ Upload FAB ═══
+         Belongs to this tab only: it uploads a skill you built, which is a
+         thing you do TO the robot. There is nothing to upload in the Store. -->
+    <button class="sv-fab" onclick={() => onNavigate && onNavigate("upload")} aria-label="Upload a skill">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="12" y1="5" x2="12" y2="19"/>
+        <line x1="5" y1="12" x2="19" y2="12"/>
+      </svg>
+    </button>
+
+  {:else if segment === "store"}
+    <!-- ═══ Store ═══════════════════════════════════════════════
+         What you OWN, which is a different question from what is on the
+         robot. A skill is listed here the moment you subscribe; the button
+         says whether it has made the trip to the robot yet. Keeping this
+         apart from the run list is the whole reason for the third tab: a
+         download used to appear in one flat list with no title and no way to
+         tell it apart from a file someone dropped there. -->
+    <div class="sv-body">
       {#if mktLoading && !mktSkills.length}
         <section class="sv-section">
-          <h3 class="sv-section-title">From the marketplace</h3>
           <p class="sv-mkt-wait">Checking your marketplace skills…</p>
         </section>
-      {/if}
-      {#if mktAvailable && mktSkills.length > 0}
+      {:else if !mktAvailable}
+        <div class="sv-empty">
+          <p class="sv-empty-title">Store unavailable</p>
+          <p class="sv-empty-desc">
+            The robot could not reach the marketplace. It needs to be on your
+            Wi-Fi, not just its own hotspot.
+          </p>
+          <button class="sv-btn sv-btn-primary" onclick={refresh}>Try again</button>
+        </div>
+      {:else if mktSkills.length === 0}
+        <div class="sv-empty">
+          <p class="sv-empty-title">You do not own any skills yet</p>
+          <p class="sv-empty-desc">
+            Browse and subscribe in <strong>Settings → Marketplace</strong>.
+            Anything you take will show up here, ready to download.
+          </p>
+        </div>
+      {:else}
         <section class="sv-section">
-          <h3 class="sv-section-title">From the marketplace</h3>
+          <h3 class="sv-section-title">Your skills</h3>
           <div class="sv-list">
             {#each mktSkills as skill (skill.skill_id)}
               <article class="sv-card">
@@ -599,7 +747,10 @@
                         {skillTypeLabel(skill.skill_type)}
                       </span>
                     </div>
-                    <span class="sv-card-meta">v{skill.current_version || "1.0"}</span>
+                    <span class="sv-card-meta">
+                      v{skill.current_version || "1.0"} ·
+                      {isDeployed(skill) ? "on this robot" : "not downloaded yet"}
+                    </span>
                   </div>
                 </div>
                 <div class="sv-card-actions">
@@ -642,14 +793,6 @@
 
       <div class="sv-spacer"></div>
     </div>
-
-    <!-- ═══ Upload FAB ═══ -->
-    <button class="sv-fab" onclick={() => onNavigate && onNavigate("upload")} aria-label="Upload a skill">
-      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-        <line x1="12" y1="5" x2="12" y2="19"/>
-        <line x1="5" y1="12" x2="19" y2="12"/>
-      </svg>
-    </button>
   {/if}
 
   <!-- ═══ Delete confirmation ═══ -->
@@ -764,6 +907,24 @@
   .sv-seg-on .sv-seg-count {
     background: var(--yellow);
     color: #000;
+  }
+
+  /* The one-liner under the tabs. Deliberately quiet: it is there for the
+     first few times you use the screen, not to compete with the list. */
+  .sv-blurb {
+    margin: 8px 2px 0;
+    font-size: 0.72rem;
+    line-height: 1.4;
+    color: #8a8a8a;
+  }
+
+  /* Marks a skill the robot knows came from the store, as opposed to one you
+     pushed yourself. Outlined rather than filled so it reads as provenance
+     and not as a second type badge. */
+  .sv-chip-store {
+    background: transparent;
+    border: 1px solid #c9c9c9;
+    color: #6f6f6f;
   }
 
   /* ── Body ───────────────────────────────────────── */

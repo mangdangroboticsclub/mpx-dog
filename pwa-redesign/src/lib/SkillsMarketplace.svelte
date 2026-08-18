@@ -37,6 +37,9 @@
 
   // Action in flight
   let actionInFlight = $state(null);
+  /* Separate from `error`, which replaces the whole list with a Retry panel.
+     A failed subscribe must not hide the catalogue you were looking at. */
+  let actionError = $state("");
 
   // ── Derived: filtered skills ────────────────────────────────
   let filteredSkills = $derived.by(() => {
@@ -127,26 +130,35 @@
   }
 
   // ── Subscribe / Refund ────────────────────────────────────────
+  /* Both of these used to swallow the failure into console.error. The robot
+     was answering 405 to every POST and DELETE here — its handler table had
+     filled up and the marketplace's write routes never registered — and the
+     screen's only tell was that the button went back to how it looked before.
+     A write that did not happen has to say so. */
   async function handleSubscribe(skillId) {
     actionInFlight = skillId;
+    actionError = "";
     try {
       await assignSkill(skillId);
       // Only refresh robot skills — marketplace listing hasn't changed
       await fetchRobotSkills();
     } catch (e) {
       console.error("Subscribe failed:", e);
+      actionError = `Could not subscribe — ${e.message || e}`;
     }
     actionInFlight = null;
   }
 
   async function handleRefund(skillId) {
     actionInFlight = skillId;
+    actionError = "";
     try {
       await removeSkill(skillId);
       // Only refresh robot skills — marketplace listing hasn't changed
       await fetchRobotSkills();
     } catch (e) {
       console.error("Refund failed:", e);
+      actionError = `Could not refund — ${e.message || e}`;
     }
     actionInFlight = null;
   }
@@ -431,6 +443,13 @@
         </button>
       {/if}
     </div>
+
+    {#if actionError}
+      <div class="mp-action-error">
+        <span>{actionError}</span>
+        <button class="mp-action-error-x" onclick={() => actionError = ""}>✕</button>
+      </div>
+    {/if}
 
     <!-- Content -->
     <div class="mp-content">
@@ -770,6 +789,30 @@
     color: #969494;
     font-size: 0.9rem;
     margin-top: 40px;
+  }
+
+  .mp-action-error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 0 16px 8px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: #FDECEC;
+    border: 1px solid #E9A8A8;
+    color: #8C2020;
+    font-size: 13px;
+    line-height: 1.35;
+  }
+  .mp-action-error-x {
+    flex: none;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font-size: 14px;
+    cursor: pointer;
+    padding: 0 2px;
   }
 
   .mp-error {

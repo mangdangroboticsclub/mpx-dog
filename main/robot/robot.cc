@@ -41,6 +41,9 @@ float s_offset[13] = {};
 
 // ── Goal buffers (1‑based, index 0 unused) ───────────────────
 uint16_t s_goal_pos[13]   = {};
+// Additive per-joint trim in DEGREES, applied to the outgoing frame in
+// flush() and never written back into s_goal_pos -- see set_overlay().
+float s_overlay[13] = {};
 uint16_t s_goal_speed[13] = {};
 
 // ── Servo bus ownership ──────────────────────────────────────
@@ -791,7 +794,19 @@ void flush()
     // field, so s_goal_speed is deliberately not sent — see set_servo_speed().
     uint16_t pos[12], cur[12];
     for (int i = 0; i < 12; ++i) {
-        pos[i] = s_goal_pos[i + 1];
+        int raw = static_cast<int>(s_goal_pos[i + 1]);
+
+        // The overlay is added here, to the frame on its way out, so it rides
+        // on top of whatever produced s_goal_pos -- the gait generator, the
+        // IK, or a skill -- without any of them knowing about it.
+        const float ov = s_overlay[i + 1];
+        if (ov != 0.0f) {
+            raw += static_cast<int>(ov * SERVO_DEG_TO_RAW);
+            if (raw < 0)    raw = 0;
+            if (raw > 1023) raw = 1023;
+        }
+
+        pos[i] = static_cast<uint16_t>(raw);
         cur[i] = SERVO_CURRENT_MAX_MA;
     }
     driver_board_sync_write(pos, cur);
@@ -804,6 +819,109 @@ void flush()
 // (s_th1_neutral_deg / s_th2_neutral_deg), exactly like the reference
 // minipupperesp fRIK/fLIK/rRIK/rLIK: front_right_ik(0,0,NEUTRAL_Z) ==
 // centred servos == the calibrated stand pose.
+
+namespace {
+struct GaitName { const char *name; GaitCmd cmd; };
+
+// GaitCmd::BodyAttitude is deliberately absent: it is set through
+// set_body_attitude(), not by name, and letting a caller send it directly
+// would put the robot in a pose-hold state nothing asked for.
+const GaitName GAIT_NAMES[] = {
+    { "none",         GaitCmd::None },
+    { "init",         GaitCmd::Init },
+    { "step",         GaitCmd::Step },
+    { "roll",         GaitCmd::Roll },
+    { "pitch",        GaitCmd::Pitch },
+    { "stretch",      GaitCmd::Stretch },
+    { "advance",      GaitCmd::Advance },
+    { "back",         GaitCmd::Back },
+    { "left",         GaitCmd::Left },
+    { "right",        GaitCmd::Right },
+    { "turnL",        GaitCmd::TurnL },
+    { "turnR",        GaitCmd::TurnR },
+    { "twerk",        GaitCmd::Twerk },
+    { "jump",         GaitCmd::Jump },
+    { "jumpfwd",      GaitCmd::JumpFwd },
+    { "testspeed",    GaitCmd::TestSpeed },
+    { "lookup",       GaitCmd::LookUp },
+    { "lookdown",     GaitCmd::LookDown },
+    { "lookleft",     GaitCmd::LookLeft },
+    { "lookright",    GaitCmd::LookRight },
+    { "lookul",       GaitCmd::LookUpperLeft },
+    { "lookur",       GaitCmd::LookUpperRight },
+    { "lookll",       GaitCmd::LookLowerLeft },
+    { "looklr",       GaitCmd::LookLowerRight },
+    { "flegL",        GaitCmd::ForelegLiftL },
+    { "flegR",        GaitCmd::ForelegLiftR },
+    { "blegL",        GaitCmd::BacklegLiftL },
+    { "blegR",        GaitCmd::BacklegLiftR },
+    { "heightup",     GaitCmd::HeightUp },
+    { "heightdown",   GaitCmd::HeightDown },
+    { "balance",      GaitCmd::Balance },
+    { "bowback",      GaitCmd::BowBack },
+    { "bodycycle",    GaitCmd::BodyCycle },
+    { "headellipse",  GaitCmd::HeadEllipse },
+    { "moveLF",       GaitCmd::MoveLeftFront },
+    { "moveRF",       GaitCmd::MoveRightFront },
+    { "moveLB",       GaitCmd::MoveLeftBack },
+    { "moveRB",       GaitCmd::MoveRightBack },
+    { "stanford",     GaitCmd::StanfordWalk },
+    { "frontkick",    GaitCmd::FrontKick },
+    { "wiggle",       GaitCmd::Wiggle },
+    { "buttshrug",    GaitCmd::ButtShrug },
+    { "wiggleL",      GaitCmd::WiggleLeft },
+    { "wiggleR",      GaitCmd::WiggleRight },
+    { "buttshrugL",   GaitCmd::ButtShrugLeft },
+    { "buttshrugR",   GaitCmd::ButtShrugRight },
+};
+constexpr int GAIT_NAME_COUNT = sizeof(GAIT_NAMES) / sizeof(GAIT_NAMES[0]);
+}  // namespace
+
+bool gait_from_name(const char *name, GaitCmd &out)
+{
+    if (!name || !*name) return false;
+    for (int i = 0; i < GAIT_NAME_COUNT; ++i) {
+        if (std::strcmp(name, GAIT_NAMES[i].name) == 0) {
+            out = GAIT_NAMES[i].cmd;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *gait_to_name(GaitCmd cmd)
+{
+    for (int i = 0; i < GAIT_NAME_COUNT; ++i)
+        if (GAIT_NAMES[i].cmd == cmd) return GAIT_NAMES[i].name;
+    return "none";
+}
+
+int gait_name_count() { return GAIT_NAME_COUNT; }
+
+const char *gait_name_at(int index)
+{
+    if (index < 0 || index >= GAIT_NAME_COUNT) return nullptr;
+    return GAIT_NAMES[index].name;
+}
+
+void set_overlay(int servo_id, float deg)
+{
+    if (servo_id < 1 || servo_id > 12) return;
+    if (deg >  SERVO_OVERLAY_MAX_DEG) deg =  SERVO_OVERLAY_MAX_DEG;
+    if (deg < -SERVO_OVERLAY_MAX_DEG) deg = -SERVO_OVERLAY_MAX_DEG;
+    s_overlay[servo_id] = deg;
+}
+
+float get_overlay(int servo_id)
+{
+    if (servo_id < 1 || servo_id > 12) return 0.0f;
+    return s_overlay[servo_id];
+}
+
+void clear_overlay()
+{
+    for (int i = 0; i <= 12; ++i) s_overlay[i] = 0.0f;
+}
 
 void front_right_ik(float x, float th0, float z)
 {
@@ -858,61 +976,34 @@ void gait_task()
     GaitCmd last_logged = GaitCmd::None;
 
     for (;;) {
+        /* ── Studio owns the bus: stand completely aside ──────────────────
+         *
+         * Not just "skip the flush". The whole tick is skipped and the task
+         * sleeps 100 ms, which is what mpxesp does and why Servo Studio is
+         * smooth there.
+         *
+         * Skipping only flush() looks equivalent and is not. This task runs at
+         * priority 22 pinned to core 1 and, without this, wakes every tick to
+         * run a full IK solve it is going to throw away. A config request is a
+         * request/NOP PAIR that must not be split, so what it needs from this
+         * task is not "no SPI" but "no interference at all" -- including not
+         * being repeatedly preempted by the highest-priority task on the chip
+         * while it waits ~600 us for an AT32 reply.
+         *
+         * 100 ms costs nothing: nothing is walking while a human is tuning
+         * servos, and set_studio_mode() already waits 50 ms on the way in for
+         * the tick in flight to drain. */
+        if (s_studio_mode) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         const GaitCmd cmd = s_gait_cmd;
 
         // Log gait transitions (avoid spam on continuous gaits)
         if (cmd != last_logged) {
             last_logged = cmd;
-            const char *name = "none";
-            switch (cmd) {
-                case GaitCmd::None:      name = "none";      break;
-                case GaitCmd::Init:      name = "init";      break;
-                case GaitCmd::Step:      name = "step";      break;
-                case GaitCmd::Roll:      name = "roll";      break;
-                case GaitCmd::Pitch:     name = "pitch";     break;
-                case GaitCmd::Stretch:   name = "stretch";   break;
-                case GaitCmd::Advance:   name = "advance";   break;
-                case GaitCmd::Back:      name = "back";      break;
-                case GaitCmd::Left:      name = "left";      break;
-                case GaitCmd::Right:     name = "right";     break;
-                case GaitCmd::TurnL:     name = "turnL";     break;
-                case GaitCmd::TurnR:     name = "turnR";     break;
-                case GaitCmd::Twerk:     name = "twerk";     break;
-                case GaitCmd::Jump:      name = "jump";      break;
-                case GaitCmd::JumpFwd:   name = "jumpfwd";   break;
-                case GaitCmd::TestSpeed: name = "testspeed"; break;
-                case GaitCmd::LookUp:         name = "lookup";        break;
-                case GaitCmd::LookDown:       name = "lookdown";      break;
-                case GaitCmd::LookLeft:       name = "lookleft";      break;
-                case GaitCmd::LookRight:      name = "lookright";     break;
-                case GaitCmd::LookUpperLeft:  name = "lookul";        break;
-                case GaitCmd::LookUpperRight: name = "lookur";        break;
-                case GaitCmd::LookLowerLeft:  name = "lookll";        break;
-                case GaitCmd::LookLowerRight: name = "looklr";        break;
-                case GaitCmd::ForelegLiftL:   name = "flegL";         break;
-                case GaitCmd::ForelegLiftR:   name = "flegR";         break;
-                case GaitCmd::BacklegLiftL:   name = "blegL";         break;
-                case GaitCmd::BacklegLiftR:   name = "blegR";         break;
-                case GaitCmd::HeightUp:       name = "heightup";      break;
-                case GaitCmd::HeightDown:     name = "heightdown";    break;
-                case GaitCmd::Balance:        name = "balance";       break;
-                case GaitCmd::BowBack:        name = "bowback";       break;
-                case GaitCmd::BodyCycle:      name = "bodycycle";     break;
-                case GaitCmd::HeadEllipse:    name = "headellipse";   break;
-                case GaitCmd::MoveLeftFront:  name = "moveLF";        break;
-                case GaitCmd::MoveRightFront: name = "moveRF";        break;
-                case GaitCmd::MoveLeftBack:   name = "moveLB";        break;
-                case GaitCmd::MoveRightBack:  name = "moveRB";        break;
-                case GaitCmd::StanfordWalk:   name = "stanford";      break;
-                case GaitCmd::FrontKick:      name = "frontkick";     break;
-                case GaitCmd::Wiggle:         name = "wiggle";        break;
-                case GaitCmd::ButtShrug:      name = "buttshrug";     break;
-                case GaitCmd::WiggleLeft:     name = "wiggleL";       break;
-                case GaitCmd::WiggleRight:    name = "wiggleR";       break;
-                case GaitCmd::ButtShrugLeft:  name = "buttshrugL";    break;
-                case GaitCmd::ButtShrugRight: name = "buttshrugR";    break;
-                case GaitCmd::BodyAttitude:   name = "attitude";      break;
-            }
+            const char *name = gait_to_name(cmd);
             ESP_LOGI(TAG, "Gait: %s", name);
         }
 

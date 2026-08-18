@@ -77,17 +77,91 @@
 
   let toastMsg = $state(""), toastBad = $state(false);
   let toastTimer;
+
+  /* A toast is gone in 2.6 s, which is no use when you are trying to work out
+     whether a write landed. Every toast is also appended here, so the answer
+     is still on screen when you look for it. Newest first, capped — this is a
+     "what just happened" panel, not a record. */
+  let logLines = $state([]);
+  let logOpen  = $state(true);
+  function logAdd(m, bad) {
+    const t = new Date().toLocaleTimeString([], { hour12: false });
+    logLines = [{ t, m, bad }, ...logLines].slice(0, 40);
+  }
+
   function toast(m, bad = false) {
     toastMsg = m; toastBad = bad;
+    logAdd(m, bad);
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => (toastMsg = ""), 2600);
   }
 
-  async function jget(path) {
+  /* ── One request at a time ─────────────────────────────────────
+   * WHY THIS EXISTS, AND WHY THE STANDALONE /studio PAGE DOES NOT NEED IT.
+   *
+   * The robot's HTTP server runs with max_open_sockets = 5 and
+   * lru_purge_enable (main/network/http_server.cc). The /studio page is
+   * effectively the only client on that budget, so it can fire requests and
+   * forget about them.
+   *
+   * The PWA is not alone. The app shell holds a PERMANENT WebSocket on
+   * /v1/chat/ui, polls /v1/wifi/status, and leaves keep-alive sockets behind
+   * from loading its own assets. Add this screen's 600 ms status poll, its
+   * 140 ms live poll and a write on top and the cap is reached. httpd then
+   * LRU-purges the oldest IDLE session — very often a keep-alive socket the
+   * browser is about to reuse. The reused socket dies on send and fetch()
+   * rejects before anything reaches the robot.
+   *
+   * That is the "sometimes it works, mostly it does not" bug. Nothing was
+   * wrong with the write, the driver board or the SPI bus: the request never
+   * left the phone. It is also why Factory reset seemed fine — it is the one
+   * button pressed rarely enough to usually land on a live socket.
+   *
+   * Two rules fix it without touching the firmware:
+   *   1. One request in flight at a time, so this screen never needs more
+   *      than one socket and never races its own poll.
+   *   2. A purged keep-alive socket fails instantly and the next attempt
+   *      opens a fresh one — so retry a network-level failure exactly once.
+   *
+   * Polls are deliberately NOT retried and do not hold the link: a dropped
+   * refresh costs nothing, and 600 ms later there is another one.
+   */
+  let chain     = Promise.resolve();
+  let inflight  = 0;                // > 0 => a real operation owns the link
+  const isPoll  = (p) => p.startsWith("/v1/studio/status") ||
+                         p.startsWith("/v1/studio/live");
+
+  async function rawGet(path) {
     const r = await fetch(path, { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
   }
+
+  function jget(path) {
+    const poll_ = isPoll(path);
+    if (!poll_) inflight++;
+    const run = chain.then(async () => {
+      try {
+        return await rawGet(path);
+      } catch (e) {
+        if (poll_) throw e;
+        await new Promise((r) => setTimeout(r, 120));
+        return rawGet(path);        // second attempt gets a fresh socket
+      }
+    }).finally(() => { if (!poll_) inflight--; });
+    chain = run.catch(() => {});    // one failure must not poison the queue
+    return run;
+  }
+
+  /* The app shell's permission WebSocket is one of the robot's five sockets,
+     held for the whole session. It is worth nothing on this screen and costs
+     a fifth of the budget, so borrow it while Studio is open and hand it
+     straight back on the way out. Reads no state, so it runs once per mount. */
+  $effect(() => {
+    window.dispatchEvent(new Event("mpx:yield-socket"));
+    return () => window.dispatchEvent(new Event("mpx:resume-socket"));
+  });
+
   const fmt = (v, d = 1) =>
     (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
   const pad = (n) => String(n).padStart(2, "0");
@@ -104,6 +178,9 @@
 
   /* ── Status poll ───────────────────────────────────────────── */
   async function pollStatus() {
+    /* A pending write matters more than a fresher temperature reading, and a
+       poll queued in front of it only delays it. */
+    if (inflight) return;
     try {
       const d = await jget("/v1/studio/status");
       servos = d.servos; cli = d.studio; online = true;
@@ -163,15 +240,39 @@
     finally { loading = false; }
   }
 
+  /* The value boxes are <input type="number">, and Svelte's bind:value COERCES
+     those to a Number. So the same slot holds a string when it was filled in
+     from a board read (refreshSel writes String(p.v)) and a number the instant
+     you type in it.
+
+     Calling .trim() on that number threw a TypeError before the try block —
+     no request, no toast, not even a line in the Activity panel. That is the
+     "I press Set and nothing happens" bug, and it explains its shape exactly:
+     Reload, Tuned defaults and Factory Reset all worked because none of them
+     read this field, and a row you had not typed into still held a string.
+     Reverse motor was just the row you happened to edit.
+
+     Read it as text and this stops mattering. */
+  const asText = (x) =>
+    (x === null || x === undefined || Number.isNaN(x)) ? "" : String(x).trim();
+
   async function applyParam(a) {
-    const v = (vals[a] ?? "").trim();
+    /* scan() and saveFlash() both check this and applyParam did not, so a
+       write with the gait still running produced a bare "write refused" from
+       the firmware with nothing saying what to do about it. */
+    if (!cli) return toast("press Connect first — the gait still owns the bus", true);
+    const v = asText(vals[a]);
     if (v === "") return toast("enter a value first", true);
     try {
       const d = await jget(`/v1/studio/set?id=${cur}&p=${a}&v=${encodeURIComponent(v)}`);
       if (!d.ok) return toast(d.err || "write refused", true);
       actual[a] = d.v; vals[a] = String(d.v);
       toast(PARAMS[a].n + " → " + d.v);
-    } catch { toast("write failed", true); }
+    } catch (e) {
+      /* Report the real reason. A bare "write failed" sent me hunting the SPI
+         bus for a bug that was in this function. */
+      toast("write failed — " + (e?.message || e), true);
+    }
   }
 
   async function saveFlash(all = false) {
@@ -184,6 +285,7 @@
   }
 
   async function factoryReset() {
+    if (!cli) return toast("press Connect first — the gait still owns the bus", true);
     try {
       const d = await jget("/v1/studio/restore?id=" + cur);
       toast(d.ok ? "factory defaults in RAM — save to keep" : (d.err || "restore failed"), !d.ok);
@@ -192,6 +294,7 @@
   }
 
   async function direct(mode) {
+    if (!cli) return toast("press Connect first — the gait still owns the bus", true);
     try {
       const d = await jget(`/v1/studio/direct?id=${cur}&m=${mode}&deg=${deg}&cur=${cap || 200}`);
       toast(d.ok ? (mode ? `holding ${Number(deg).toFixed(1)}°` : "motor off")
@@ -208,14 +311,20 @@
     tickPoll();
     pollTimer = setInterval(tickPoll, 140);
   }
+  /* A transient drop used to stop the scope dead. Now three consecutive
+     failures do — one lost frame at 140 ms is not worth ending the trace. */
+  let liveMiss = 0;
   async function tickPoll() {
-    if (!poll || !cur) return;
+    if (!poll || !cur || inflight) return;
     try {
       const d = await jget("/v1/studio/live?id=" + cur);
       if (!d.ok) { stopPoll(); return toast(d.err || "live read failed", true); }
       live = d;
+      liveMiss = 0;
       gPush(d);
-    } catch { stopPoll(); toast("live read failed", true); }
+    } catch {
+      if (++liveMiss >= 3) { liveMiss = 0; stopPoll(); toast("live read failed", true); }
+    }
   }
 
   /* ── Scope ─────────────────────────────────────────────────────
@@ -428,7 +537,10 @@
   }
 
   async function saApply() {
-    const todo = PARAMS.filter((p) => saTick[p.a] && (saVal[p.a] ?? "").trim() !== "");
+    if (!cli) return toast("press Connect first — the gait still owns the bus", true);
+    /* Same number-input coercion as applyParam: .trim() on a typed-in value
+       threw here too, and this one took the whole Set All panel with it. */
+    const todo = PARAMS.filter((p) => saTick[p.a] && asText(saVal[p.a]) !== "");
     if (!todo.length) return toast("tick a parameter and give it a value", true);
     let bad = 0;
     for (let i = 0; i < todo.length; i++) {
@@ -437,7 +549,7 @@
       saRes[p.a] = "…";
       try {
         const d = await jget(`/v1/studio/setall?p=${p.a}` +
-                             `&v=${encodeURIComponent(saVal[p.a])}` +
+                             `&v=${encodeURIComponent(asText(saVal[p.a]))}` +
                              `&save=${saSave && last ? 1 : 0}`);
         if (d.ok) {
           saRes[p.a] = d.fail?.length ? "fail " + d.fail.join(",") : `${d.n}/12`;
@@ -701,6 +813,27 @@
     </div>
   {/if}
 
+  <div class="logwrap" class:open={logOpen}>
+    <button class="loghead" onclick={() => (logOpen = !logOpen)}>
+      <span>Activity</span>
+      <span class="logcount">{logLines.length ? logLines.length : ""}</span>
+      <span class="logchev">{logOpen ? "\u25be" : "\u25b4"}</span>
+    </button>
+    {#if logOpen}
+      <div class="logbody">
+        {#if logLines.length === 0}
+          <div class="logempty">Nothing yet. Connect, pick a servo, then Set a value.</div>
+        {:else}
+          {#each logLines as l}
+            <div class="logline" class:bad={l.bad}>
+              <span class="logt">{l.t}</span><span>{l.m}</span>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    {/if}
+  </div>
+
   {#if toastMsg}<div class="toast" class:bad={toastBad}>{toastMsg}</div>{/if}
 </div>
 
@@ -874,12 +1007,40 @@
 
   /* ── Toast ── */
   .toast{
-    position:absolute;left:50%;bottom:20px;transform:translateX(-50%);
+    /* fixed, not absolute: .studio is a flex column that can extend past the
+       viewport, so an absolutely-positioned toast ends up below the fold —
+       which reads as "there was no message at all". The standalone studio
+       page uses fixed for the same reason. */
+    position:fixed;left:50%;bottom:20px;transform:translateX(-50%);
     background:var(--y);color:#000;padding:10px 20px;border-radius:999px;
     font-size:12.5px;font-weight:700;box-shadow:0 10px 34px rgba(0,0,0,.7);
     max-width:90%;text-align:center;z-index:60;
   }
   .toast.bad{background:#1A1A1A;color:var(--y);border:1px solid var(--y)}
+
+  /* Activity log — docked bottom-right, collapsible, never covers the table. */
+  .logwrap{
+    position:fixed;right:14px;bottom:14px;width:min(340px,calc(100vw - 28px));
+    background:var(--pane);border:1px solid var(--line);border-radius:12px;
+    box-shadow:0 12px 40px rgba(0,0,0,.6);z-index:55;overflow:hidden;
+  }
+  .loghead{
+    display:flex;align-items:center;gap:8px;width:100%;
+    background:var(--well);border:0;border-bottom:1px solid var(--line);
+    color:var(--mute);font:600 11.5px/1 var(--mono);letter-spacing:.08em;
+    text-transform:uppercase;padding:9px 12px;cursor:pointer;
+  }
+  .loghead span:first-child{flex:1;text-align:left}
+  .logcount{color:var(--y)}
+  .logchev{color:var(--dim)}
+  .logbody{max-height:168px;overflow:auto;padding:6px 0}
+  .logline{
+    display:flex;gap:9px;padding:4px 12px;
+    font:12px/1.45 var(--mono);color:#DEDEDE;
+  }
+  .logline.bad{color:var(--y)}
+  .logt{color:var(--dim);flex:none}
+  .logempty{padding:10px 12px;color:var(--dim);font-size:12px}
 
   /* ── Phone ── */
   .tools{display:flex;align-items:center;gap:9px;flex-wrap:wrap}

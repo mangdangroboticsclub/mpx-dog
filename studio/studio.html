@@ -374,8 +374,8 @@ const PARAMS = [
   {a:4, n:"Reverse motor",           h:"0 or 1",               cal:1, s:1},
   {a:5, n:"Kp position",             h:"position P gain",      cal:0, s:0.01},
   {a:6, n:"Kd position",             h:"position D gain",      cal:0, s:0.01},
-  {a:7, n:"Kp current",              h:"current P gain",       cal:0, s:0.01},
-  {a:8, n:"Kff current",             h:"current feed-forward", cal:0, s:0.01},
+  {a:7, n:"Kp current",              h:"current P gain",       cal:0, s:0.0001},
+  {a:8, n:"Kff current",             h:"current feed-forward", cal:0, s:0.00001},
   {a:9, n:"Max PWM duty",            h:"0 to 1",               cal:0, s:0.01},
 ];
 const LEGS = [
@@ -506,6 +506,9 @@ async function refreshSel(){
 }
 
 async function applyParam(a){
+  // scan() and the flash buttons check this and Set did not, so writing with
+  // the gait still running gave a bare "write refused" and no way to know why.
+  if(!cli) return toast("press Connect first — the gait still owns the bus", 1);
   const el = $("pv"+a), v = el.value.trim();
   if(v === "") return toast("enter a value first", 1);
   try{

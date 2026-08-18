@@ -36,6 +36,47 @@ StaState s_state = StaState::Disconnected;
 std::string s_current_ssid;
 std::string s_current_ip;
 
+/* 802.11 disconnect reasons, by number.
+ *
+ * The bare integer sends you to a table on the internet every time, and the
+ * distinction it hides is the one that matters: 15 means you typed the
+ * password wrong, 4 means the router accepted you and then let go. Switching
+ * on the literals rather than the WIFI_REASON_* enum keeps this compiling
+ * across IDF versions that add or rename members.
+ *
+ * On this robot 4 (ASSOC_EXPIRE) deserves special mention. The ESP32 has ONE
+ * radio, and this firmware runs WIFI_MODE_APSTA — the MPX-Dog hotspot and the
+ * join to your home network at the same time. They cannot sit on different
+ * channels, so when the STA associates the driver drags the softAP over to
+ * the router's channel, which is the "wifi:new:<1,1>, old:<6,1>" line right
+ * above the failure. That switch lands in the middle of the association and
+ * the association sometimes does not survive it. It is a race, not a fault:
+ * the retry normally succeeds, which is why the robot ends up online anyway.
+ */
+static const char *wifi_reason_name(int reason)
+{
+    switch (reason) {
+    case 1:   return "UNSPECIFIED";
+    case 2:   return "AUTH_EXPIRE";
+    case 3:   return "AUTH_LEAVE";
+    case 4:   return "ASSOC_EXPIRE — router accepted then dropped us; on this "
+                     "robot usually the AP+STA channel switch";
+    case 5:   return "ASSOC_TOOMANY — the router is at its client limit";
+    case 6:   return "NOT_AUTHED";
+    case 7:   return "NOT_ASSOCED";
+    case 8:   return "ASSOC_LEAVE";
+    case 15:  return "4WAY_HANDSHAKE_TIMEOUT — almost always a wrong password";
+    case 200: return "BEACON_TIMEOUT — out of range, or the router went away";
+    case 201: return "NO_AP_FOUND — wrong SSID, or it is 5 GHz only "
+                     "(this radio is 2.4 GHz)";
+    case 202: return "AUTH_FAIL";
+    case 203: return "ASSOC_FAIL";
+    case 204: return "HANDSHAKE_TIMEOUT";
+    case 205: return "CONNECTION_FAIL";
+    default:  return "see esp_wifi_types.h";
+    }
+}
+
 void wifi_event_handler(void *arg, esp_event_base_t base,
                         int32_t id, void *data)
 {
@@ -46,7 +87,8 @@ void wifi_event_handler(void *arg, esp_event_base_t base,
         s_state = StaState::Connecting;
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         auto *event = static_cast<wifi_event_sta_disconnected_t *>(data);
-        ESP_LOGW(TAG, "STA disconnected (reason=%d)", event->reason);
+        ESP_LOGW(TAG, "STA disconnected (reason=%d: %s)",
+                 event->reason, wifi_reason_name(event->reason));
 
         s_state = StaState::Disconnected;
         s_current_ip.clear();

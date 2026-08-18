@@ -149,6 +149,71 @@
     };
   });
 
+  // ── Lending the socket out ──────────────────────────────────
+  // The robot's HTTP server allows five open sockets and LRU-purges the
+  // oldest idle one when a sixth arrives (main/network/http_server.cc). This
+  // permanent WebSocket is one of those five, all session long.
+  //
+  // Servo Studio is the one screen where that matters: it polls twice a
+  // second, reads live values eight times a second, and every write it sends
+  // has to survive the trip. When a purge lands on a keep-alive socket the
+  // browser was about to reuse, that write dies before it leaves the phone.
+  //
+  // So Studio asks for the socket back on the way in and returns it on the
+  // way out. Nothing needs the permission channel while you are tuning gains,
+  // and any action raised meanwhile is still pending when the socket comes
+  // back — the robot re-announces it.
+  $effect(() => {
+    const lend   = () => disconnectPermissionWs();
+    const takeBack = () => { permStopped = false; connectPermissionWs(); };
+    window.addEventListener("mpx:yield-socket",  lend);
+    window.addEventListener("mpx:resume-socket", takeBack);
+    return () => {
+      window.removeEventListener("mpx:yield-socket",  lend);
+      window.removeEventListener("mpx:resume-socket", takeBack);
+    };
+  });
+
+  /* ── What the dialog says ────────────────────────────────────
+   * "Permission Required / The robot is requesting access to perform an
+   * action / 🔧 file write / ✅ Approve" described the plumbing, not the
+   * decision. Someone who has just tapped Download on a skill is being asked
+   * a question they already know the answer to, in words that make it sound
+   * like something has gone wrong.
+   *
+   * The robot distinguishes an install from an ordinary write, so this can
+   * ask the actual question and label the button with the actual verb — the
+   * one thing that reliably tells a person what a button will do. */
+  function permCopy(action) {
+    switch (action?.type) {
+    case "skill_install":
+      return {
+        title: "Install this skill?",
+        subtitle: "It will be added to this robot and appear under Skills.",
+        label: "Skill install",
+        foot: "Skills run in a sandbox: they can move the robot, but cannot "
+            + "reach your network or the rest of its storage.",
+        confirm: "Install",
+      };
+    case "file_delete":
+      return {
+        title: "Delete this file?",
+        subtitle: "This removes it from the robot's storage.",
+        label: "File delete",
+        foot: "This cannot be undone from here.",
+        confirm: "Delete",
+      };
+    default:
+      return {
+        title: "Save this file?",
+        subtitle: "Something running on the robot wants to write to its storage.",
+        label: (action?.type || "action").replace(/_/g, " "),
+        foot: "Only allow this if you started it.",
+        confirm: "Allow",
+      };
+    }
+  }
+
   // ── Pack props for children ─────────────────────────────────
   let network = $derived({ apIp, apSsid, staState, staSsid, staIp, networkLoaded });
 </script>
@@ -168,30 +233,29 @@
       style="--yellow: {YELLOW}"
       onclick={(e) => e.stopPropagation()}
     >
-      <h3 class="perm-title">Permission Required</h3>
-      <p class="perm-subtitle">
-        The robot is requesting access to perform an action.
-      </p>
+      <h3 class="perm-title">{permCopy(pendingActions[0]).title}</h3>
+      <p class="perm-subtitle">{permCopy(pendingActions[0]).subtitle}</p>
 
       {#each pendingActions as action}
         <div class="perm-action-card">
           <div class="perm-action-header">
-            <span class="perm-action-icon">🔧</span>
-            <span class="perm-action-type">{action.type.replace(/_/g, " ")}</span>
+            <span class="perm-action-type">{permCopy(action).label}</span>
           </div>
           <p class="perm-action-desc">{action.description}</p>
         </div>
       {/each}
 
+      <p class="perm-foot">{permCopy(pendingActions[0]).foot}</p>
+
       <div class="perm-buttons">
         <button
           class="perm-btn perm-btn-deny"
           onclick={() => respondPermission(pendingActions[0].id, false)}
-        >⛔ Deny</button>
+        >Cancel</button>
         <button
           class="perm-btn perm-btn-approve"
           onclick={() => respondPermission(pendingActions[0].id, true)}
-        >✅ Approve</button>
+        >{permCopy(pendingActions[0]).confirm}</button>
       </div>
     </div>
   </div>
@@ -246,8 +310,14 @@
     margin-bottom: 4px;
   }
 
-  .perm-action-icon {
-    font-size: 1.2rem;
+  /* The footnote that says what the robot will and will not let a skill do.
+     Small, but it is the sentence that makes Install a considered tap rather
+     than a reflex. */
+  .perm-foot {
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: #7a7a7a;
+    margin: 10px 2px 16px;
   }
 
   .perm-action-type {
