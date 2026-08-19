@@ -30,6 +30,20 @@
   let searchQuery = $state("");
   let activeFilters = $state([]); // array of skill type keys e.g. ["awa", "wasm"]
 
+  /* Sorting. A store with no sort reads as a pile; a store with a sort reads
+     as a catalogue. Kept as a plain <select> rather than a custom dropdown —
+     it is one element, it is keyboard- and screen-reader-correct for free, and
+     on a phone the OS picker is better than anything hand-rolled. */
+  const SORTS = [
+    { key: "name",      label: "Name (A–Z)" },
+    { key: "name_desc", label: "Name (Z–A)" },
+    { key: "price_asc", label: "Price (low to high)" },
+    { key: "price_desc",label: "Price (high to low)" },
+    { key: "type",      label: "Type" },
+    { key: "owned",     label: "Owned first" },
+  ];
+  let sortBy = $state("name");
+
   // Detail view
   let detailSkill = $state(null);
   let detailManifest = $state(null);
@@ -41,7 +55,11 @@
      A failed subscribe must not hide the catalogue you were looking at. */
   let actionError = $state("");
 
-  // ── Derived: filtered skills ────────────────────────────────
+  /* ── Derived: what the list shows ─────────────────────────────
+   * Filter and sort in ONE pass over one array. Nothing intermediate is kept
+   * in state, so the only copies alive are the source list and the slice on
+   * screen — which matters on a device where the whole app shares the
+   * browser with a robot's control page. */
   let filteredSkills = $derived.by(() => {
     let skills = marketplaceSkills;
 
@@ -62,8 +80,24 @@
       );
     }
 
-    return skills;
+    // Sort last, on the already-narrowed set.
+    const byName = (a, b) => (a.title || "").localeCompare(b.title || "");
+    const sorted = [...skills];
+    switch (sortBy) {
+    case "name_desc":  sorted.sort((a, b) => byName(b, a)); break;
+    case "price_asc":  sorted.sort((a, b) => skillPrice(a) - skillPrice(b) || byName(a, b)); break;
+    case "price_desc": sorted.sort((a, b) => skillPrice(b) - skillPrice(a) || byName(a, b)); break;
+    case "type":       sorted.sort((a, b) =>
+                         (a.skill_type || "").localeCompare(b.skill_type || "") || byName(a, b)); break;
+    case "owned":      sorted.sort((a, b) =>
+                         (isAssigned(b.id) - isAssigned(a.id)) || byName(a, b)); break;
+    default:           sorted.sort(byName);
+    }
+    return sorted;
   });
+
+  let ownedCount = $derived(
+    marketplaceSkills.filter((s) => isAssigned(s.id)).length);
 
   // ── Fetch ────────────────────────────────────────────────────
   async function fetchMarketplace() {
@@ -424,25 +458,40 @@
       </div>
     </div>
 
-    <!-- Filter chips -->
-    <div class="mp-filters">
-      {#each SKILL_TYPES as type}
-        <button
-          class="mp-filter-chip"
-          class:active={activeFilters.includes(type.key)}
-          style="--chip-color: {skillTypeColor(type.key)}"
-          onclick={() => toggleFilter(type.key)}
-        >
-          <span class="mp-filter-dot" style="background: {skillTypeColor(type.key)}"></span>
-          {type.label}
-        </button>
-      {/each}
-      {#if activeFilters.length > 0}
-        <button class="mp-filter-clear" onclick={() => activeFilters = []}>
-          Clear
-        </button>
-      {/if}
+    <!-- ═══ TOOLBAR ═══════════════════════════════════════════════
+         Filter, sort, and a count. The count is the part that makes a
+         store read as a store rather than a pile: it says the list is
+         complete and that something is deciding what you see. -->
+    <div class="mp-toolbar">
+      <div class="mp-chiprow">
+        <button class="mp-filter-chip" class:active={activeFilters.length === 0}
+                onclick={() => (activeFilters = [])}>All</button>
+        {#each SKILL_TYPES as type}
+          <button
+            class="mp-filter-chip"
+            class:active={activeFilters.includes(type.key)}
+            onclick={() => toggleFilter(type.key)}
+          >
+            <span class="mp-filter-dot" style="background: {skillTypeColor(type.key)}"></span>
+            {type.label}
+          </button>
+        {/each}
+      </div>
+
+      <label class="mp-sort">
+        <span class="mp-sort-label">Sort</span>
+        <select class="mp-sort-select" bind:value={sortBy}>
+          {#each SORTS as o}<option value={o.key}>{o.label}</option>{/each}
+        </select>
+      </label>
     </div>
+
+    <!-- What the two kinds ARE. One line, once, instead of two badge colours
+         nobody can decode. -->
+    <p class="mp-legend">
+      <b>MoveSkill</b> downloads onto the robot and makes it move ·
+      <b>AISkill</b> runs as a behaviour you switch on
+    </p>
 
     {#if actionError}
       <div class="mp-action-error">
@@ -462,82 +511,77 @@
         </div>
       {:else if filteredSkills.length === 0}
         <div class="mp-empty-state">
-          <div class="mp-empty-icon">🛒</div>
           {#if searchQuery || activeFilters.length > 0}
-            <p class="mp-empty-title">No Results</p>
-            <p class="mp-empty-desc">Try adjusting your search or filters.</p>
+            <p class="mp-empty-title">No matches</p>
+            <p class="mp-empty-desc">
+              Nothing here matches “{searchQuery || SKILL_TYPES.find(t => activeFilters.includes(t.key))?.label}”.
+            </p>
+            <button class="mp-retry-btn" onclick={() => { searchQuery = ""; activeFilters = []; }}>
+              Clear filters
+            </button>
           {:else}
-            <p class="mp-empty-title">No Skills Available</p>
-            <p class="mp-empty-desc">Check back later for new skills.</p>
+            <p class="mp-empty-title">The store is empty</p>
+            <p class="mp-empty-desc">No skills have been published yet.</p>
           {/if}
         </div>
       {:else}
-        <div class="mp-grid">
+        <p class="mp-count">
+          <b>{filteredSkills.length}</b>
+          {filteredSkills.length === 1 ? "skill" : "skills"}
+          {#if filteredSkills.length !== marketplaceSkills.length}of {marketplaceSkills.length}{/if}
+          {#if ownedCount}· <b>{ownedCount}</b> owned{/if}
+        </p>
+
+        <!-- Rows, not cards. Aligned columns down the page are what makes a
+             list scannable, and scannable is most of what "looks legitimate"
+             actually means. No images anywhere: the glyph is the first letter
+             on the type colour, so there is nothing to fetch and nothing to
+             decode. -->
+        <ul class="mp-list">
           {#each filteredSkills as skill (skill.id)}
-            <div class="mp-card" role="button" tabindex="0">
-              <!-- Clickable area → detail -->
-              <button class="mp-card-main" onclick={() => openDetail(skill)}>
-                <div class="mp-card-top">
-                  <!-- Icon -->
-                  <div class="mp-card-icon" style="background: {skillTypeColor(skill.skill_type)}">
-                    <span>{skill.title?.charAt(0) || "⚡"}</span>
-                  </div>
-                  <div class="mp-card-meta">
-                    <span
-                      class="mp-type-badge"
-                      style="--badge-color: {skillTypeColor(skill.skill_type)}"
-                    >
-                      {skillTypeLabel(skill.skill_type)}
-                    </span>
-                    <span class="mp-card-version">v{skill.current_version || "1.0"}</span>
-                  </div>
-                </div>
+            <li class="mp-row" class:mp-row-owned={isAssigned(skill.id)}>
+              <button class="mp-row-main" onclick={() => openDetail(skill)}>
+                <span class="mp-glyph" style="background: {skillTypeColor(skill.skill_type)}">
+                  {(skill.title || "?").charAt(0).toUpperCase()}
+                </span>
 
-                <h3 class="mp-card-title">{skill.title}</h3>
-                <p class="mp-card-author">{extractAuthor(skill)}</p>
-                {#if skill.description}
-                  <p class="mp-card-desc">{skill.description}</p>
-                {/if}
+                <span class="mp-row-text">
+                  <span class="mp-row-title">{skill.title || "Untitled"}</span>
+                  <span class="mp-row-sub">
+                    {extractAuthor(skill)} · v{skill.current_version || "1.0"}
+                  </span>
+                  {#if skill.description}
+                    <span class="mp-row-desc">{skill.description}</span>
+                  {/if}
+                </span>
 
-                <div class="mp-card-price">
-                  <span class="mp-card-price-value">{priceLabel(skill)}</span>
-                </div>
+                <span class="mp-row-right">
+                  <span class="mp-price">{priceLabel(skill)}</span>
+                  <span class="mp-type" style="--badge-color: {skillTypeColor(skill.skill_type)}">
+                    {skillTypeLabel(skill.skill_type)}
+                  </span>
+                </span>
               </button>
 
-              <!-- Action row -->
-              <div class="mp-card-actions">
+              <div class="mp-row-actions">
                 {#if isAssigned(skill.id)}
+                  <span class="mp-owned">In your library</span>
                   <button
-                    class="mp-card-btn mp-card-btn-refund"
+                    class="mp-btn mp-btn-ghost"
                     disabled={actionInFlight === skill.id}
                     onclick={() => handleRefund(skill.id)}
                   >
                     {actionInFlight === skill.id ? "…" : "Refund"}
                   </button>
                 {:else}
-                  <button
-                    class="mp-card-btn mp-card-btn-sub"
-                    onclick={() => openPay(skill)}
-                  >
-                    Subscribe
+                  <button class="mp-btn mp-btn-buy" onclick={() => openPay(skill)}>
+                    Get for {priceLabel(skill)}
                   </button>
                 {/if}
-
-                <!--
-                  TODO: Checkout button on card (future)
-                  Uncomment when checkout flow is implemented.
-
-                  <button
-                    class="mp-card-btn mp-card-btn-checkout"
-                    onclick={() => handleCheckout(skill.id)}
-                  >
-                    Buy
-                  </button>
-                -->
               </div>
-            </div>
+            </li>
           {/each}
-        </div>
+        </ul>
       {/if}
     </div>
   {/if}
@@ -619,13 +663,181 @@
             Pay {priceLabel(payingSkill)}
           {/if}
         </button>
-        <p class="pay-secure">🔒 Secured payment · 256-bit encryption</p>
+        <!-- Was "🔒 Secured payment · 256-bit encryption". Padlock emoji and
+             a bit-count are what a phishing page says; a real store states
+             plainly who takes the money and what happens next. -->
+        <p class="pay-secure">Payment is handled by the MPX marketplace. You can
+          refund a skill from your library at any time.</p>
       {/if}
     </div>
   {/if}
 </div>
 
 <style>
+  /* ═══ Store list ═══════════════════════════════════════════════
+     Rows with columns that line up, not cards floating in a grid.
+     Everything below is plain CSS on flexbox — no library, no images, no
+     web fonts. The heaviest thing on this screen is the text. */
+
+  .mp-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 14px 8px;
+  }
+  .mp-chiprow {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    flex: 1;
+    min-width: 0;
+  }
+  .mp-chiprow::-webkit-scrollbar { display: none; }
+
+  .mp-sort { display: flex; align-items: center; gap: 5px; flex: none; }
+  .mp-sort-label { font-size: 0.68rem; color: #8a8a8a; }
+  .mp-sort-select {
+    font: inherit;
+    font-size: 0.72rem;
+    padding: 5px 6px;
+    border: 1px solid #dcdcdc;
+    border-radius: 8px;
+    background: #fff;
+    color: #000;
+    max-width: 118px;
+  }
+
+  .mp-legend {
+    margin: 0 14px 8px;
+    font-size: 0.68rem;
+    line-height: 1.45;
+    color: #8a8a8a;
+  }
+  .mp-legend b { color: #4a4a4a; font-weight: 600; }
+
+  .mp-count {
+    margin: 0 2px 8px;
+    font-size: 0.72rem;
+    color: #8a8a8a;
+  }
+  .mp-count b { color: #000; font-weight: 700; }
+
+  .mp-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border-top: 1px solid #ececec;
+  }
+
+  .mp-row {
+    border-bottom: 1px solid #ececec;
+    background: #fff;
+  }
+  /* Owned rows get a rail rather than a fill: it marks them without making
+     the list look striped and busy. */
+  .mp-row-owned { box-shadow: inset 3px 0 0 var(--yellow); }
+
+  .mp-row-main {
+    display: flex;
+    align-items: flex-start;
+    gap: 11px;
+    width: 100%;
+    padding: 12px 14px 8px;
+    background: none;
+    border: 0;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+  }
+
+  .mp-glyph {
+    flex: none;
+    width: 38px;
+    height: 38px;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 1.05rem;
+    font-weight: 800;
+  }
+
+  .mp-row-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .mp-row-title {
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: #000;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mp-row-sub { font-size: 0.7rem; color: #8a8a8a; }
+  .mp-row-desc {
+    font-size: 0.72rem;
+    line-height: 1.4;
+    color: #6a6a6a;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    margin-top: 2px;
+  }
+
+  .mp-row-right {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 5px;
+  }
+  /* Tabular figures so prices form a column you can compare down, which is
+     the single cheapest thing that makes a list of prices look priced. */
+  .mp-price {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: #000;
+    font-variant-numeric: tabular-nums;
+  }
+  .mp-type {
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    padding: 2px 6px;
+    border-radius: 999px;
+    color: var(--badge-color);
+    border: 1px solid var(--badge-color);
+    white-space: nowrap;
+  }
+
+  .mp-row-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 0 14px 11px;
+  }
+  .mp-owned {
+    margin-right: auto;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #4a7a4a;
+  }
+  .mp-btn {
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 7px 14px;
+    border-radius: 9px;
+    border: 1px solid transparent;
+    cursor: pointer;
+  }
+  .mp-btn:disabled { opacity: 0.5; cursor: default; }
+  .mp-btn-buy { background: var(--yellow); color: #000; }
+  .mp-btn-ghost { background: #fff; border-color: #d7d7d7; color: #6a6a6a; }
+
   .marketplace-root {
     position: absolute;
     inset: 0;

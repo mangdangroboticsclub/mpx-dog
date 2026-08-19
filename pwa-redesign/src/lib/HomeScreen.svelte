@@ -91,7 +91,6 @@
   let showStudio = $state(false);
   let showWiFi = $state(false);
   let showAPConfig = $state(false);
-  let showMarketplace = $state(false);
   let adjustDraggingId = $state(null);
   let adjustDragBarEl = $state(null);
 
@@ -231,10 +230,18 @@
   // skill pushed with `mpx-cli deploy` ended up looking like a stray blob.
   // It is now the Skills screen; the file browser lives inside it as a
   // segment, so nothing was lost.
+  /* The store is a destination, not a setting.
+   *
+   * It used to be a row inside Settings — three taps deep, next to Wi-Fi and
+   * calibration, which is where you put a configuration screen and not where
+   * anyone looks to browse. Somewhere you go to spend money belongs in the
+   * navigation. Placed after Skills because the pair reads in the order you
+   * use them: find something, then run it. */
   const tabs = [
-    { id: "home",    label: "Home",     icon: "home" },
-    { id: "skills",  label: "Skills",   icon: "skills" },
-    { id: "chat",    label: "Chat",    icon: "chat" },
+    { id: "home",     label: "Home",     icon: "home" },
+    { id: "skills",   label: "Skills",   icon: "skills" },
+    { id: "store",    label: "Store",    icon: "store" },
+    { id: "chat",     label: "Chat",     icon: "chat" },
     { id: "settings", label: "Settings", icon: "settings" },
   ];
 
@@ -840,6 +847,8 @@
       {:else}
         <SkillsView onNavigate={(view) => { if (view === "upload") activeView = "upload"; }} />
       {/if}
+    {:else if activeTab === "store"}
+      <SkillsMarketplace onNavigate={() => (activeTab = "skills")} />
     {:else if activeTab === "chat"}
       <ChatView navigate={(to) => { if (to === "home") activeTab = "home"; }} />
     {:else if activeTab === "settings"}
@@ -851,8 +860,6 @@
         <Calibration onBack={() => showCalibration = false} />
       {:else if showStudio}
         <ServoStudio onBack={() => showStudio = false} />
-      {:else if showMarketplace}
-        <SkillsMarketplace onNavigate={() => showMarketplace = false} />
       {:else}
         <div class="settings-page" style="--yellow: {YELLOW}">
           <header class="settings-header" style="background: {YELLOW}">
@@ -926,22 +933,9 @@
                 <polyline points="9 18 15 12 9 6"/>
               </svg>
             </button>
-            <button class="settings-item" onclick={() => showMarketplace = true}>
-              <div class="settings-item-icon">
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/>
-                  <line x1="3" y1="6" x2="21" y2="6"/>
-                  <path d="M16 10a4 4 0 0 1-8 0"/>
-                </svg>
-              </div>
-              <div class="settings-item-content">
-                <span class="settings-item-label">Skill Store</span>
-                <span class="settings-item-desc">Browse and subscribe to skills</span>
-              </div>
-              <svg class="settings-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="9 18 15 12 9 6"/>
-              </svg>
-            </button>
+            <!-- The Skill Store row lived here. It is a bottom-nav tab now:
+                 two doors to one screen is how people end up unsure which one
+                 they are looking at. -->
             <!-- "Skill Management" used to live here. It listed only
                  marketplace skills, while skills pushed from mpx-cli were
                  invisible to it — two half-lists on two screens. Both are now
@@ -982,6 +976,15 @@
             <!-- Lightning bolt — a skill is something that runs, not a folder -->
             <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
               <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+            </svg>
+          {:else if tab.id === "store"}
+            <!-- Shopfront awning. A bag or a cart would read as a checkout;
+                 this reads as a place you browse. -->
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 9l1.5-5h15L21 9"/>
+              <path d="M4 9v10a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V9"/>
+              <path d="M3 9h18"/>
+              <path d="M9 20v-6h6v6"/>
             </svg>
           {:else if tab.id === "chat"}
             <!-- Chat bubble -->
@@ -1850,6 +1853,13 @@
     font-size: 0.65rem;
     font-weight: 600;
     letter-spacing: 0.02em;
+    /* Five tabs instead of four: on a 320px phone each gets about 64px and
+       "Settings" is the longest label. Clip rather than wrap, so one long
+       word cannot make the whole bar taller than its neighbours. */
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* ════════════════════════════════════════

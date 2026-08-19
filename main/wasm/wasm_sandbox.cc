@@ -4,9 +4,13 @@
 #include "wasm/wasm_decrypt.h"
 
 // Forward-declared rather than including sdk/wasm_host_functions.h: that
-// header carries the NativeSymbol table itself, and this file needs one
-// function from it.
-namespace sdk { void control_reset(); }
+// header carries the NativeSymbol table itself, and this file needs a few
+// functions from it.
+namespace sdk {
+void control_reset();
+int  restore_skill_gains();   // put back gains the skill changed
+void forget_skill_gains();    // drop the record without writing
+}
 
 #include <atomic>
 #include <cinttypes>
@@ -316,6 +320,7 @@ static void *wasm_load_run_thread(void *arg)
 	// mpx_control_take() sees exactly the v2 write behaviour, and the clock
 	// starts here so mpx_millis() is 0 on the first instruction of on_start().
 	sdk::control_reset();
+	sdk::forget_skill_gains();   /* no record survives from the previous run */
 	s_tick_period_ms = 0;
 	s_tick_stop      = false;
 	s_hard_killed    = false;
@@ -382,6 +387,33 @@ static void *wasm_load_run_thread(void *arg)
 		}
 	}
 	wasm::set_params(nullptr);   // parameters never leak into the next run
+
+	// Put back any gains the skill changed, to whatever they were before it
+	// ran. Gains live on the driver boards, so they outlive the module: a skill
+	// that leaves Kp at 95 makes every built-in gait afterwards walk slightly
+	// wrong, with nothing on screen to explain it. Same class of leak as the
+	// overlay below, and it needs the same treatment.
+	//
+	// BEFORE the bus is released, and that ordering is load-bearing: a config
+	// write is a request/reply PAIR, and gait traffic in between loses the
+	// reply. Restoring after the gait resumes would fail on most of the writes.
+	//
+	// To keep a tuning deliberately, mpx_gain_save() burns it to the board's
+	// own flash, which this does not touch.
+	if (robot::servo_owned_by_skill()) {
+		sdk::restore_skill_gains();
+	} else {
+		// The skill released the bus itself, so take it back for the moment the
+		// restore needs. If Servo Studio has claimed it meanwhile, servo_lock()
+		// refuses and we leave the gains alone rather than fighting a human.
+		if (robot::servo_lock()) {
+			sdk::restore_skill_gains();
+		} else {
+			ESP_LOGW(TAG, "could not retake the bus to restore gains — they "
+						  "stay as the skill left them");
+			sdk::forget_skill_gains();
+		}
+	}
 
 	// A skill that took the servo bus must not keep it. This runs whether the
 	// skill returned cleanly, trapped, or was killed by the watchdog — otherwise

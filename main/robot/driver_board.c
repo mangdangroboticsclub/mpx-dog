@@ -17,6 +17,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"   /* esp_rom_delay_us */
+#include "esp_timer.h"     /* esp_timer_get_time — config-op pacing */
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -341,16 +342,115 @@ static bool cfg_xfer(uint8_t board, uint16_t op, uint16_t servo_index,
 #define CFG_REPLY_TRIES     6
 #define CFG_REPLY_GAP_US  600
 
+/* ── Minimum spacing between config operations on one board ─────────────────
+ *
+ * The AT32 needs a breath between config exchanges. Fire them back to back
+ * and it simply stops answering: the reply poll runs out of tries and every
+ * write in the burst fails with "board never sent a config reply", one after
+ * another, for boards 0, 2 and 3 while whichever board happened to catch the
+ * timing right sails through.
+ *
+ * This was already known, in the wrong place. studio_setall_handler() sleeps
+ * between servos with the comment "give the AT32 time between writes", which
+ * fixed Servo Studio and left the constraint undocumented everywhere else.
+ * So mpx_gains_all() and mpx_current_all() — twelve joints, two parameters
+ * each, in a tight loop with no HTTP round trip to slow them down — walked
+ * straight into it.
+ *
+ * A timing requirement of the hardware belongs next to the hardware, not
+ * duplicated into every caller that happens to discover it. Enforced here,
+ * per board, so a burst across different boards still interleaves at full
+ * speed and only consecutive ops on the SAME board wait.
+ */
+#define CFG_MIN_GAP_US   2000
+#define CFG_BOARDS          4    /* four AT32 driver boards, three servos each */
+
+static int64_t s_cfg_last_us[CFG_BOARDS];
+
+/* ── A board that is not there should cost one attempt, not every attempt ────
+ *
+ * A config request to an absent board is not free: it sends, then polls six
+ * times at 600 us before concluding nobody is home, and writes a warning. On
+ * a bench robot with one board plugged in, a single "set this gain on all
+ * twelve joints" sweep pays that 45 times over — about 900 ms of dead bus
+ * time and 90 log lines, per sweep, for boards whose absence was established
+ * on the first one.
+ *
+ * So establish it once. After three consecutive failures a board is muted:
+ * further requests fail immediately, silently, with no retries. Any success
+ * un-mutes it. A muted board is re-probed every 5 s, which is what makes this
+ * self-healing rather than sticky — plug a board in and it comes back on its
+ * own, and a board that drops out mid-session stops costing a second of every
+ * sweep within three requests.
+ *
+ * Deliberately NOT a configured list of "which boards exist". A robot should
+ * not need to be told what it is plugged into, and a setting like that is
+ * wrong exactly when it matters most: when something has come loose.
+ */
+#define CFG_FAILS_TO_MUTE      3
+#define CFG_REPROBE_US   5000000   /* 5 s */
+
+static uint8_t s_cfg_fails[CFG_BOARDS];
+static bool    s_cfg_muted[CFG_BOARDS];
+static int64_t s_cfg_probe_us[CFG_BOARDS];
+
+/* Called on every completed config exchange. */
+static void cfg_note_result(uint8_t board, bool ok)
+{
+    if (board >= CFG_BOARDS) return;
+
+    if (ok) {
+        if (s_cfg_muted[board]) {
+            ESP_LOGI(TAG, "board %u is answering again", (unsigned)board);
+        }
+        s_cfg_muted[board] = false;
+        s_cfg_fails[board] = 0;
+        return;
+    }
+
+    if (s_cfg_fails[board] < 255) s_cfg_fails[board]++;
+    if (!s_cfg_muted[board] && s_cfg_fails[board] >= CFG_FAILS_TO_MUTE) {
+        s_cfg_muted[board]   = true;
+        s_cfg_probe_us[board] = esp_timer_get_time();
+        ESP_LOGW(TAG, "board %u not responding after %d config requests — "
+                      "skipping it until it answers (re-probed every %d s)",
+                 (unsigned)board, CFG_FAILS_TO_MUTE, CFG_REPROBE_US / 1000000);
+    }
+}
+
 static bool cfg_request(uint8_t board, uint16_t op, uint16_t servo_index,
                         uint16_t param_id, float value, float *out)
 {
+    /* Muted: fail now rather than spending 3.6 ms discovering the same thing
+       again. One request every CFG_REPROBE_US is let through to check. */
+    if (board < CFG_BOARDS && s_cfg_muted[board]) {
+        const int64_t now = esp_timer_get_time();
+        if (now - s_cfg_probe_us[board] < CFG_REPROBE_US) return false;
+        s_cfg_probe_us[board] = now;   /* this attempt is the probe */
+    }
+
+    if (board < CFG_BOARDS) {
+        const int64_t since = esp_timer_get_time() - s_cfg_last_us[board];
+        if (since >= 0 && since < CFG_MIN_GAP_US) {
+            esp_rom_delay_us((uint32_t)(CFG_MIN_GAP_US - since));
+        }
+    }
+
     SMS_host_t rx;
-    if (!cfg_xfer(board, op, servo_index, param_id, value, NULL)) return false;
+    if (!cfg_xfer(board, op, servo_index, param_id, value, NULL)) {
+        if (board < CFG_BOARDS) s_cfg_last_us[board] = esp_timer_get_time();
+        cfg_note_result(board, false);
+        return false;
+    }
 
     bool saw_frame = false;
     for (int attempt = 0; attempt < CFG_REPLY_TRIES; attempt++) {
         esp_rom_delay_us(CFG_REPLY_GAP_US);      /* let the AT32 IRQ run */
-        if (!cfg_xfer(board, CFG_OP_NOP, 0, 0, 0, &rx)) return false;
+        if (!cfg_xfer(board, CFG_OP_NOP, 0, 0, 0, &rx)) {
+            if (board < CFG_BOARDS) s_cfg_last_us[board] = esp_timer_get_time();
+            cfg_note_result(board, false);
+            return false;
+        }
 
         if (rx.status != START_CONFIG) continue; /* not a config reply yet */
         saw_frame = true;
@@ -359,16 +459,28 @@ static bool cfg_request(uint8_t board, uint16_t op, uint16_t servo_index,
         /* the AT32 packs the float across reserved1+reserved2 (res1/res2
          * here, adjacent in a packed struct), little endian */
         if (out) memcpy(out, &rx.s1.res1, sizeof(float));
+        if (board < CFG_BOARDS) s_cfg_last_us[board] = esp_timer_get_time();
+        cfg_note_result(board, true);
         return true;
     }
 
+    if (board < CFG_BOARDS) s_cfg_last_us[board] = esp_timer_get_time();
+
     /* Name which failure it was. They need different fixes, and one message
-     * covering both is why this took several attempts to find. */
-    ESP_LOGW(TAG, "cfg op %u param %u board %u: %s after %d tries",
-             (unsigned)op, (unsigned)param_id, (unsigned)board,
-             saw_frame ? "reply never echoed the parameter"
-                       : "board never sent a config reply",
-             CFG_REPLY_TRIES);
+     * covering both is why this took several attempts to find.
+     *
+     * Only while the board is still believed to be there: once muted, the
+     * summary above has said it, and repeating it per parameter per joint
+     * buries everything else in the log. */
+    const bool first_time = (board >= CFG_BOARDS) || !s_cfg_muted[board];
+    cfg_note_result(board, false);
+    if (first_time) {
+        ESP_LOGW(TAG, "cfg op %u param %u board %u: %s after %d tries",
+                 (unsigned)op, (unsigned)param_id, (unsigned)board,
+                 saw_frame ? "reply never echoed the parameter"
+                           : "board never sent a config reply",
+                 CFG_REPLY_TRIES);
+    }
     return false;
 }
 

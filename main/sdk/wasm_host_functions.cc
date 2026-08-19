@@ -627,6 +627,95 @@ static inline bool param_is_read_only(int32_t param)
 		|| param == DB_PARAM_REVERSE_POSITION_SENSOR;
 }
 
+/* ── Undoing what a skill did to the gains ──────────────────────────────────
+ *
+ * Gains live on the AT32 driver boards, not in the module, so they survive the
+ * skill that wrote them — the bus lock being released, the skill returning,
+ * even the skill crashing. That is deliberate and useful: it is how a skill
+ * tunes the motors and then lets the firmware's own gait walk with that
+ * tuning. It is also a trap, and the same trap the sandbox already closes
+ * twice over: an overlay outliving its skill silently biases every later
+ * movement, so the sandbox clears it; a held bus lock leaves the gait parked,
+ * so the sandbox force-releases it. A skill that leaves Kp at 95 makes every
+ * built-in gait afterwards walk slightly wrong with nothing on screen to
+ * explain why. Same shape of bug, and it was the one left standing.
+ *
+ * So: remember the value that was there BEFORE the skill's first write to each
+ * slot, and put it back on the way out. Not "restore stock" — restore what was
+ * actually there, which may be a tuning a human set from Servo Studio and has
+ * every reason to expect to still be theirs afterwards.
+ *
+ * TO KEEP A TUNING ON PURPOSE, there is already a way: mpx_gain_save() burns
+ * it into the driver board's own flash, which is what "permanent" means here.
+ * Restoring the RAM value afterwards does not touch that, and a reboot brings
+ * the saved values back. So this needs no opt-out flag — the escape hatch is
+ * the one that was always the right tool for the job.
+ *
+ * Cost: one extra config read the first time a skill touches a given slot,
+ * paid once, not per write. 12 x DB_PARAM_COUNT of bookkeeping, under a
+ * kilobyte, in BSS.
+ */
+static float s_gain_before[12][DB_PARAM_COUNT];
+static bool  s_gain_saved [12][DB_PARAM_COUNT];
+/* Counted, not narrated. One line per unreadable slot meant 45 warnings for a
+ * bench robot with one board plugged in — enough to bury the run's actual
+ * result. The fact is worth reporting once, with a number. */
+static int   s_gain_unreadable;
+
+static void remember_gain(int id, int param)
+{
+	const int i = id - 1;
+	if (i < 0 || i >= 12 || param < 0 || param >= DB_PARAM_COUNT) return;
+	if (s_gain_saved[i][param]) return;          /* first write only */
+
+	float before = 0.0f;
+	if (!driver_board_get_param(id, param, &before)) {
+		/* Could not read it, so we must not pretend we can restore it. Leaving
+		 * `saved` false means the value is left alone at the end rather than
+		 * being overwritten with a guess. Tallied and reported once by
+		 * restore_skill_gains(); at DEBUG if you want the individual slots. */
+		s_gain_unreadable++;
+		ESP_LOGD(TAG, "could not read servo %d param %d before writing; it "
+					  "will not be restored", id, param);
+		return;
+	}
+	s_gain_before[i][param] = before;
+	s_gain_saved [i][param] = true;
+}
+
+void forget_skill_gains()
+{
+	std::memset(s_gain_saved, 0, sizeof(s_gain_saved));
+	s_gain_unreadable = 0;
+}
+
+int restore_skill_gains()
+{
+	int restored = 0, failed = 0;
+	for (int i = 0; i < 12; ++i) {
+		for (int p = 0; p < DB_PARAM_COUNT; ++p) {
+			if (!s_gain_saved[i][p]) continue;
+			if (driver_board_set_param(i + 1, p, s_gain_before[i][p])) restored++;
+			else                                                      failed++;
+			s_gain_saved[i][p] = false;
+		}
+	}
+	if (restored || failed || s_gain_unreadable) {
+		ESP_LOGI(TAG, "restored %d gain(s) the skill changed%s%s",
+				 restored,
+				 failed ? " (some failed)" : "",
+				 s_gain_unreadable ? " — and some could not be read beforehand,"
+									 " so they were left alone" : "");
+		if (s_gain_unreadable) {
+			ESP_LOGI(TAG, "  %d slot(s) unreadable — a board that is not "
+						  "answering; enable DEBUG on this tag to list them",
+					 s_gain_unreadable);
+		}
+	}
+	s_gain_unreadable = 0;
+	return restored;
+}
+
 int32_t host_servo_set_gain(wasm_exec_env_t exec_env,
 							int32_t id, int32_t param, float value)
 {
@@ -641,6 +730,7 @@ int32_t host_servo_set_gain(wasm_exec_env_t exec_env,
 		ESP_LOGW(TAG, "servo_set_gain: bus not locked — call servo_lock() first");
 		return -2;
 	}
+	remember_gain(id, param);   /* so the sandbox can put it back afterwards */
 	if (!driver_board_set_param(id, param, value)) return -3;
 	ESP_LOGD(TAG, "servo_set_gain: id=%" PRId32 " p=%" PRId32 " v=%.4f", id, param, value);
 	return 0;

@@ -544,4 +544,22 @@ static NativeSymbol NATIVE_SYMBOLS[] = {
 static constexpr uint32_t NUM_NATIVE_SYMBOLS =
 	sizeof(NATIVE_SYMBOLS) / sizeof(NATIVE_SYMBOLS[0]);
 
+/**
+ * @brief Put back every gain a skill changed, to the value it had before.
+ *
+ * Called by the sandbox when a skill ends — cleanly, trapped or killed — in
+ * the same teardown that force-releases the bus and clears the overlay, and
+ * for the same reason: state a skill leaves on the hardware outlives it and
+ * silently changes how everything afterwards behaves.
+ *
+ * MUST be called while the skill still holds the bus. A config write is a
+ * request/reply pair and gait traffic in between loses the reply.
+ *
+ * @return how many slots were restored.
+ */
+int restore_skill_gains();
+
+/** Drop the record without writing anything — call before a run starts. */
+void forget_skill_gains();
+
 }  // namespace sdk
