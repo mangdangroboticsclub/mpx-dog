@@ -413,6 +413,10 @@ int32_t host_mpx_control_owner(wasm_exec_env_t exec_env);
 /** True when `domain` may write right now. Used by the v2 write paths. */
 bool control_allows(int32_t domain);
 
+/* True when a skill has claimed feet or joints, so the gait task must leave
+ * the goal buffer alone. Called from robot.cc's idle branch. */
+bool control_owner_is_pose();
+
 /** Reset arbitration to MPX_CTRL_NONE. Called by the sandbox per skill run. */
 void control_reset();
 

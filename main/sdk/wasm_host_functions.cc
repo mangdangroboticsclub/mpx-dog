@@ -947,6 +947,19 @@ bool control_allows(int32_t domain)
 	return s_control_owner == MPX_CTRL_NONE || s_control_owner == domain;
 }
 
+// Does a skill currently own the twelve goal positions?
+//
+// The gait task's idle branch asks this before rewriting them with the neutral
+// stand. Until this existed, a control claim was checked ONLY inside host
+// functions -- so it could refuse the skill's own calls from another layer and
+// nothing else. Only one skill runs at a time, so it protected you from
+// yourself and from no one, while the goal buffer was still overwritten
+// underneath the skill that had claimed it.
+bool control_owner_is_pose()
+{
+	return s_control_owner == MPX_CTRL_FEET || s_control_owner == MPX_CTRL_JOINTS;
+}
+
 int32_t host_mpx_control_take(wasm_exec_env_t exec_env, int32_t domain)
 {
 	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
@@ -1047,6 +1060,18 @@ int32_t host_mpx_get_walk_speed(wasm_exec_env_t exec_env)
 // One call instead of four differently-named ones, so a leg index can be a
 // loop variable. Same maths as robot_ik_*; this is purely about the shape of
 // the call site.
+//
+// Z CONVENTION, SO NOBODY HAS TO GUESS AGAIN: `z` arriving here is the
+// FIRMWARE's — distance DOWN from the hip, POSITIVE, standing at +70, the same
+// number robot::calculate_ik() and the idle loop's front_right_ik(0,0,
+// s_cfg.height) use. The C SDK declares z as UP-positive and negates it inside
+// mpx_foot_to() before the call; do not negate again here.
+//
+// It was not always converted. A skill asking for the standing height as -70
+// resolved to servo2 = servo3 = -180 (atan2(x, zd) flips by pi once zd goes
+// negative), clamped at the joint limit, and moved the legs somewhere nobody
+// asked for -- silently, with no error and no warning. If this ever needs
+// changing, change it in ONE of the two places, never both.
 
 int32_t host_mpx_foot(wasm_exec_env_t exec_env, int32_t leg, float x, float th0, float z)
 {

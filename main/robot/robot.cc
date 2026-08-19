@@ -24,6 +24,13 @@ extern "C" {
 
 static const char *TAG = "robot";
 
+// Does a running skill own the twelve goal positions? Defined in
+// wasm_host_functions.cc, inside the GLOBAL namespace sdk. Declared out here
+// on purpose: written inside `namespace robot`, this would have declared
+// robot::sdk::control_owner_is_pose() -- a different function that nobody
+// defines, and the link fails.
+namespace sdk { bool control_owner_is_pose(); }
+
 namespace robot {
 namespace {
 
@@ -153,6 +160,13 @@ static void ik_neutral_init()
 // ── Inverse kinematics (shared math) ─────────────────────────
 // Given x (forward), th0 (hip angle deg), z (height),
 // compute shoulder (th1) and knee (th2) angles and write all 3 servos.
+//
+// z IS DISTANCE DOWN FROM THE HIP AND MUST BE POSITIVE. Standing is z = +70
+// (NEUTRAL_Z), which is what the idle loop passes. Hand it a negative z and it
+// does not fail: ld = sqrt(x*x + zd*zd) stays positive, but phi = atan2(x, zd)
+// swings by pi, so the leg is commanded ~180 degrees away and then clamps at
+// the joint limit. The C SDK uses the opposite sign (z up-positive) and
+// converts in mpx_foot_to(); see the note on host_mpx_foot().
 static void calculate_ik(float x, float th0_deg, float z,
                           float &th1_deg, float &th2_deg)
 {
@@ -1009,10 +1023,26 @@ void gait_task()
 
         // ── Idle (no command) ────────────────────────────────────
         if (cmd == GaitCmd::None) {
-            front_right_ik(0, 0, static_cast<float>(s_cfg.height));
-            rear_right_ik(0, 0, static_cast<float>(s_cfg.height));
-            front_left_ik(0, 0, static_cast<float>(s_cfg.height));
-            rear_left_ik(0, 0, static_cast<float>(s_cfg.height));
+            // A skill that CLAIMED feet or joints owns the goal buffer, and
+            // this branch must not touch it.
+            //
+            // Without this guard the idle rewrite below overwrote all twelve
+            // targets with the neutral stand every ~15 ms while a skill ran.
+            // It skips the flush, so the last frame the skill SENT still held
+            // -- but the buffer underneath it did not. A skill that set two
+            // joints, sent, then later sent again without re-setting them
+            // watched the first two snap back to neutral, because by then the
+            // idle branch had rewritten them. "Stage a frame, then send it"
+            // only worked inside a 15 ms window, and nothing said so.
+            //
+            // mpx_take(MPX_CTRL_FEET) / mpx_take(MPX_OWN_JOINTS) now means
+            // what it reads like: the goal buffer is yours until you release.
+            if (!::sdk::control_owner_is_pose()) {
+                front_right_ik(0, 0, static_cast<float>(s_cfg.height));
+                rear_right_ik(0, 0, static_cast<float>(s_cfg.height));
+                front_left_ik(0, 0, static_cast<float>(s_cfg.height));
+                rear_left_ik(0, 0, static_cast<float>(s_cfg.height));
+            }
             // When a WASM skill is running, skip the flush so the
             // skill's own servo commands (sent via robot_flush from
             // host functions) are not immediately overwritten with
