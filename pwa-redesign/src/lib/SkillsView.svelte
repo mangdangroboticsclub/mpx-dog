@@ -21,7 +21,11 @@
    * quietly: no uplink simply means that section is not rendered. A skill you
    * uploaded yourself must never be hidden because the internet is down.
    */
-  import { colors, skillTypeColor, skillTypeLabel } from "./colors.js";
+  import {
+    colors, skillTypeColor, skillTypeLabel, skillTypeBlurb,
+    capabilityLabel, capabilityIsSensitive,
+  } from "./colors.js";
+  import StoreView from "./StoreView.svelte";
   import FileViewer from "./FileViewer.svelte";
   import {
     listRobotSkills,
@@ -64,12 +68,13 @@
    * Every tab carries one line saying what it holds, so nobody has to learn
    * the rule from watching where things land.
    */
-  let segment = $state("skills");   // "skills" | "store" | "files"
+  let segment = $state("skills");   // "skills" | "store" | "library" | "files"
 
   const TAB_BLURB = {
-    skills: "Everything installed on this robot. Tap Run to try one.",
-    store:  "Skills you own. Download one to put it on the robot.",
-    files:  "The robot's raw storage. You rarely need this.",
+    skills:  "Everything installed on this robot. Tap Run to try one.",
+    store:   "Browse the marketplace and install new skills.",
+    library: "Skills you own. AI and Web skills run in the cloud; Motion skills download to the robot.",
+    files:   "The robot's raw storage. You rarely need this.",
   };
 
   // ── Local (on-robot) skills ─────────────────────────────────
@@ -81,6 +86,16 @@
 
   // ── Marketplace skills ──────────────────────────────────────
   let mktSkills = $state(cache.mkt ?? []);
+
+  /**
+   * Store filter: "all" | "capability" | "awa" | "wasm".
+   *
+   * Added because the list is now long enough that finding your own skill
+   * meant scrolling past a dozen others. Filtering by what a skill DOES is
+   * the only sort an owner can reason about -- they do not know or care that
+   * "AWA" means Playwright.
+   */
+  let typeFilter = $state("all");
   let mktAvailable = $state(false);
   let mktLoading = $state(false);
   let actionInFlight = $state(null);
@@ -484,6 +499,73 @@
   let localCount = $derived(wasmSkills.length + luaSkills.length);
   let storeCount = $derived(mktSkills.length);
 
+  /** Normalised type for a skill, lowercased, with a safe fallback. */
+  function typeOf(skill) {
+    return (skill?.skill_type || "").toLowerCase() || "awa";
+  }
+
+  /** How many of each type the owner has, for the filter chips. */
+  let typeCounts = $derived.by(() => {
+    const counts = { all: mktSkills.length, capability: 0, awa: 0, wasm: 0 };
+    for (const s2 of mktSkills) {
+      const t = typeOf(s2);
+      if (counts[t] !== undefined) counts[t]++;
+    }
+    return counts;
+  });
+
+  /** Display order and headings. AI first: newest, and what people look for. */
+  const TYPE_ORDER = ["capability", "awa", "wasm"];
+
+  /**
+   * The store list as GROUPS, not one flat list.
+   *
+   * Sorting alone was not enough — with ten skills and no visual break, a
+   * sorted list looks identical to an unsorted one and you still scroll
+   * hunting for your own skill. Headings make the structure visible, which
+   * was the whole point of sorting in the first place.
+   *
+   * When a single type is filtered the heading is redundant, so the group
+   * renders without one.
+   */
+  let mktGroups = $derived.by(() => {
+    const groups = [];
+    for (const type of TYPE_ORDER) {
+      if (typeFilter !== "all" && typeFilter !== type) continue;
+      const items = mktSkills
+        .filter((s2) => typeOf(s2) === type)
+        .slice()
+        .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+      if (items.length) groups.push({ type, items });
+    }
+    return groups;
+  });
+
+  /** Total shown, for the empty state. */
+  let visibleCount = $derived(mktGroups.reduce((n, g) => n + g.items.length, 0));
+
+  /** Capabilities a skill declared, or [] for legacy skills that declared none. */
+  function requiresOf(skill) {
+    const raw = Array.isArray(skill?.requires) ? skill.requires : [];
+    // "sense:activity" and "sense:orientation" are one permission to an owner.
+    return [...new Set(raw.map((r) => String(r).split(":")[0]))];
+  }
+
+  /** True when the robot cannot provide something this skill needs. */
+  function isBlocked(skill) {
+    return Array.isArray(skill?.missing_capabilities) && skill.missing_capabilities.length > 0;
+  }
+
+  /**
+   * Cloud-run skills are enabled with a toggle; on-robot skills are
+   * downloaded. Capability and AWA skills both execute in the worker, so
+   * neither has a file to push to the robot.
+   */
+  function isCloudSkill(skill) {
+    const t = typeOf(skill);
+    return t === "capability" || t === "awa";
+  }
+
   /* The install record for a file, if the robot has one. This is what turns
      "gaits.mpxe" into "01 · Layer 1" and puts a Store badge on it — and it is
      exactly what was missing, because nothing wrote installed.json for a
@@ -525,7 +607,14 @@
         role="tab" aria-selected={segment === "store"}
         onclick={() => (segment = "store")}
       >
-        Store{#if storeCount}<span class="sv-seg-count">{storeCount}</span>{/if}
+        Store
+      </button>
+      <button
+        class="sv-seg" class:sv-seg-on={segment === "library"}
+        role="tab" aria-selected={segment === "library"}
+        onclick={() => (segment = "library")}
+      >
+        Library{#if storeCount}<span class="sv-seg-count">{storeCount}</span>{/if}
       </button>
       <button
         class="sv-seg" class:sv-seg-on={segment === "files"}
@@ -701,6 +790,13 @@
     </button>
 
   {:else if segment === "store"}
+    <!-- The storefront replaces the old owned-skills list here. Owning and
+         browsing are different questions: "what can I get" needs the whole
+         catalogue, "what do I have" needs toggles. The owned list now lives
+         under the Library segment below. -->
+    <StoreView />
+
+  {:else if segment === "library"}
     <!-- ═══ Store ═══════════════════════════════════════════════
          What you OWN, which is a different question from what is on the
          robot. A skill is listed here the moment you subscribe; the button
@@ -731,11 +827,50 @@
           </p>
         </div>
       {:else}
+        <!-- Filter by what a skill DOES. Owners cannot reason about "AWA"
+             vs "CAPABILITY", but they can reason about AI / Web / Motion. -->
+        <div class="sv-filters" role="tablist" aria-label="Filter skills by type">
+          {#each [["all", "All"], ["capability", "AI"], ["awa", "Web"], ["wasm", "Motion"]] as [key, label]}
+            {#if key === "all" || typeCounts[key] > 0}
+              <button
+                class="sv-filter"
+                class:sv-filter-on={typeFilter === key}
+                style="--badge: {key === 'all' ? '#6f6f6f' : skillTypeColor(key)}"
+                role="tab"
+                aria-selected={typeFilter === key}
+                onclick={() => (typeFilter = key)}
+              >
+                {#if key !== "all"}<span class="sv-filter-dot"></span>{/if}
+                {label}
+                <span class="sv-filter-count">{typeCounts[key]}</span>
+              </button>
+            {/if}
+          {/each}
+        </div>
+
+        {#if typeFilter !== "all" && skillTypeBlurb(typeFilter)}
+          <p class="sv-filter-blurb">{skillTypeBlurb(typeFilter)}</p>
+        {/if}
+
+        {#if visibleCount === 0}
+          <p class="sv-mkt-wait">No {skillTypeLabel(typeFilter)} skills yet.</p>
+        {/if}
+
+        {#each mktGroups as group (group.type)}
         <section class="sv-section">
-          <h3 class="sv-section-title">Your skills</h3>
+          <!-- A coloured rule keyed to the type, so the eye can find the
+               section without reading the words. -->
+          <div class="sv-group-head" style="--badge: {skillTypeColor(group.type)}">
+            <span class="sv-group-bar"></span>
+            <h3 class="sv-section-title sv-group-title">
+              {skillTypeLabel(group.type)} skills
+            </h3>
+            <span class="sv-group-count">{group.items.length}</span>
+          </div>
+
           <div class="sv-list">
-            {#each mktSkills as skill (skill.skill_id)}
-              <article class="sv-card">
+            {#each group.items as skill (skill.skill_id)}
+              <article class="sv-card" class:sv-card-blocked={isBlocked(skill)}>
                 <div class="sv-card-top">
                   <div class="sv-avatar" style="--badge: {skillTypeColor(skill.skill_type)}">
                     {(skill.title || "?").charAt(0).toUpperCase()}
@@ -749,10 +884,36 @@
                     </div>
                     <span class="sv-card-meta">
                       v{skill.current_version || "1.0"} ·
-                      {isDeployed(skill) ? "on this robot" : "not downloaded yet"}
+                      {#if isCloudSkill(skill)}
+                        {skill.enabled ? "on" : "off"}
+                      {:else}
+                        {isDeployed(skill) ? "on this robot" : "not downloaded yet"}
+                      {/if}
                     </span>
                   </div>
                 </div>
+
+                <!-- What this skill is allowed to touch.
+                     An owner enabling a stranger's skill deserves to see that
+                     it can move their robot before they flip the switch, not
+                     after. Legacy skills declare nothing, so nothing shows. -->
+                {#if requiresOf(skill).length}
+                  <div class="sv-perms">
+                    {#each requiresOf(skill) as cap}
+                      <span class="sv-perm" class:sv-perm-warn={capabilityIsSensitive(cap)}>
+                        {capabilityLabel(cap)}
+                      </span>
+                    {/each}
+                  </div>
+                {/if}
+
+                {#if isBlocked(skill)}
+                  <p class="sv-blocked-note">
+                    Needs {skill.missing_capabilities.map(capabilityLabel).join(", ").toLowerCase()} —
+                    this robot does not have that yet.
+                  </p>
+                {/if}
+
                 <div class="sv-card-actions">
                   {#if isWasmSkill(skill)}
                     {#if isDeployed(skill)}
@@ -773,11 +934,15 @@
                       </button>
                     {/if}
                   {:else}
-                    <label class="sv-toggle" class:sv-toggle-busy={actionInFlight === skill.skill_id}>
+                    <label
+                      class="sv-toggle"
+                      class:sv-toggle-busy={actionInFlight === skill.skill_id}
+                      class:sv-toggle-blocked={isBlocked(skill)}
+                    >
                       <input
                         type="checkbox"
-                        checked={skill.enabled}
-                        disabled={actionInFlight === skill.skill_id}
+                        checked={skill.enabled && !isBlocked(skill)}
+                        disabled={actionInFlight === skill.skill_id || isBlocked(skill)}
                         onchange={() => handleToggle(skill.skill_id, !skill.enabled)}
                       />
                       <span class="sv-toggle-track"></span>
@@ -789,6 +954,7 @@
             {/each}
           </div>
         </section>
+        {/each}
       {/if}
 
       <div class="sv-spacer"></div>
@@ -925,6 +1091,144 @@
     background: transparent;
     border: 1px solid #c9c9c9;
     color: #6f6f6f;
+  }
+
+
+  /* ── Type filters ─────────────────────────────────────
+     A second row of tabs under the segment control. Visually lighter than
+     .sv-seg so the hierarchy stays readable: segment picks the screen, this
+     narrows what is on it. */
+  .sv-filters {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 2px 0 10px;
+  }
+  .sv-filters::-webkit-scrollbar { display: none; }
+
+  .sv-filter {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 11px;
+    border: 1.5px solid #dcdcdc;
+    border-radius: 999px;
+    background: #fff;
+    color: #6f6f6f;
+    font-size: 0.72rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .sv-filter:hover { border-color: #bcbcbc; }
+
+  .sv-filter-on {
+    /* Tinted with the type's own colour rather than a single accent, so the
+       active filter and the chips on the cards below are visibly the same
+       idea. */
+    border-color: var(--badge);
+    color: #2a2a2a;
+    background: color-mix(in srgb, var(--badge) 14%, #fff);
+  }
+
+  .sv-filter-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--badge);
+  }
+
+  .sv-filter-count {
+    font-size: 0.62rem;
+    font-weight: 800;
+    color: #9a9a9a;
+  }
+  .sv-filter-on .sv-filter-count { color: var(--badge); }
+
+  .sv-filter-blurb {
+    margin: -4px 2px 10px;
+    font-size: 0.7rem;
+    line-height: 1.4;
+    color: #8a8a8a;
+  }
+
+  /* ── Capability permissions ───────────────────────────
+     The phone-app permission list. Neutral pills for the harmless ones,
+     amber for anything that moves hardware, records, or costs money —
+     colour plus a border change, never colour alone. */
+  .sv-perms {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 9px;
+  }
+
+  .sv-perm {
+    padding: 3px 8px;
+    border-radius: 6px;
+    background: #f2f2f2;
+    border: 1px solid #e4e4e4;
+    color: #6f6f6f;
+    font-size: 0.63rem;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .sv-perm-warn {
+    background: #fff6e8;
+    border-color: #f0c99a;
+    color: #8a5a1c;
+  }
+
+  /* ── Blocked skills ───────────────────────────────────
+     Owned, but this robot lacks the hardware. Shown greyed rather than
+     hidden: "where did my skill go" is a worse experience than "here is
+     your skill and here is why it cannot run". */
+  .sv-card-blocked {
+    opacity: 0.72;
+    background: #fafafa;
+  }
+
+  .sv-blocked-note {
+    margin: 8px 0 0;
+    font-size: 0.67rem;
+    line-height: 1.4;
+    color: #a06a2c;
+  }
+
+  .sv-toggle-blocked {
+    opacity: 0.4;
+    pointer-events: none;
+  }
+
+
+  /* ── Group headings ───────────────────────────────────
+     Sorting alone was invisible with ten skills in one column. A coloured
+     rule keyed to the type lets the eye find a section without reading. */
+  .sv-group-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 2px 0 8px;
+  }
+
+  .sv-group-bar {
+    width: 3px;
+    height: 13px;
+    border-radius: 2px;
+    background: var(--badge);
+  }
+
+  .sv-group-title { margin: 0; }
+
+  .sv-group-count {
+    margin-left: auto;
+    font-size: 0.64rem;
+    font-weight: 800;
+    color: #a8a8a8;
   }
 
   /* ── Body ───────────────────────────────────────── */

@@ -21,12 +21,18 @@ export const colors = {
     action_blue: "#89B0DB"
   },
 
-  // ── Skill type colors (4 slots: AWA, WASM, + 2 future types) ──
+  // ── Skill type colors ────────────────────────────────────────
+  //
+  // One colour per kind of skill, so the list is scannable without reading
+  // any labels. Deliberately far apart in hue AND in lightness, so they stay
+  // distinguishable for the ~8% of men with red-green colour blindness —
+  // green and orange are the risky pair, which is why the chips carry text
+  // as well and colour is never the only signal.
   skillType: {
-    awa:  "#6AAE6C",   // green — AWA skills (Lua-based)
-    wasm: "#A476ED",   // purple — WASM skills
-    type3: "#F4A261",  // orange — reserved for future skill type
-    type4: "#89B0DB",  // blue — reserved for future skill type
+    capability: "#F4A261",  // orange — AI skills: sensors, movement, reasoning
+    awa:        "#6AAE6C",  // green  — Web skills: browse and shop on websites
+    wasm:       "#A476ED",  // purple — Motion skills: run on the robot itself
+    type4:      "#89B0DB",  // blue   — reserved
   },
 };
 
@@ -48,11 +54,63 @@ export function skillTypeColor(skillType) {
  */
 export function skillTypeLabel(skillType) {
   const key = (skillType || "").toLowerCase();
+  // "awa" used to be labelled "AISkill", which was wrong and became actively
+  // confusing once real AI skills existed: AWA drives a web browser and has no
+  // access to a sensor, a servo or a model. Labels now say what the skill
+  // actually does, in the words an owner would use.
   const labels = {
-    awa: "AISkill",
-    wasm: "MoveSkill",
-    type3: "TYPE3",
+    capability: "AI",
+    awa: "Web",
+    wasm: "Motion",
     type4: "TYPE4",
   };
   return labels[key] || skillType?.toUpperCase() || "?";
+}
+
+/**
+ * One line explaining what a skill type can do, for the owner rather than the
+ * developer. Shown under the filter tabs.
+ */
+export function skillTypeBlurb(skillType) {
+  const key = (skillType || "").toLowerCase();
+  const blurbs = {
+    capability: "Senses, thinks and moves — runs in the cloud, acts on the robot.",
+    awa: "Browses websites for you, like shopping and price checks.",
+    wasm: "Runs directly on the robot. Movement and gaits, no internet needed.",
+  };
+  return blurbs[key] || "";
+}
+
+/**
+ * Plain-English name for a capability a skill has asked for.
+ *
+ * The manifest says "sense:activity"; an owner deciding whether to trust a
+ * third-party skill needs "Read motion sensors". This is the phone-app
+ * permission prompt, and it is the only place most owners will ever see what
+ * a skill is actually allowed to touch.
+ */
+export function capabilityLabel(entry) {
+  const ns = String(entry || "").split(":")[0].toLowerCase();
+  const labels = {
+    sense: "Read motion sensors",
+    robot: "Move the robot",
+    vision: "Use the camera",
+    voice: "Listen and speak",
+    brain: "Use AI reasoning",
+    store: "Remember things",
+    web: "Browse websites",
+  };
+  return labels[ns] || ns;
+}
+
+/**
+ * Capabilities an owner should think twice about granting.
+ *
+ * Movement can hurt a bystander; camera and microphone are recording in
+ * someone's home; AI reasoning costs money. These get a warning treatment
+ * rather than being listed as flatly as "remember things".
+ */
+export function capabilityIsSensitive(entry) {
+  const ns = String(entry || "").split(":")[0].toLowerCase();
+  return ["robot", "vision", "voice", "brain"].includes(ns);
 }

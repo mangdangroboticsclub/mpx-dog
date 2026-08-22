@@ -2293,6 +2293,7 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
 
     const char *prefix_skills = "/v1/marketplace/skills";
     const char *prefix_robot  = "/v1/marketplace/robot/";
+    const char *prefix_mkt    = "/v1/marketplace/";
 
     if (std::strncmp(uri, prefix_robot, std::strlen(prefix_robot)) == 0) {
         // /v1/marketplace/robot/{action}[/...] → /v1/robots/{uuid}/{action}[/...]
@@ -2305,6 +2306,18 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
         // /v1/marketplace/skills[/...] → /v1/skills[/...]
         // Strip "/v1/marketplace/" (16 chars), prepend "/v1/"
         target_path = std::string("/v1/") + (uri + 16);
+    } else if (std::strncmp(uri, prefix_mkt, std::strlen(prefix_mkt)) == 0) {
+        // Everything else: /v1/marketplace/{rest} -> /v1/{rest}
+        //
+        // Without this, every new gateway endpoint needed a firmware change
+        // and a reflash before the app could reach it -- the two prefixes
+        // above were the entire vocabulary. A generic passthrough means the
+        // gateway can grow without touching the robot.
+        //
+        // It stays scoped to /v1/marketplace/ and the gateway host from
+        // Kconfig, so this is not an open relay: the app can only reach paths
+        // under /v1/ on the one host the robot already talks to.
+        target_path = std::string("/v1/") + (uri + std::strlen(prefix_mkt));
     } else {
         httpd_resp_set_status(req, "404 Not Found");
         httpd_resp_send(req, "unknown marketplace path", -1);

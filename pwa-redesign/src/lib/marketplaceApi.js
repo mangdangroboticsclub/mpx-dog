@@ -152,4 +152,64 @@ export async function removeSkill(skillId) {
   return res.json();
 }
 
+// ── Storefront ────────────────────────────────────────────────
+
+/**
+ * The whole Store screen in one request.
+ *
+ * GET /v1/marketplace/storefront  →  GET /v1/storefront
+ *
+ * Returns { featured, sections, counts, provides, ranking }. The gateway does
+ * the ranking so every client agrees on what "Featured" and "New" mean, and
+ * states its rule in `ranking` rather than leaving clients to guess.
+ *
+ * robotUuid matters: without it nothing knows what is already installed or
+ * what this robot's hardware can actually run.
+ */
+export async function getStorefront(robotUuid, type) {
+  const params = new URLSearchParams();
+  if (robotUuid) params.set("robot_uuid", robotUuid);
+  if (type && type !== "all") params.set("type", type);
+  const qs = params.toString();
+
+  const res = await fetch(`/v1/marketplace/storefront${qs ? "?" + qs : ""}`);
+  if (!res.ok) throw new Error(`Failed to load the store: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Everything needed to draw the install confirmation for one skill.
+ * GET /v1/marketplace/storefront/skills/{id}  →  GET /v1/storefront/skills/{id}
+ */
+export async function getStorefrontSkill(skillId, robotUuid) {
+  const qs = robotUuid ? `?robot_uuid=${encodeURIComponent(robotUuid)}` : "";
+  const res = await fetch(
+    `/v1/marketplace/storefront/skills/${encodeURIComponent(skillId)}${qs}`,
+  );
+  if (!res.ok) throw new Error(`Failed to load skill: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Install a skill: assign it to the robot, then switch it on.
+ *
+ * Two calls because the gateway keeps ownership and activation separate — you
+ * can own a skill and have it off. From the owner's side "Install" means both,
+ * so this does both rather than leaving a skill installed-but-inert with no
+ * explanation.
+ *
+ * If the enable half fails the skill IS still assigned, so this reports which
+ * half succeeded rather than a bare failure — the caller can tell the user to
+ * flip the toggle instead of trying to install again.
+ */
+export async function installSkill(skillId) {
+  await assignSkill(skillId);
+  try {
+    await toggleSkill(skillId, true);
+    return { assigned: true, enabled: true };
+  } catch (err) {
+    return { assigned: true, enabled: false, error: err.message };
+  }
+}
+
 export { getConfig };
