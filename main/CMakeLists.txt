@@ -91,6 +91,11 @@ idf_component_register(
         esp_event
         mbedtls
         json
+    # 802.1X. esp_eap_client.h lives in wpa_supplicant, not esp_wifi, and it is
+    # included only from network/wifi_sta.cc — no header of ours exposes it —
+    # so it is private rather than part of this component's interface.
+    PRIV_REQUIRES
+        wpa_supplicant
 )
 
 # Lua requires 32-bit mode on Xtensa/RISC-V architectures.

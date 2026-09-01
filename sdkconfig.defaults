@@ -36,3 +36,11 @@ CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# WPA2/WPA3-Enterprise (802.1X). Needed by network/wifi_sta.cc for school and
+# campus networks, which authenticate with a username and password against a
+# RADIUS server instead of a shared passphrase. It is on by default in the
+# esp32s3 defaults, but it is the kind of option a `fullclean` can quietly
+# drop, and the failure it produces then is a link error against
+# esp_eap_client_* rather than anything that says "enterprise".
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=y

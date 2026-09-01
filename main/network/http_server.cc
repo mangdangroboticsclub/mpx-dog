@@ -1441,12 +1441,29 @@ static esp_err_t api_wifi_status(httpd_req_t *req)
         case StaState::Failed:       sta_state_str = "failed";       break;
     }
 
-    char resp[512];
+    // 802.1X. The PWA uses this to re-open the enterprise form on the right
+    // setting after a reload. The identity is safe to hand back — it goes
+    // over the air in the clear during EAP — but the password never leaves
+    // NVS, so the form asks for it again if the user edits the network.
+    const EapMethod eap = wifi_sta_get_eap_method();
+    const char *eap_str = "none";
+    switch (eap) {
+        case EapMethod::None: eap_str = "none"; break;
+        case EapMethod::Peap: eap_str = "peap"; break;
+        case EapMethod::Ttls: eap_str = "ttls"; break;
+        case EapMethod::Tls:  eap_str = "tls";  break;
+    }
+    const std::string eap_identity = wifi_sta_get_eap_identity();
+
+    char resp[640];
     std::snprintf(resp, sizeof(resp),
         R"({"ap":{"ssid":"%s","ip":"%s"})"
-        R"(,"sta":{"state":"%s","ssid":"%s","ip":"%s"}})",
+        R"(,"sta":{"state":"%s","ssid":"%s","ip":"%s")"
+        R"(,"enterprise":%s,"eap_method":"%s","identity":"%s"}})",
         wifi_ap_get_ssid(), AP_IP_ADDR,
-        sta_state_str, sta_ssid.c_str(), sta_ip.c_str());
+        sta_state_str, sta_ssid.c_str(), sta_ip.c_str(),
+        eap == EapMethod::None ? "false" : "true",
+        eap_str, json_escape(eap_identity).c_str());
 
     ESP_LOGI(TAG, "GET  /v1/wifi/status  ap_ssid=%s sta=%s ssid=%s ip=%s",
              wifi_ap_get_ssid(), sta_state_str, sta_ssid.c_str(), sta_ip.c_str());
@@ -1506,20 +1523,45 @@ static esp_err_t api_wifi_ap_config(httpd_req_t *req)
     return ESP_OK; // never reached
 }
 
-/* POST /v1/wifi/connect — connect to a Wi-Fi network (STA mode) */
+/* POST /v1/wifi/connect — connect to a Wi-Fi network (STA mode)
+ *
+ * Personal network:
+ *   {"ssid":"HomeWiFi","password":"hunter2"}
+ *
+ * WPA2/WPA3-Enterprise (802.1X) — what campus networks want:
+ *   {"ssid":"eduroam","eap_method":"peap",
+ *    "username":"s1234567@uni.edu","password":"...",
+ *    "identity":"anonymous@uni.edu",        // optional outer identity
+ *    "phase2":"mschapv2",                   // TTLS only
+ *    "ca_cert":"-----BEGIN CERTIFICATE-----\n..."}   // optional
+ *
+ * EAP-TLS additionally takes "client_cert" and "client_key".
+ *
+ * The body is read onto the heap rather than into a stack buffer. The old
+ * char[256] was fine for an SSID and a passphrase, but a CA certificate is a
+ * couple of kilobytes of PEM and would have been silently truncated —
+ * producing a TLS handshake failure with nothing in the log to explain it.
+ */
 static esp_err_t api_wifi_connect(httpd_req_t *req)
 {
-    char buf[256] = {};
-    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (len <= 0) {
+    char *body = read_body(req);
+    if (!body) {
         httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "empty body", -1);
+        httpd_resp_send(req, "empty or oversized body", -1);
         return ESP_OK;
     }
-    buf[len] = 0;
 
-    std::string ssid = json_get_str(buf, "ssid");
-    std::string password = json_get_str(buf, "password");
+    const std::string ssid        = json_get_str(body, "ssid");
+    const std::string password    = json_get_str(body, "password");
+    const std::string method_str  = json_get_str(body, "eap_method");
+    const std::string identity    = json_get_str(body, "identity");
+    const std::string username    = json_get_str(body, "username");
+    const std::string phase2_str  = json_get_str(body, "phase2");
+    const std::string ca_cert     = json_get_str(body, "ca_cert");
+    const std::string client_cert = json_get_str(body, "client_cert");
+    const std::string client_key  = json_get_str(body, "client_key");
+
+    free(body);
 
     if (ssid.empty()) {
         httpd_resp_set_status(req, "400 Bad Request");
@@ -1527,11 +1569,72 @@ static esp_err_t api_wifi_connect(httpd_req_t *req)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "POST /v1/wifi/connect  ssid=%s", ssid.c_str());
+    // Absent, empty or "none" all mean an ordinary personal network, so an
+    // older PWA build that knows nothing about 802.1X keeps working.
+    EapMethod method = EapMethod::None;
+    if      (method_str.empty() || method_str == "none") method = EapMethod::None;
+    else if (method_str == "peap")                       method = EapMethod::Peap;
+    else if (method_str == "ttls")                       method = EapMethod::Ttls;
+    else if (method_str == "tls")                        method = EapMethod::Tls;
+    else {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "eap_method must be one of: none, peap, ttls, tls", -1);
+        return ESP_OK;
+    }
 
-    if (!wifi_sta_connect(ssid.c_str(), password.c_str())) {
+    if (method == EapMethod::None) {
+        ESP_LOGI(TAG, "POST /v1/wifi/connect  ssid=%s (personal)", ssid.c_str());
+
+        if (!wifi_sta_connect(ssid.c_str(), password.c_str())) {
+            httpd_resp_set_status(req, "500 Server Error");
+            httpd_resp_send(req, "connect failed", -1);
+            return ESP_OK;
+        }
+
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, R"({"ok":true})", -1);
+        return ESP_OK;
+    }
+
+    EapConfig eap;
+    eap.method      = method;
+    eap.identity    = identity;
+    eap.username    = username;
+    eap.password    = password;
+    eap.ca_cert     = ca_cert;
+    eap.client_cert = client_cert;
+    eap.client_key  = client_key;
+
+    if      (phase2_str == "mschap") eap.phase2 = EapPhase2::Mschap;
+    else if (phase2_str == "pap")    eap.phase2 = EapPhase2::Pap;
+    else if (phase2_str == "chap")   eap.phase2 = EapPhase2::Chap;
+    else                             eap.phase2 = EapPhase2::Mschapv2;
+
+    // Caught here rather than in the driver, because a rejected association
+    // three seconds later looks identical to a wrong password and sends the
+    // user hunting for the wrong problem.
+    if (method != EapMethod::Tls && eap.username.empty()) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "missing 'username' — PEAP and TTLS authenticate "
+                             "with a username and password", -1);
+        return ESP_OK;
+    }
+    if (method == EapMethod::Tls &&
+        (eap.client_cert.empty() || eap.client_key.empty())) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "EAP-TLS needs both 'client_cert' and 'client_key'", -1);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "POST /v1/wifi/connect  ssid=%s  802.1X %s  identity=%s  "
+                  "ca_cert=%s",
+             ssid.c_str(), method_str.c_str(),
+             (eap.identity.empty() ? eap.username : eap.identity).c_str(),
+             eap.ca_cert.empty() ? "none" : "supplied");
+
+    if (!wifi_sta_connect_eap(ssid.c_str(), eap)) {
         httpd_resp_set_status(req, "500 Server Error");
-        httpd_resp_send(req, "connect failed", -1);
+        httpd_resp_send(req, "802.1X connect failed — check the robot log", -1);
         return ESP_OK;
     }
 

@@ -22,6 +22,17 @@
   // Connect form
   let inputSsid = $state("");
   let inputPassword = $state("");
+
+  // 802.1X (WPA2/WPA3-Enterprise). School and campus networks hand out an
+  // account rather than a shared passphrase, so SSID + password is not
+  // enough on its own — the robot also needs a username, and sometimes a
+  // separate outer identity that travels in the clear before the tunnel.
+  let enterprise = $state(false);
+  let eapMethod = $state("peap");
+  let eapUsername = $state("");
+  let eapIdentity = $state("");
+  let eapPhase2 = $state("mschapv2");
+  let showIdentity = $state(false);
   let connecting = $state(false);
   let reconnecting = $state(false);
   let connectError = $state("");
@@ -47,6 +58,14 @@
         staState = data.sta?.state ?? "disconnected";
         staSsid = data.sta?.ssid ?? "";
         staIp = data.sta?.ip ?? "";
+        // Re-open the form on the setting the robot is actually using. The
+        // firmware returns the identity (it goes over the air in the clear
+        // anyway) but never the password, so that field always starts empty.
+        if (data.sta?.enterprise) {
+          enterprise = true;
+          eapMethod = data.sta?.eap_method ?? "peap";
+          if (!eapUsername && data.sta?.identity) eapUsername = data.sta.identity;
+        }
         if (reconnecting) reconnecting = false;
       } else if (!reconnecting) {
         error = `Status fetch failed (${res.status})`;
@@ -80,9 +99,27 @@
     poll();
   }
 
+  function buildConnectBody() {
+    const body = { ssid: inputSsid.trim(), password: inputPassword };
+    if (!enterprise) return body;
+
+    body.eap_method = eapMethod;
+    body.username = eapUsername.trim();
+    // Blank outer identity means "use the username", which is what the
+    // firmware does and what a phone does when you leave the anonymous
+    // identity empty. Only send it when the user actually filled it in.
+    if (eapIdentity.trim()) body.identity = eapIdentity.trim();
+    if (eapMethod === "ttls") body.phase2 = eapPhase2;
+    return body;
+  }
+
   async function doConnect() {
     const ssid = inputSsid.trim();
     if (!ssid) return;
+    if (enterprise && !eapUsername.trim()) {
+      connectError = "Enterprise networks need a username.";
+      return;
+    }
     connecting = true;
     reconnecting = false;
     connectError = "";
@@ -91,7 +128,7 @@
       const res = await fetch("/v1/wifi/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ssid, password: inputPassword }),
+        body: JSON.stringify(buildConnectBody()),
       });
       requestSent = true;
       if (res.ok) {
@@ -268,6 +305,83 @@
           />
         </div>
 
+        <!-- ── 802.1X toggle ── -->
+        <div class="ent-row">
+          <div class="ent-label">
+            <span>Enterprise (802.1X)</span>
+            <span class="ent-sub">School or work network with a login</span>
+          </div>
+          <button
+            class="toggle-switch small"
+            class:active={enterprise}
+            onclick={() => (enterprise = !enterprise)}
+            role="switch"
+            aria-checked={enterprise}
+            aria-label="Enterprise network"
+          >
+            <span class="toggle-knob"></span>
+          </button>
+        </div>
+
+        {#if enterprise}
+          <div class="field">
+            <label class="field-label" for="wifi-eap">EAP method</label>
+            <select id="wifi-eap" class="field-input" bind:value={eapMethod}>
+              <option value="peap">PEAP · MSCHAPv2 (most schools)</option>
+              <option value="ttls">TTLS</option>
+            </select>
+          </div>
+
+          {#if eapMethod === "ttls"}
+            <div class="field">
+              <label class="field-label" for="wifi-phase2">Phase 2</label>
+              <select id="wifi-phase2" class="field-input" bind:value={eapPhase2}>
+                <option value="mschapv2">MSCHAPv2</option>
+                <option value="pap">PAP</option>
+                <option value="mschap">MSCHAP</option>
+                <option value="chap">CHAP</option>
+              </select>
+            </div>
+          {/if}
+
+          <div class="field">
+            <label class="field-label" for="wifi-user">Username</label>
+            <input
+              id="wifi-user"
+              class="field-input"
+              type="text"
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
+              bind:value={eapUsername}
+              placeholder="e.g. s1234567@school.edu"
+            />
+          </div>
+
+          <button class="link-btn" onclick={() => (showIdentity = !showIdentity)}>
+            {showIdentity ? "Hide" : "Add"} anonymous identity (optional)
+          </button>
+
+          {#if showIdentity}
+            <div class="field">
+              <label class="field-label" for="wifi-ident">Anonymous identity</label>
+              <input
+                id="wifi-ident"
+                class="field-input"
+                type="text"
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
+                bind:value={eapIdentity}
+                placeholder="anonymous@school.edu"
+              />
+              <p class="field-hint">
+                Sent before the secure tunnel opens. Leave blank to use your username.
+              </p>
+            </div>
+          {/if}
+        {/if}
+
         <div class="field">
           <label class="field-label" for="wifi-password">Password</label>
           <input
@@ -279,10 +393,18 @@
           />
         </div>
 
+        {#if enterprise}
+          <p class="field-hint">
+            The robot will not check the school's server certificate. If the
+            login fails, the log usually says reason=23, which means the
+            school rejected the username or password.
+          </p>
+        {/if}
+
         <button
           class="join-btn"
           onclick={doConnect}
-          disabled={connecting || !inputSsid.trim()}
+          disabled={connecting || !inputSsid.trim() || (enterprise && !eapUsername.trim())}
         >
           {#if connecting}
             <span class="spinner"></span>
@@ -575,6 +697,74 @@
   .join-btn:disabled {
     background: #ccc;
     cursor: not-allowed;
+  }
+
+  /* ── Enterprise toggle ──────────────────── */
+  .ent-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: #f5f5f5;
+    border-radius: 12px;
+    padding: 12px 14px;
+  }
+
+  .ent-label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #000;
+  }
+
+  .ent-sub {
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: #888;
+  }
+
+  .toggle-switch.small {
+    width: 42px;
+    height: 24px;
+    border-radius: 12px;
+    flex-shrink: 0;
+  }
+  .toggle-switch.small .toggle-knob {
+    width: 18px;
+    height: 18px;
+  }
+  .toggle-switch.small.active .toggle-knob {
+    transform: translateX(18px);
+  }
+
+  select.field-input {
+    appearance: none;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23666' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    padding-right: 36px;
+    cursor: pointer;
+  }
+
+  .link-btn {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #666;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .link-btn:hover { color: #000; }
+
+  .field-hint {
+    font-size: 0.75rem;
+    color: #888;
+    line-height: 1.45;
   }
 
   /* ── Error Toast ────────────────────────── */
