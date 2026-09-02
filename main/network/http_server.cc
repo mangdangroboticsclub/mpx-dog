@@ -1560,6 +1560,7 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
     std::string target_path;
 
     const char *prefix_skills = "/v1/marketplace/skills";
+    const char *prefix_orders = "/v1/marketplace/orders";
     const char *prefix_robot  = "/v1/marketplace/robot/";
 
     if (std::strncmp(uri, prefix_robot, std::strlen(prefix_robot)) == 0) {
@@ -1567,11 +1568,16 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
         // e.g.  /v1/marketplace/robot/skills      → /v1/robots/{uuid}/skills
         //       /v1/marketplace/robot/skills/{id}  → /v1/robots/{uuid}/skills/{id}
         //       /v1/marketplace/robot/deploy       → /v1/robots/{uuid}/deploy
+        //       /v1/marketplace/robot/checkout     → /v1/robots/{uuid}/checkout
+        //       /v1/marketplace/robot/orders       → /v1/robots/{uuid}/orders
         std::string suffix = uri + std::strlen(prefix_robot);
         target_path = "/v1/robots/" + std::string(CONFIG_APP_ROBOT_UUID) + "/" + suffix;
     } else if (std::strncmp(uri, prefix_skills, std::strlen(prefix_skills)) == 0) {
         // /v1/marketplace/skills[/...] → /v1/skills[/...]
         // Strip "/v1/marketplace/" (16 chars), prepend "/v1/"
+        target_path = std::string("/v1/") + (uri + 16);
+    } else if (std::strncmp(uri, prefix_orders, std::strlen(prefix_orders)) == 0) {
+        // /v1/marketplace/orders[/...] → /v1/orders[/...]  (checkout order polls)
         target_path = std::string("/v1/") + (uri + 16);
     } else {
         httpd_resp_set_status(req, "404 Not Found");
@@ -1604,15 +1610,20 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
 
     const bool is_get = (req->method == HTTP_GET);
 
+    // Order-status polls must NOT be cached — the PWA polls every couple of
+    // seconds and a stale "pending" body would delay the owned→paid flip.
+    const bool cacheable = is_get &&
+        std::strncmp(target_path.c_str(), "/v1/orders", 10) != 0;
+
     // ── Serve GETs from the short-lived cache (no proxy socket) ──
-    if (is_get) {
+    if (cacheable) {
         std::string cached = mpx_cache_get(target_path);
         if (!cached.empty()) {
             httpd_resp_set_type(req, "application/json");
             httpd_resp_send(req, cached.c_str(), cached.size());
             return ESP_OK;
         }
-    } else {
+    } else if (!is_get) {
         // Any write changes the catalog — drop cached reads.
         mpx_cache_invalidate_all();
     }
@@ -1625,7 +1636,7 @@ static esp_err_t api_marketplace_proxy(httpd_req_t *req)
              method_str, uri, target_path.c_str(), ok, resp_body.size());
 
     // Cache successful GET responses so repeated polls don't re-proxy.
-    if (is_get && ok && !resp_body.empty()) {
+    if (cacheable && ok && !resp_body.empty()) {
         mpx_cache_put(target_path, resp_body);
     }
 

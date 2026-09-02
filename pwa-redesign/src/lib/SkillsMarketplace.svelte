@@ -6,6 +6,9 @@
     listRobotSkills,
     assignSkill,
     removeSkill,
+    deploySkill,
+    createCheckout,
+    getOrder,
   } from "./marketplaceApi.js";
 
   let { onNavigate } = $props();
@@ -208,49 +211,119 @@
     return `${symbol}${price.amount.toFixed(2)}`;
   }
 
-  // ── Demo pricing + fake checkout ─────────────────────────────
-  // NOTE: cosmetic only. The API has no price yet, so prices are derived
-  // deterministically from the skill id. Replace skillPrice() and confirmPay()
-  // with the real pricing + payment integration when ready.
-  const DEMO_PRICES = [0.99, 1.99, 9.99];
+  // ── Pricing from the gateway ──────────────────────────────────
+  // Each skill now carries price: { amount: 4.99, currency: "USD" }.
+  // amount <= 0 means free.
   function skillPrice(skill) {
-    const id = skill?.id || skill?.title || "";
-    let h = 0;
-    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-    return DEMO_PRICES[h % DEMO_PRICES.length];
+    return skill?.price ?? null;
   }
-  function priceLabel(skill) { return `$${skillPrice(skill).toFixed(2)}`; }
+  function priceLabel(skill) {
+    const p = skillPrice(skill);
+    if (!p || p.amount <= 0) return "Free";
+    return formatPrice(p);
+  }
 
-  // Payment sheet state
-  let payingSkill = $state(null);  // skill being "purchased"
-  let payStage = $state("form");   // "form" | "processing" | "success"
-  let payOrderId = $state("");
-  let payMethod = $state("card");
+  // ── Checkout state (link-out flow — card entry happens on HTTPS) ─
+  let checkoutSkill = $state(null);        // skill being purchased
+  let checkoutStage = $state("creating");  // creating | awaiting | paid | error
+  let checkoutUrl = $state("");
+  let checkoutError = $state("");
+  let checkoutOrderId = $state("");
+  let checkoutPollTimer = null;
 
-  function openPay(skill) {
-    payingSkill = skill;
-    payStage = "form";
-    payMethod = "card";
+  function openCheckout(skill) {
+    checkoutSkill = skill;
+    checkoutStage = "creating";
+    checkoutUrl = "";
+    checkoutError = "";
+    checkoutOrderId = "";
+    handleCheckout(skill);
   }
-  function closePay() {
-    payingSkill = null;
-    payStage = "form";
+
+  function closeCheckout() {
+    stopCheckoutPoll();
+    checkoutSkill = null;
+    checkoutStage = "creating";
   }
-  function confirmPay() {
-    if (payStage === "processing") return;
-    payStage = "processing";
-    const skill = payingSkill;
-    // Simulate payment processing, then actually subscribe so the robot demo works.
-    setTimeout(async () => {
-      try {
-        await assignSkill(skill.id);
-        await fetchRobotSkills();
-      } catch (e) {
-        console.error("Subscribe failed:", e);
+
+  function stopCheckoutPoll() {
+    if (checkoutPollTimer) {
+      clearInterval(checkoutPollTimer);
+      checkoutPollTimer = null;
+    }
+  }
+
+  /**
+   * Start a purchase. Creates an order + hosted checkout session on the
+   * gateway, then either finishes immediately (free skill / mock
+   * auto-approve) or hands the buyer an HTTPS checkout link to open in
+   * their browser (the PWA is HTTP, so card entry happens off-device).
+   */
+  async function handleCheckout(skill) {
+    checkoutStage = "creating";
+    checkoutError = "";
+    try {
+      const data = await createCheckout(skill.id);
+      checkoutOrderId = data.order_id || "";
+      checkoutUrl = data.checkout_url || "";
+
+      if (data.status === "paid" || data.status === "fulfilled") {
+        await finishPurchase(skill);
+        return;
       }
-      payOrderId = "#MD-" + Math.floor(100000 + Math.random() * 899999);
-      payStage = "success";
-    }, 1900);
+
+      // Copy the HTTPS link so the buyer can open it in any browser.
+      try {
+        await navigator.clipboard.writeText(checkoutUrl);
+      } catch { /* clipboard unavailable — user can still copy manually */ }
+
+      checkoutStage = "awaiting";
+      startCheckoutPoll(skill);
+    } catch (e) {
+      console.error("Checkout failed:", e);
+      checkoutStage = "error";
+      checkoutError = e.message || "Checkout failed";
+    }
+  }
+
+  function startCheckoutPoll(skill) {
+    stopCheckoutPoll();
+    checkoutPollTimer = setInterval(async () => {
+      try {
+        const order = await getOrder(checkoutOrderId);
+        if (order.status === "paid" || order.status === "fulfilled") {
+          await finishPurchase(skill);
+        } else if (order.status === "failed" || order.status === "expired") {
+          stopCheckoutPoll();
+          checkoutStage = "error";
+          checkoutError = `Order ${order.status} — please try again.`;
+        }
+      } catch { /* transient network hiccup — keep polling */ }
+    }, 2500);
+  }
+
+  async function finishPurchase(skill) {
+    stopCheckoutPoll();
+    checkoutStage = "paid";
+    // Re-read robot skills so the storefront flips to owned immediately.
+    await fetchRobotSkills();
+    if ((skill.skill_type || "").toLowerCase() === "wasm") {
+      try {
+        await deploySkill(skill.id);
+      } catch (e) {
+        console.error("Deploy failed:", e);
+      }
+    }
+  }
+
+  async function copyCheckoutUrl() {
+    try {
+      await navigator.clipboard.writeText(checkoutUrl);
+    } catch { /* ignore */ }
+  }
+
+  function openCheckoutUrl() {
+    window.open(checkoutUrl, "_blank");
   }
 </script>
 
@@ -361,9 +434,9 @@
           {:else}
             <button
               class="mp-action-btn mp-action-subscribe"
-              onclick={() => openPay(detailSkill)}
+              onclick={() => openCheckout(detailSkill)}
             >
-              Subscribe
+              {priceLabel(detailSkill) === "Free" ? "Get" : `Buy ${priceLabel(detailSkill)}`}
             </button>
           {/if}
 
@@ -498,9 +571,9 @@
                 {:else}
                   <button
                     class="mp-card-btn mp-card-btn-sub"
-                    onclick={() => openPay(skill)}
+                    onclick={() => openCheckout(skill)}
                   >
-                    Subscribe
+                    {priceLabel(skill) === "Free" ? "Get" : "Buy"}
                   </button>
                 {/if}
 
@@ -523,13 +596,13 @@
     </div>
   {/if}
 
-  <!-- ═══ PAYMENT SHEET (cosmetic demo — wire real payment later) ═══ -->
-  {#if payingSkill}
-    <div class="pay-scrim" onclick={closePay} role="presentation"></div>
+  <!-- ═══ CHECKOUT SHEET (link-out flow — card entry happens on HTTPS) ═══ -->
+  {#if checkoutSkill}
+    <div class="pay-scrim" onclick={closeCheckout} role="presentation"></div>
     <div class="pay-sheet">
       <div class="pay-grab"></div>
 
-      {#if payStage === "success"}
+      {#if checkoutStage === "paid"}
         <div class="pay-success">
           <div class="pay-check">
             <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
@@ -537,70 +610,53 @@
             </svg>
           </div>
           <h3 class="pay-success-title">Payment successful</h3>
-          <p class="pay-success-sub">{payingSkill.title} is now in your library.</p>
+          <p class="pay-success-sub">{checkoutSkill.title} is now in your library.</p>
           <div class="pay-receipt">
-            <div class="pay-receipt-row"><span>Item</span><b>{payingSkill.title}</b></div>
-            <div class="pay-receipt-row"><span>Order ID</span><b>{payOrderId}</b></div>
-            <div class="pay-receipt-row"><span>Paid</span><b>{priceLabel(payingSkill)}</b></div>
+            <div class="pay-receipt-row"><span>Item</span><b>{checkoutSkill.title}</b></div>
+            <div class="pay-receipt-row"><span>Order ID</span><b>{checkoutOrderId}</b></div>
+            <div class="pay-receipt-row"><span>Paid</span><b>{priceLabel(checkoutSkill)}</b></div>
             <div class="pay-receipt-row"><span>Status</span><b class="pay-ok">Installed ✓</b></div>
           </div>
-          <button class="pay-done" onclick={closePay}>Start using it</button>
+          <button class="pay-done" onclick={closeCheckout}>Start using it</button>
         </div>
+
+      {:else if checkoutStage === "error"}
+        <h3 class="pay-title">Checkout failed</h3>
+        <p class="pay-sub">{checkoutError || "Something went wrong."}</p>
+        <button class="pay-confirm" onclick={() => handleCheckout(checkoutSkill)}>Try again</button>
+        <button class="pay-done" onclick={closeCheckout}>Close</button>
+
       {:else}
         <h3 class="pay-title">Checkout</h3>
-        <p class="pay-sub">Complete your purchase to unlock this skill.</p>
+        <p class="pay-sub">Payment happens on a secure page — open the link in your browser.</p>
 
         <div class="pay-order">
-          <div class="pay-order-icon" style="background: {skillTypeColor(payingSkill.skill_type)}">
-            {payingSkill.title?.charAt(0) || "⚡"}
+          <div class="pay-order-icon" style="background: {skillTypeColor(checkoutSkill.skill_type)}">
+            {checkoutSkill.title?.charAt(0) || "⚡"}
           </div>
           <div class="pay-order-info">
-            <span class="pay-order-name">{payingSkill.title}</span>
-            <span class="pay-order-type">{skillTypeLabel(payingSkill.skill_type)}</span>
+            <span class="pay-order-name">{checkoutSkill.title}</span>
+            <span class="pay-order-type">{skillTypeLabel(checkoutSkill.skill_type)}</span>
           </div>
-          <span class="pay-order-amt">{priceLabel(payingSkill)}</span>
+          <span class="pay-order-amt">{priceLabel(checkoutSkill)}</span>
         </div>
 
-        <div class="pay-methods">
-          <button class="pay-method" class:active={payMethod === "card"} onclick={() => payMethod = "card"}>Card</button>
-          <button class="pay-method" class:active={payMethod === "apple"} onclick={() => payMethod = "apple"}>Apple Pay</button>
-          <button class="pay-method" class:active={payMethod === "gpay"} onclick={() => payMethod = "gpay"}>Google Pay</button>
-        </div>
-
-        {#if payMethod === "card"}
-          <div class="pay-field">
-            <label for="pay-cc">Card number</label>
-            <input id="pay-cc" type="text" value="4242 4242 4242 4242" inputmode="numeric" />
-          </div>
-          <div class="pay-field-row">
-            <div class="pay-field">
-              <label for="pay-exp">Expiry</label>
-              <input id="pay-exp" type="text" value="09/28" />
-            </div>
-            <div class="pay-field">
-              <label for="pay-cvc">CVC</label>
-              <input id="pay-cvc" type="text" value="123" inputmode="numeric" />
-            </div>
-          </div>
-          <div class="pay-field">
-            <label for="pay-name">Name on card</label>
-            <input id="pay-name" type="text" value="Mang Dang" />
+        {#if checkoutStage === "creating"}
+          <div class="pay-await">
+            <span class="pay-spinner"></span>
+            <p>Creating secure checkout…</p>
           </div>
         {:else}
-          <div class="pay-wallet">
-            <span class="pay-wallet-label">{payMethod === "apple" ? "Apple Pay" : "Google Pay"} selected</span>
-            <span class="pay-wallet-hint">Confirm with a single tap below.</span>
+          <div class="pay-link-box">
+            <span class="pay-link-label">Checkout link</span>
+            <span class="pay-link-url">{checkoutUrl}</span>
           </div>
+          <div class="pay-link-actions">
+            <button class="pay-confirm" onclick={copyCheckoutUrl}>📋 Copy link</button>
+            <button class="pay-confirm pay-open" onclick={openCheckoutUrl}>Open in browser ↗</button>
+          </div>
+          <p class="pay-secure">Waiting for payment… this screen updates automatically.</p>
         {/if}
-
-        <button class="pay-confirm" disabled={payStage === "processing"} onclick={confirmPay}>
-          {#if payStage === "processing"}
-            <span class="pay-spinner"></span> Processing…
-          {:else}
-            Pay {priceLabel(payingSkill)}
-          {/if}
-        </button>
-        <p class="pay-secure">🔒 Secured payment · 256-bit encryption</p>
       {/if}
     </div>
   {/if}
@@ -1276,4 +1332,43 @@
     font-weight: 700;
     cursor: pointer;
   }
+
+  /* ── Checkout link-out states ──────────────────────────────── */
+  .pay-await {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 18px 0 6px;
+    color: #969494;
+    font-size: 0.82rem;
+  }
+  .pay-await .pay-spinner {
+    border: 2.5px solid rgba(0, 0, 0, 0.15);
+    border-top-color: #000;
+  }
+  .pay-link-box {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: #f7f7f8;
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 4px;
+  }
+  .pay-link-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #969494;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .pay-link-url {
+    font-size: 0.78rem;
+    color: #333;
+    word-break: break-all;
+    line-height: 1.4;
+  }
+  .pay-link-actions { display: flex; gap: 8px; }
+  .pay-open { background: var(--yellow); color: #000; }
 </style>

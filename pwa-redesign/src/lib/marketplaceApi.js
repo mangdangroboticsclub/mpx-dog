@@ -124,6 +124,44 @@ export async function deploySkill(skillId) {
   return res.json();
 }
 
+// ── Checkout & Orders ─────────────────────────────────────────
+
+/**
+ * Create a checkout order + hosted HTTPS checkout URL for a skill on
+ * this robot. The robot injects its own UUID into the path.
+ * POST /v1/marketplace/robot/checkout  →  POST /v1/robots/{uuid}/checkout
+ * Returns { order_id, checkout_url, status, ... }.
+ */
+export async function createCheckout(skillId) {
+  const res = await fetch("/v1/marketplace/robot/checkout", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ skill_id: skillId }),
+  });
+  if (!res.ok) throw new Error(`Failed to create checkout: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Poll a checkout order's status.
+ * GET /v1/marketplace/orders/{orderId}  →  GET /v1/orders/{orderId}
+ */
+export async function getOrder(orderId) {
+  const res = await fetch(`/v1/marketplace/orders/${encodeURIComponent(orderId)}`);
+  if (!res.ok) throw new Error(`Failed to get order: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * List this robot's orders (purchase history).
+ * GET /v1/marketplace/robot/orders  →  GET /v1/robots/{uuid}/orders
+ */
+export async function listOrders() {
+  const res = await fetch("/v1/marketplace/robot/orders");
+  if (!res.ok) throw new Error(`Failed to list orders: ${res.status}`);
+  return res.json();
+}
+
 /**
  * Enqueue a Lua script for async execution (non-blocking).
  * POST /v1/lua/enqueue  →  {"script":"..."}
